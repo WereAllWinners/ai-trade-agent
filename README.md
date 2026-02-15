@@ -574,10 +574,6 @@ This is an experimental trading system. **Use at your own risk.**
 - ⚠️ Test thoroughly before using real money
 - ⚠️ Markets are inherently risky
 
-## 📝 License
-
-MIT License - See LICENSE file for details
-
 ## 🤝 Contributing
 
 Contributions welcome! Please:
@@ -605,10 +601,4 @@ Contributions welcome! Please:
 
 ---
 
-**Built with ❤️ by autonomous AI traders**
-
-*Trade smart. Trade safe. Let AI do the heavy lifting.* 🚀
-
-**Repository**: https://github.com/WereAllWinners/ai-trade-agent
-
-**Questions?** Open an issue on GitHub or contribute to the project!
+**Built with ❤️ by your fellow hobbyist**

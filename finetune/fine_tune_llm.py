@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Advanced LLM Fine-tuning Script
-Supports both fresh training and continuing from existing models
+Advanced LLM Fine-tuning Script – Fixed to use correct data file
 """
 
 import os
@@ -16,10 +15,6 @@ from transformers import TrainingArguments
 from datetime import datetime
 
 class AdvancedModelTrainer:
-    """
-    Elite model fine-tuning with support for continuing training
-    """
-    
     def __init__(
         self,
         base_model="unsloth/qwen2.5-32b-instruct-bnb-4bit",
@@ -32,86 +27,68 @@ class AdvancedModelTrainer:
         self.output_dir = output_dir
         self.max_seq_length = max_seq_length
         
-        # Check if continuing training
+        # Check mode
         if existing_adapter and Path(existing_adapter).exists():
             self.mode = "continue"
-            print(f"🔄 CONTINUE TRAINING MODE")
-            print(f"📂 Loading existing adapter from: {existing_adapter}")
+            print(f"🔄 CONTINUE TRAINING MODE from {existing_adapter}")
         else:
             self.mode = "fresh"
             print(f"🆕 FRESH TRAINING MODE")
-            print(f"📥 Will download base model: {base_model}")
-    
-    def load_training_data(self, data_path):
-        """
-        Load and format training data
-        """
-        print(f"\n📚 Loading training data from {data_path}...")
+            print(f"📥 Base model: {base_model}")
+
+    def load_training_data(self, data_path: str):
+        print(f"\n📚 Loading training data from: {data_path}")
         
-        with open(data_path, 'r') as f:
-            data = json.load(f)
+        if not Path(data_path).exists():
+            raise FileNotFoundError(f"Training data not found: {data_path}")
         
-        # Format for instruction fine-tuning - create the full text here
-        formatted_data = []
-        for example in data:
-            instruction = example.get('input', '')
-            output = example.get('output', '')
+        with open(data_path, 'r', encoding='utf-8') as f:
+            raw_data = json.load(f)
+        
+        print(f"   Raw entries loaded: {len(raw_data)}")
+        
+        # Format for Qwen 2.5 chat template
+        formatted = []
+        for i, ex in enumerate(raw_data):
+            input_text = ex.get('input', '')
+            output_text = ex.get('output', '')
             
-            # Qwen 2.5 chat format - create the full text
-            text = f"""<|im_start|>system
+            # Full prompt with system instruction
+            full_text = f"""<|im_start|>system
 You are an expert financial trading advisor with knowledge from the world's best investors including Warren Buffett, Nancy Pelosi, Cathie Wood, and Michael Burry. You analyze stocks using technical indicators, fundamental analysis, insider trading patterns, congressional trades, and proven strategies.<|im_end|>
 <|im_start|>user
-{instruction}<|im_end|>
+{input_text}<|im_end|>
 <|im_start|>assistant
-{output}<|im_end|>"""
+{output_text}<|im_end|>"""
             
-            formatted_data.append({
-                'text': text,
-                'source': example.get('metadata', {}).get('source', 'unknown')
-            })
+            formatted.append({"text": full_text})
+            
+            # Print first 2 examples for sanity check
+            if i < 2:
+                print(f"\nExample {i+1}:")
+                print(f"Input preview: {input_text[:200]}...")
+                print(f"Output preview: {output_text[:200]}...")
         
-        print(f"✅ Loaded {len(formatted_data)} training examples")
+        dataset = Dataset.from_list(formatted)
+        print(f"✅ Formatted dataset ready with {len(dataset)} examples")
         
-        # Show data distribution
-        sources = {}
-        for ex in formatted_data:
-            source = ex['source']
-            sources[source] = sources.get(source, 0) + 1
-        
-        print(f"\n📊 Data distribution:")
-        for source, count in sorted(sources.items(), key=lambda x: x[1], reverse=True):
-            print(f"  • {source}: {count} examples")
-        
-        return Dataset.from_list(formatted_data)
-    
+        return dataset
+
     def load_model(self):
-        """
-        Load either fresh base model or existing adapter
-        """
         print(f"\n{'='*70}")
-        print(f"📥 LOADING MODEL")
+        print("📥 LOADING MODEL")
         print(f"{'='*70}")
         
         if self.mode == "continue":
-            # Load existing LoRA adapter
-            print(f"🔄 Loading existing fine-tuned model...")
-            print(f"   Base: {self.base_model}")
-            print(f"   Adapter: {self.existing_adapter}")
-            
+            print(f"🔄 Loading existing adapter: {self.existing_adapter}")
             model, tokenizer = FastLanguageModel.from_pretrained(
                 model_name=self.existing_adapter,
                 max_seq_length=self.max_seq_length,
                 dtype=None,
                 load_in_4bit=True,
             )
-            
-            print(f"✅ Loaded existing adapter successfully")
-            
         else:
-            # Fresh start - download base model
             print(f"📥 Downloading base model: {self.base_model}")
-            print(f"   (This may take a few minutes...)")
-            
             model, tokenizer = FastLanguageModel.from_pretrained(
                 model_name=self.base_model,
                 max_seq_length=self.max_seq_length,
@@ -119,59 +96,45 @@ You are an expert financial trading advisor with knowledge from the world's best
                 load_in_4bit=True,
             )
             
-            print(f"✅ Base model loaded")
-            
-            # Add LoRA adapters
-            print(f"\n🔧 Configuring LoRA adapters...")
+            print("\n🔧 Adding LoRA adapters...")
             model = FastLanguageModel.get_peft_model(
                 model,
-                r=16,
+                r=64,
                 target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                              "gate_proj", "up_proj", "down_proj"],
-                lora_alpha=16,
+                               "gate_proj", "up_proj", "down_proj"],
+                lora_alpha=64,
                 lora_dropout=0,
                 bias="none",
                 use_gradient_checkpointing="unsloth",
                 random_state=3407,
             )
-            
-            print(f"✅ LoRA adapters configured")
         
+        print("✅ Model and tokenizer loaded")
         return model, tokenizer
-    
-    def train(self, training_data_path, num_epochs=3, batch_size=2, learning_rate=2e-4):
-        """
-        Main training loop
-        """
+
+    def train(self, data_path: str, num_epochs=3, batch_size=2, learning_rate=2e-4):
         print(f"\n{'='*70}")
-        print(f"🎓 STARTING FINE-TUNING")
+        print("🎓 STARTING FINE-TUNING")
         print(f"{'='*70}")
         print(f"Mode: {self.mode.upper()}")
         print(f"Epochs: {num_epochs}")
-        print(f"Batch size: {batch_size}")
+        print(f"Batch size: {batch_size} (with grad accumulation)")
         print(f"Learning rate: {learning_rate}")
         print(f"{'='*70}\n")
-        
+
         # Load model
         model, tokenizer = self.load_model()
-        
-        # Load dataset
-        dataset = self.load_training_data(training_data_path)
-        
-        # Create output directory with timestamp
+
+        # Load data
+        dataset = self.load_training_data(data_path)
+
+        # Output dir with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        if self.mode == "continue":
-            output_dir = self.existing_adapter
-            backup_dir = f"{self.existing_adapter}_backup_{timestamp}"
-            print(f"💾 Backing up existing model to: {backup_dir}")
-            os.system(f"cp -r {self.existing_adapter} {backup_dir}")
-        else:
-            output_dir = f"{self.output_dir}_{timestamp}"
-        
-        print(f"💾 Output directory: {output_dir}")
-        
-        # Training arguments optimized for your ZGX nano
-        print(f"\n⚙️  Configuring training arguments...")
+        output_dir = f"{self.output_dir}_{timestamp}"
+
+        print(f"💾 Saving to: {output_dir}")
+
+        # Training args – optimized for your ZGX Nano
         training_args = TrainingArguments(
             output_dir=output_dir,
             per_device_train_batch_size=batch_size,
@@ -190,9 +153,8 @@ You are an expert financial trading advisor with knowledge from the world's best
             save_total_limit=2,
             report_to="none",
         )
-        
-        # Create trainer
-        print(f"👨‍🏫 Creating SFT Trainer...")
+
+        # Trainer
         trainer = SFTTrainer(
             model=model,
             tokenizer=tokenizer,
@@ -201,124 +163,61 @@ You are an expert financial trading advisor with knowledge from the world's best
             max_seq_length=self.max_seq_length,
             args=training_args,
         )
-        
+
         # Show GPU info
         if torch.cuda.is_available():
-            gpu_name = torch.cuda.get_device_name(0)
-            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
-            print(f"\n🖥️  GPU: {gpu_name}")
-            print(f"💾 VRAM: {gpu_memory:.1f} GB")
-        
-        # Train!
+            print(f"\n🖥️ GPU: {torch.cuda.get_device_name(0)}")
+            print(f"💾 VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
         print(f"\n{'='*70}")
-        print(f"🚀 TRAINING STARTED")
+        print("🚀 TRAINING STARTED")
         print(f"{'='*70}\n")
-        
+
         trainer.train()
-        
-        print(f"\n{'='*70}")
-        print(f"✅ TRAINING COMPLETE")
-        print(f"{'='*70}")
-        
+
         # Save final model
         print(f"\n💾 Saving final model...")
         model.save_pretrained(output_dir)
         tokenizer.save_pretrained(output_dir)
-        
-        # Save training metadata
-        metadata = {
-            'mode': self.mode,
-            'base_model': self.base_model,
-            'training_data': training_data_path,
-            'num_epochs': num_epochs,
-            'batch_size': batch_size,
-            'learning_rate': learning_rate,
-            'timestamp': timestamp,
-            'dataset_size': len(dataset),
-            'output_dir': output_dir
-        }
-        
-        with open(f"{output_dir}/training_metadata.json", 'w') as f:
-            json.dump(metadata, f, indent=2)
-        
-        print(f"✅ Model saved to: {output_dir}")
-        print(f"📊 Training metadata saved")
-        
-        # Show next steps
-        print(f"\n{'='*70}")
-        print(f"🎉 SUCCESS!")
-        print(f"{'='*70}")
-        print(f"\n💡 Next steps:")
-        print(f"   1. Test inference:")
-        print(f"      python3 scripts/model_inference_lora.py")
-        print(f"   \n   2. Update trading bots to use new model:")
-        print(f"      Edit scripts/model_inference_lora.py")
-        print(f"      Change model path to: {output_dir}")
-        print(f"   \n   3. Restart trading bots:")
-        print(f"      sudo systemctl restart ai-trading-bot.service")
-        print(f"      sudo systemctl restart ai-options-bot.service")
-        print(f"{'='*70}\n")
-        
+
+        print(f"\n✅ TRAINING COMPLETE")
+        print(f"Model saved to: {output_dir}")
         return output_dir
+
 
 def main():
     parser = argparse.ArgumentParser(description='Fine-tune trading LLM')
     
-    parser.add_argument('--data', type=str, 
-                       required=True,
-                       help='Path to training data JSON file')
+    parser.add_argument('--data', type=str, required=True,
+                        help='Path to training data JSON file (required)')
     
-    parser.add_argument('--continue-from', type=str,
-                       default=None,
-                       help='Path to existing adapter to continue training (optional)')
+    parser.add_argument('--continue-from', type=str, default=None,
+                        help='Path to existing adapter to continue training')
     
-    parser.add_argument('--base-model', type=str,
-                       default='unsloth/qwen2.5-32b-instruct-bnb-4bit',
-                       help='Base model to use (only for fresh training)')
+    parser.add_argument('--epochs', type=int, default=3,
+                        help='Number of epochs')
     
-    parser.add_argument('--output', type=str,
-                       default='finetune/finance_qwen_32b_lora',
-                       help='Output directory for model')
+    parser.add_argument('--batch-size', type=int, default=2,
+                        help='Per-device batch size')
     
-    parser.add_argument('--epochs', type=int, 
-                       default=3,
-                       help='Number of training epochs')
-    
-    parser.add_argument('--batch-size', type=int,
-                       default=2,
-                       help='Per-device batch size')
-    
-    parser.add_argument('--learning-rate', type=float,
-                       default=2e-4,
-                       help='Learning rate')
+    parser.add_argument('--learning-rate', type=float, default=2e-4,
+                        help='Learning rate')
     
     args = parser.parse_args()
-    
-    # Auto-detect existing model if not specified
-    if args.continue_from is None:
-        default_path = '/home/zgx/personal-projects/ai-trade-agent/finetune/finance_qwen_32b_lora'
-        if Path(default_path).exists():
-            print(f"🔍 Found existing model at: {default_path}")
-            response = input(f"Continue training from this model? [Y/n]: ").strip().lower()
-            if response != 'n':
-                args.continue_from = default_path
-    
-    # Create trainer
+
     trainer = AdvancedModelTrainer(
-        base_model=args.base_model,
-        existing_adapter=args.continue_from,
-        output_dir=args.output
+        existing_adapter=args.continue_from
     )
-    
-    # Train
+
     output_dir = trainer.train(
-        training_data_path=args.data,
+        data_path=args.data,
         num_epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate
     )
-    
-    print(f"\n✅ All done! Model ready at: {output_dir}")
+
+    print(f"\nModel ready at: {output_dir}")
+
 
 if __name__ == "__main__":
     main()
