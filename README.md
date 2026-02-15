@@ -6,10 +6,12 @@ Autonomous AI-powered trading system with dual agents for stocks and options, fe
 
 - **Dual-Agent System**: Separate bots for stock trading and options trading
 - **Autonomous Discovery**: Automatically finds trading opportunities using technical analysis
-- **AI-Powered Decisions**: Uses fine-tuned Qwen LLM for trade analysis
+- **AI-Powered Decisions**: Uses fine-tuned Qwen 2.5 32B LLM for trade analysis
 - **Self-Improving**: Daily performance analysis and model fine-tuning
+- **Weekend Deep Research**: Comprehensive market analysis and model updates on Saturdays
 - **Risk Management**: Strict position sizing, stop losses, and portfolio limits
 - **24/7 Operation**: Runs continuously with systemd services
+- **World-Class Learning**: Learns from congressional trades, 13F filings, and proven strategies
 
 ## 📊 System Architecture
 
@@ -35,38 +37,49 @@ Autonomous AI-powered trading system with dual agents for stocks and options, fe
   - Take profit: +50%
   - Min confidence: 75%
   - DTE range: 7-45 days
+  - Target delta: 0.30
 - **Schedule**:
   - 5:30 PM EST: Daily performance analysis
   - 9:00 PM EST: Model fine-tuning
+
+### Weekend Strategy (Saturday 10:00 AM EST)
+1. 🔬 Deep market research and trend analysis
+2. 📊 Collect world-class training data (congressional trades, 13F filings, proven strategies)
+3. 🎓 Fine-tune model with new insights (2 epochs, ~45 minutes)
+4. ✅ Model ready and optimized before Monday market open!
 
 ## 🚀 Quick Start
 
 ### Prerequisites
 
-- **Python**: 3.10 or higher
-- **GPU**: CUDA-capable GPU recommended (8GB+ VRAM)
-- **Disk Space**: ~20GB for model files
-- **OS**: Linux (Ubuntu 22.04+ recommended)
+- **Hardware**: 
+  - CUDA-capable GPU with 8GB+ VRAM (recommended: 32GB+ for Qwen 32B)
+  - 64GB+ RAM
+  - 100GB+ free disk space (for model files and data)
+- **Software**:
+  - Python 3.10 or higher
+  - CUDA 12.1+ (for GPU acceleration)
+  - Linux (Ubuntu 22.04+ recommended)
 - **API**: Alpaca trading account (paper or live)
 
 ### Installation
 
 1. **Clone the repository:**
 ```bash
-git clone https://github.com/YOUR_USERNAME/ai-trade-agent.git
+git clone https://github.com/WereAllWinners/ai-trade-agent.git
 cd ai-trade-agent
 ```
 
-2. **Create virtual environment:**
+2. **Create and activate conda environment (recommended):**
 ```bash
-python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+conda create -n trading python=3.12
+conda activate trading
 ```
 
 3. **Install dependencies:**
 ```bash
-pip install --upgrade pip
 pip install -r requirements.txt
+pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
 ```
 
 4. **Set up environment variables:**
@@ -85,54 +98,139 @@ Get your API keys from [Alpaca Markets](https://alpaca.markets/)
 
 ## 🧠 Model Setup & Fine-tuning
 
-This project uses a fine-tuned Qwen 2.5 model. You have two options:
+This project uses **Qwen 2.5 32B Instruct** model, fine-tuned with LoRA (Low-Rank Adaptation) for efficient training.
 
-### Option 1: Use Pre-trained Base Model (Recommended for Testing)
+### Model Details
 
-The system will automatically download the base Qwen model on first run:
+- **Base Model**: `unsloth/qwen2.5-32b-instruct-bnb-4bit`
+- **Model Size**: ~20GB (4-bit quantized)
+- **Parameters**: 32 billion
+- **Architecture**: Qwen 2.5 with instruction tuning
+- **Quantization**: 4-bit via bitsandbytes (for memory efficiency)
+- **Fine-tuning Method**: LoRA adapters (~2GB)
+
+### Option 1: Automatic Download (Recommended for First-Time Users)
+
+The model will automatically download when you run fine-tuning:
 ```bash
-# The model will be cached in ~/.cache/huggingface/
-# No additional setup needed
+python3 finetune/fine_tune_llm.py \
+  --data finetune/data/finance_tuning/training_data.json \
+  --epochs 3
 ```
 
-### Option 2: Fine-tune Your Own Model (Recommended for Production)
+The model will be cached in `~/.cache/huggingface/hub/` and reused for future runs.
+
+### Option 2: Manual Download (Recommended for Advanced Users)
+
+**Using Hugging Face CLI:**
+```bash
+# Install Hugging Face Hub
+pip install huggingface-hub[cli]
+
+# Login (optional - only needed for gated models)
+huggingface-cli login
+
+# Download the model
+huggingface-cli download unsloth/qwen2.5-32b-instruct-bnb-4bit \
+  --local-dir ~/.cache/huggingface/hub/models--unsloth--qwen2.5-32b-instruct-bnb-4bit \
+  --local-dir-use-symlinks False
+```
+
+**Using Python:**
+```python
+from huggingface_hub import snapshot_download
+
+# Download model
+model_path = snapshot_download(
+    repo_id="unsloth/qwen2.5-32b-instruct-bnb-4bit",
+    cache_dir="~/.cache/huggingface/hub",
+    resume_download=True  # Resume if interrupted
+)
+
+print(f"Model downloaded to: {model_path}")
+```
+
+**Download Progress:**
+- Total size: ~20GB
+- Time: 10-30 minutes (depending on internet speed)
+- Location: `~/.cache/huggingface/hub/models--unsloth--qwen2.5-32b-instruct-bnb-4bit/`
+
+### Verify Model Download
+```bash
+# Check if model exists
+ls -lh ~/.cache/huggingface/hub/models--unsloth--qwen2.5-32b-instruct-bnb-4bit/
+
+# Should show files like:
+# - model-00001-of-00004.safetensors
+# - model-00002-of-00004.safetensors
+# - model-00003-of-00004.safetensors
+# - model-00004-of-00004.safetensors
+# - config.json
+# - tokenizer.json
+# - etc.
+
+# Check total size
+du -sh ~/.cache/huggingface/hub/models--unsloth--qwen2.5-32b-instruct-bnb-4bit/
+# Should be ~20GB
+```
+
+### Fine-tuning the Model
 
 #### Step 1: Collect Training Data
 ```bash
-# Collect financial data from various sources
+# Collect financial data from multiple sources
 python3 finetune/data_collection.py
 ```
 
 This creates `finetune/data/finance_tuning/training_data.json` with examples from:
-- Stock price movements
-- Technical indicators
-- Market sentiment
-- Trading patterns
+- Your Alpaca portfolio performance
+- High-volume and trending stocks
+- Technical indicators and market conditions
+- Dynamic symbol discovery
+
+**For world-class training data (congressional trades, 13F filings, proven strategies):**
+```bash
+# Edit data_collection.py to use WorldClassDataCollector
+# Then run it to get elite training data
+python3 finetune/data_collection.py
+```
 
 #### Step 2: Fine-tune the Model
-```bash
-# Install unsloth for efficient fine-tuning
-pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
 
-# Run fine-tuning (requires GPU)
+**Fresh Training (First Time):**
+```bash
 python3 finetune/fine_tune_llm.py \
   --data finetune/data/finance_tuning/training_data.json \
-  --model unsloth/qwen2.5-0.5b-instruct-bnb-4bit \
-  --output finetune/finance_qwen_32b_lora \
-  --epochs 3
+  --epochs 3 \
+  --batch-size 2 \
+  --learning-rate 2e-4
+```
+
+**Continue Training (Add New Knowledge to Existing Model):**
+```bash
+python3 finetune/fine_tune_llm.py \
+  --data finetune/data/finance_tuning/training_data.json \
+  --continue-from finetune/finance_qwen_32b_lora \
+  --epochs 2
 ```
 
 **Fine-tuning Options:**
 ```bash
---data      Path to training data JSON file
---model     Base model to fine-tune (default: qwen2.5-0.5b)
---output    Output directory for LoRA adapter
---epochs    Number of training epochs (default: 3)
+--data           Path to training data JSON file (required)
+--continue-from  Path to existing LoRA adapter (optional, for continued training)
+--base-model     Base model to use (default: qwen2.5-32b-instruct-bnb-4bit)
+--output         Output directory for LoRA adapter
+--epochs         Number of training epochs (default: 3)
+--batch-size     Per-device batch size (default: 2)
+--learning-rate  Learning rate (default: 2e-4)
 ```
 
-**Training Time**: ~30 minutes on modern GPU (RTX 3090, A100, etc.)
+**Training Time**: 
+- Fresh training: ~1-2 hours (3 epochs)
+- Continue training: ~30-45 minutes (2 epochs)
+- Depends on: dataset size, GPU, batch size
 
-**Output**: LoRA adapter saved to `finetune/finance_qwen_32b_lora/`
+**Output**: LoRA adapter saved to `finetune/finance_qwen_32b_lora_[timestamp]/`
 
 #### Step 3: Verify Model
 ```bash
@@ -141,14 +239,27 @@ python3 scripts/model_inference_lora.py
 ```
 
 ### Understanding the Model Architecture
-
-The system uses **LoRA (Low-Rank Adaptation)** for efficient fine-tuning:
 ```
-Base Model (Qwen 2.5 - 0.5B parameters)
-    ↓
-+ LoRA Adapter (~2GB - your custom trading knowledge)
-    ↓
-Fine-tuned Trading Model
+┌─────────────────────────────────────────┐
+│   Qwen 2.5 32B Base Model (20GB)        │
+│   - Pre-trained on general knowledge    │
+│   - Instruction-tuned                   │
+│   - 4-bit quantized for efficiency      │
+└─────────────────────────────────────────┘
+                    ↓
+┌─────────────────────────────────────────┐
+│   LoRA Adapter (~2GB)                   │
+│   - Your custom trading knowledge       │
+│   - Portfolio performance lessons       │
+│   - Congressional trades                │
+│   - 13F filings & proven strategies     │
+└─────────────────────────────────────────┘
+                    ↓
+┌─────────────────────────────────────────┐
+│   Fine-tuned Trading Model              │
+│   - Ready for autonomous trading        │
+│   - Self-improving daily                │
+└─────────────────────────────────────────┘
 ```
 
 **Why LoRA?**
@@ -156,40 +267,56 @@ Fine-tuned Trading Model
 - ✅ Small adapter size (2GB vs 50GB full model)
 - ✅ Easy to update daily with new trading data
 - ✅ Can run on consumer GPUs
+- ✅ Multiple adapters for different strategies
+
+### Model Update Schedule
+
+**Daily (Weekdays at 8:00 PM EST):**
+- Quick fine-tuning with day's trading results
+- 1 epoch, ~15 minutes
+- Incremental learning from wins/losses
+
+**Weekly (Saturday at 10:00 AM EST):**
+- Comprehensive training with world-class data
+- 2 epochs, ~45 minutes
+- Major knowledge updates before Monday
 
 ## 📁 Project Structure
 ```
 ai-trade-agent/
-├── scripts/
-│   ├── autonomous_agent.py          # Stock trading logic
+├── scripts/                          # Trading agents and utilities
+│   ├── autonomous_agent.py           # Stock trading logic
 │   ├── options_agent.py              # Options trading logic
-│   ├── trading_daemon.py             # Stock trading daemon
-│   ├── options_daemon.py             # Options trading daemon
+│   ├── trading_daemon.py             # Stock trading daemon (24/7)
+│   ├── options_daemon.py             # Options trading daemon (24/7)
 │   ├── model_inference_lora.py       # LLM inference with LoRA
 │   ├── performance_analyzer.py       # Stock performance analysis
 │   ├── options_performance_analyzer.py
 │   ├── stock_discovery.py            # Find trading opportunities
-│   ├── weekend_strategist.py         # Weekend analysis
-│   └── finetune_model.py            # Daily fine-tuning script
-├── finetune/
+│   ├── weekend_strategist.py         # Weekend deep analysis
+│   ├── finetune_model.py            # Daily fine-tuning script
+│   └── data_utils.py                # Utility functions
+├── finetune/                        # Model training system
 │   ├── data_collection.py           # Collect training data
 │   ├── fine_tune_llm.py             # Fine-tune model
 │   ├── data/                        # Training data storage
 │   │   └── finance_tuning/
-│   │       └── training_data.json
+│   │       ├── training_data.json
+│   │       ├── validation_report.json
+│   │       └── portfolio_analysis.json
 │   └── finance_qwen_32b_lora/       # Fine-tuned model (not in repo)
-├── services/
-│   ├── ai-trading-bot.service       # Systemd service for stocks
-│   └── ai-options-bot.service       # Systemd service for options
-├── logs/
+├── services/                        # Systemd service files
+│   ├── ai-trading-bot.service       # Stock trading service
+│   └── ai-options-bot.service       # Options trading service
+├── logs/                            # Trade history (not in repo)
 │   ├── trade_log.jsonl              # Stock trade history
 │   ├── options_trade_log.jsonl      # Options trade history
 │   ├── performance_metrics.json
 │   └── options_performance_metrics.json
-├── requirements.txt
-├── .env.example
-├── .gitignore
-└── README.md
+├── requirements.txt                 # Python dependencies
+├── .env.example                     # Environment variables template
+├── .gitignore                       # Git ignore rules
+└── README.md                        # This file
 ```
 
 ## 🎮 Running the Bots
@@ -207,6 +334,9 @@ python3 scripts/options_agent.py
 
 # Test model inference
 python3 scripts/model_inference_lora.py
+
+# Test weekend analysis
+python3 scripts/weekend_strategist.py
 ```
 
 ### Production Deployment (Systemd)
@@ -233,6 +363,9 @@ sudo journalctl -u ai-trading-bot.service -f
 
 # Options trading bot
 sudo journalctl -u ai-options-bot.service -f
+
+# Both bots
+sudo journalctl -u ai-trading-bot.service -u ai-options-bot.service -f
 ```
 
 **Control services:**
@@ -252,10 +385,13 @@ sudo systemctl status ai-trading-bot.service
 ### View Metrics
 ```bash
 # Stock performance
-cat logs/performance_metrics.json
+cat logs/performance_metrics.json | jq
 
 # Options performance
-cat logs/options_performance_metrics.json
+cat logs/options_performance_metrics.json | jq
+
+# Recent trades
+tail -20 logs/trade_log.jsonl | jq
 ```
 
 ### Sample Metrics Output
@@ -269,7 +405,9 @@ cat logs/options_performance_metrics.json
   "win_rate": 0.63,
   "avg_return": 0.042,
   "best_trade": 0.18,
-  "worst_trade": -0.07
+  "worst_trade": -0.07,
+  "sharpe_ratio": 1.34,
+  "max_drawdown": -0.12
 }
 ```
 
@@ -279,26 +417,36 @@ The bots continuously learn from their own performance:
 
 1. **Trade Execution** (Market hours)
    - Bots make trades based on AI analysis
-   - All trades logged with reasoning
+   - All trades logged with reasoning and confidence
 
-2. **Daily Analysis** (5:00 PM / 5:30 PM)
+2. **Daily Analysis** (5:00 PM / 5:30 PM EST)
    - Analyze day's trades
-   - Identify winners and losers
-   - Extract patterns
+   - Identify winners (>30% profit) and losers (<-30% loss)
+   - Extract patterns and lessons
 
 3. **Training Data Generation**
-   - Winners (>30% profit) → Positive examples
-   - Losers (<-30% loss) → Negative examples
-   - Strong positions (>40% unrealized) → Current learnings
+   - Winners → Positive examples (what worked)
+   - Losers → Negative examples (what to avoid)
+   - Strong positions (>40% unrealized) → Current best practices
 
-4. **Model Fine-tuning** (8:00 PM / 9:00 PM)
+4. **Model Fine-tuning** (8:00 PM / 9:00 PM EST)
    - Update model with new examples
    - Reinforce successful patterns
    - Learn to avoid losing patterns
+   - Takes 15-30 minutes
 
-5. **Next Day Trading**
+5. **Weekend Deep Learning** (Saturday 10:00 AM EST)
+   - Comprehensive market analysis
+   - Collect data from elite sources (congressional trades, 13F filings)
+   - Major model update (45 minutes)
+   - Ready for Monday market open
+
+6. **Next Day Trading**
    - Trade with improved model
+   - Better pattern recognition
    - Repeat cycle
+
+**Result**: The model gets smarter every day! 📈
 
 ## 🛡️ Risk Management
 
@@ -308,15 +456,17 @@ The bots continuously learn from their own performance:
 - Stop loss: -7%
 - Take profit: +15%
 - Min confidence: 60%
+- Max portfolio heat: 50%
 
 ### Options Trading Controls
-- Max 15% portfolio allocation
-- Max 3% per position
+- Max 15% portfolio allocation to options
+- Max 3% per options position
 - Max 5 trades per day
 - Stop loss: -50%
 - Take profit: +50%
 - Min confidence: 75%
 - DTE: 7-45 days
+- Target delta: 0.30
 - 1-hour cooldown per symbol
 
 ## 🔧 Configuration
@@ -326,19 +476,26 @@ Edit trading parameters in the respective agent files:
 **Stock Trading** (`scripts/autonomous_agent.py`):
 ```python
 self.params = {
-    'max_position_size': 0.05,  # 5% per position
-    'min_confidence': 0.60,     # 60% minimum
+    'max_position_size': 0.05,      # 5% per position
+    'min_confidence': 0.60,         # 60% minimum
     'max_daily_trades': 10,
+    'stop_loss': -0.07,             # -7%
+    'take_profit': 0.15,            # +15%
 }
 ```
 
 **Options Trading** (`scripts/options_agent.py`):
 ```python
 self.params = {
-    'max_portfolio_allocation': 0.15,  # 15% max
-    'max_position_size': 0.03,          # 3% per position
-    'min_confidence': 0.75,             # 75% minimum
+    'max_portfolio_allocation': 0.15,  # 15% max in options
+    'max_position_size': 0.03,         # 3% per position
+    'min_confidence': 0.75,            # 75% minimum
     'max_daily_trades': 5,
+    'stop_loss': -0.50,                # -50%
+    'take_profit': 0.50,               # +50%
+    'dte_min': 7,                      # Minimum days to expiration
+    'dte_max': 45,                     # Maximum days to expiration
+    'target_delta': 0.30,              # Target option delta
 }
 ```
 
@@ -347,11 +504,26 @@ self.params = {
 ### Issue: Model not loading
 ```bash
 # Check if model directory exists
+ls -la ~/.cache/huggingface/hub/models--unsloth--qwen2.5-32b-instruct-bnb-4bit/
+
+# Check if LoRA adapter exists
 ls -la finetune/finance_qwen_32b_lora/
 
-# If empty, either:
-# 1. Download base model (auto on first run)
-# 2. Fine-tune your own model (see Model Setup section)
+# If empty, download base model or fine-tune
+python3 finetune/fine_tune_llm.py --data finetune/data/finance_tuning/training_data.json
+```
+
+### Issue: CUDA not available
+```bash
+# Check CUDA
+nvidia-smi
+
+# Check PyTorch CUDA
+python3 -c "import torch; print(f'CUDA: {torch.cuda.is_available()}')"
+
+# If False, reinstall PyTorch with CUDA support
+pip uninstall torch torchvision torchaudio -y
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 ```
 
 ### Issue: API authentication failed
@@ -367,7 +539,7 @@ python3 -c "from alpaca.trading.client import TradingClient; import os; from dot
 ```bash
 # Check service status and logs
 sudo systemctl status ai-trading-bot.service
-sudo journalctl -u ai-trading-bot.service -n 50
+sudo journalctl -u ai-trading-bot.service -n 100
 
 # Common fixes:
 # 1. Ensure logs directory exists
@@ -382,9 +554,11 @@ chmod +x scripts/*.py
 
 ### Issue: Out of memory during fine-tuning
 ```bash
-# Use smaller model or reduce batch size in fine_tune_llm.py:
-per_device_train_batch_size=1  # Reduce from 2 to 1
-gradient_accumulation_steps=8  # Increase from 4 to 8
+# Reduce batch size in fine_tune_llm.py:
+python3 finetune/fine_tune_llm.py \
+  --data finetune/data/finance_tuning/training_data.json \
+  --batch-size 1 \
+  --epochs 2
 ```
 
 ## ⚠️ Disclaimer
@@ -397,6 +571,12 @@ This is an experimental trading system. **Use at your own risk.**
 - ⚠️ The author is not responsible for any financial losses
 - ⚠️ This is not financial advice
 - ⚠️ Always do your own research
+- ⚠️ Test thoroughly before using real money
+- ⚠️ Markets are inherently risky
+
+## 📝 License
+
+MIT License - See LICENSE file for details
 
 ## 🤝 Contributing
 
@@ -411,15 +591,24 @@ Contributions welcome! Please:
 - [Alpaca API Documentation](https://docs.alpaca.markets/)
 - [Unsloth Fine-tuning](https://github.com/unslothai/unsloth)
 - [Qwen Model](https://huggingface.co/Qwen)
+- [Hugging Face Hub](https://huggingface.co/docs/hub)
 - [LoRA Paper](https://arxiv.org/abs/2106.09685)
+- [Transformers Documentation](https://huggingface.co/docs/transformers)
 
 ## 🙏 Acknowledgments
 
 - Alpaca API for trading infrastructure
 - Qwen team for the base language model
-- Unsloth for efficient fine-tuning
+- Unsloth for efficient fine-tuning tools
+- Hugging Face for model hosting
 - yfinance for market data
 
 ---
 
-**Built with ❤️ by your fellow hobbyist**
+**Built with ❤️ by autonomous AI traders**
+
+*Trade smart. Trade safe. Let AI do the heavy lifting.* 🚀
+
+**Repository**: https://github.com/WereAllWinners/ai-trade-agent
+
+**Questions?** Open an issue on GitHub or contribute to the project!
