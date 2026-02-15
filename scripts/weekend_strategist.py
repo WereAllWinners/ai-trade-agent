@@ -1,5 +1,9 @@
 import os
 import logging
+from pathlib import Path
+
+# Ensure logs directory exists
+Path('logs').mkdir(exist_ok=True)
 import json
 import pandas as pd
 from datetime import datetime, timedelta
