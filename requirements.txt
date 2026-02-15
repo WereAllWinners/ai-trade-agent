@@ -1,4 +1,5 @@
 # Core ML/AI
+unsloth
 torch>=2.0.0
 transformers>=4.30.0
 peft>=0.4.0
@@ -14,6 +15,7 @@ yfinance>=0.2.0
 # Data processing
 pandas>=2.0.0
 numpy>=1.24.0
+lxml==6.0.2
 
 # Utilities
 python-dotenv>=1.0.0
