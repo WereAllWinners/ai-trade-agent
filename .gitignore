@@ -1,0 +1,25 @@
+# Environment
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+ai-trade-venv/
+
+# Logs
+logs/
+*.log
+*.jsonl
+*.json
+
+# Model files
+finetune/
+*.safetensors
+*.bin
+*.gguf
+
+# Cache
+.cache/
+__pycache__/
