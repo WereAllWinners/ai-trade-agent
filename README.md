@@ -398,10 +398,6 @@ This is an experimental trading system. **Use at your own risk.**
 - ⚠️ This is not financial advice
 - ⚠️ Always do your own research
 
-## 📝 License
-
-MIT License - See LICENSE file for details
-
 ## 🤝 Contributing
 
 Contributions welcome! Please:
@@ -426,6 +422,4 @@ Contributions welcome! Please:
 
 ---
 
-**Built with ❤️ by autonomous AI traders**
-
-*Trade smart. Trade safe. Let AI do the heavy lifting.* 🚀
+**Built with ❤️ by your fellow hobbyist**
