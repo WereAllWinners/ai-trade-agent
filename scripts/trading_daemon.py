@@ -1,219 +1,252 @@
 #!/usr/bin/env python3
 """
-AI Trading Daemon - Runs 24/7 with intelligent scheduling
-TRADES CONTINUOUSLY EVERY 30 MIN DURING MARKET HOURS
+Trading Daemon - Runs stock trading bot 24/7
 """
 import os
 import sys
 import time
 import logging
+import subprocess
 import traceback
-from datetime import datetime, time as dt_time
+from datetime import datetime, timedelta
 import pytz
 
-# Add project root to path
 sys.path.append('/home/zgx/personal-projects/ai-trade-agent/scripts')
 
-# Simple console logging - systemd will capture it
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
-
-# Import after path and logging are set
-from autonomous_agent import AutonomousAgent
-from weekend_strategist import WeekendStrategist
-from performance_analyzer import PerformanceAnalyzer
 
 class TradingDaemon:
     def __init__(self):
-        self.timezone = pytz.timezone('America/New_York')
-        self.agent = None  # Initialize lazily on first trading session
-        self.weekend_strategist = WeekendStrategist()
-        self.analyzer = PerformanceAnalyzer()
-        
-        # Track last execution times
-        self.last_trade_check = None
-        self.last_nightly_analysis = None
-        self.last_weekend_analysis_sat = None
-        self.last_weekend_analysis_sun = None
+        self.est = pytz.timezone('US/Eastern')
+        self.market_open = datetime.strptime('09:30', '%H:%M').time()
+        self.market_close = datetime.strptime('16:00', '%H:%M').time()
+        self.trading_interval = 30  # 30 minutes
+        self.analysis_time = datetime.strptime('17:00', '%H:%M').time()  # 5:00 PM
+        self.finetune_time = datetime.strptime('20:00', '%H:%M').time()  # 8:00 PM
         
         logging.info("🤖 Trading Daemon Initialized")
+        logging.info("⏰ Stock trading every 30 minutes")
+        logging.info("📊 Performance analysis scheduled for 5:00 PM EST daily")
+        logging.info("🎓 Model fine-tuning scheduled for 8:00 PM EST daily")
     
-    def get_current_time(self):
-        """Get current time in EST/EDT."""
-        from datetime import timezone as tz
-        # Get UTC time and convert to EST/EDT
-        utc_now = datetime.now(tz.utc)
-        est_now = utc_now.astimezone(self.timezone)
-        return est_now
-    
-    def is_market_hours(self):
-        """Check if it's market hours (9:30 AM - 4:00 PM EST, Mon-Fri)."""
-        now = self.get_current_time()
+    def is_market_open(self):
+        """Check if market is currently open."""
+        now = datetime.now(self.est)
         
+        # Check if weekend
         if now.weekday() >= 5:
             return False
         
-        market_open = dt_time(9, 30)
-        market_close = dt_time(16, 0)
         current_time = now.time()
-        
-        return market_open <= current_time <= market_close
+        return self.market_open <= current_time <= self.market_close
     
-    def should_run_trading(self):
-        """Check if we should run trading logic (every 30 minutes during market hours)."""
-        if not self.is_market_hours():
-            return False
+    def get_next_market_open(self):
+        """Get next market open time."""
+        now = datetime.now(self.est)
         
-        now = self.get_current_time()
-        
-        if self.last_trade_check is None:
-            return True
-        
-        time_since_last = (now - self.last_trade_check).total_seconds()
-        return time_since_last >= 1800  # 30 minutes
-    
-    def should_run_nightly_analysis(self):
-        """Check if we should run nightly analysis (6 PM on weekdays)."""
-        now = self.get_current_time()
-        
+        # If weekend, next Monday
         if now.weekday() >= 5:
-            return False
+            days_ahead = 7 - now.weekday()
+            next_open = now + timedelta(days=days_ahead)
+            next_open = next_open.replace(hour=9, minute=30, second=0, microsecond=0)
+        # If before market open today
+        elif now.time() < self.market_open:
+            next_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        # If after market close, next day
+        else:
+            next_open = now + timedelta(days=1)
+            next_open = next_open.replace(hour=9, minute=30, second=0, microsecond=0)
+            # Skip weekend
+            if next_open.weekday() >= 5:
+                days_ahead = 7 - next_open.weekday()
+                next_open = next_open + timedelta(days=days_ahead)
         
-        if now.hour != 18:
-            return False
-        
-        if self.last_nightly_analysis is not None:
-            if self.last_nightly_analysis.date() == now.date():
-                return False
-        
-        return True
-    
-    def should_run_weekend_analysis(self):
-        """Check if we should run weekend analysis (Sat 10 AM, Sun 2 PM)."""
-        now = self.get_current_time()
-        
-        if now.weekday() == 5:  # Saturday
-            if now.hour == 10:
-                if self.last_weekend_analysis_sat is None or \
-                   self.last_weekend_analysis_sat.date() != now.date():
-                    return True
-        
-        if now.weekday() == 6:  # Sunday
-            if now.hour == 14:
-                if self.last_weekend_analysis_sun is None or \
-                   self.last_weekend_analysis_sun.date() != now.date():
-                    return True
-        
-        return False
+        return next_open
     
     def run_trading_session(self):
-        """Execute trading logic."""
-        logging.info("="*70)
-        logging.info("📊 RUNNING TRADING SESSION")
-        logging.info("="*70)
-        
+        """Run stock trading session."""
         try:
-            # Initialize agent on first run (loads model once)
-            if self.agent is None:
-                logging.info("Initializing autonomous agent (and loading AI model)...")
-                self.agent = AutonomousAgent()
+            logging.info("======================================================================")
+            logging.info("📈 STARTING TRADING SESSION")
+            logging.info("======================================================================")
+            logging.info("🔄 Initializing trading agent...")
             
-            # Run trading session
-            self.agent.run_trading_session()
+            result = subprocess.run(
+                ['python3', '/home/zgx/personal-projects/ai-trade-agent/scripts/autonomous_agent.py'],
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
             
-            self.last_trade_check = self.get_current_time()
-            logging.info("✅ Trading session complete")
-            logging.info(f"⏰ Next session in 30 minutes")
-        
+            if result.returncode == 0:
+                logging.info("✅ Trading session completed")
+            else:
+                logging.error(f"❌ Trading session failed: {result.stderr}")
+                
+        except subprocess.TimeoutExpired:
+            logging.error("❌ Trading session timed out")
         except Exception as e:
             logging.error(f"❌ Trading session failed: {e}")
-            logging.error(traceback.format_exc())
     
-    def run_nightly_analysis(self):
-        """Execute nightly performance analysis."""
-        logging.info("="*70)
-        logging.info("🌙 RUNNING NIGHTLY ANALYSIS")
-        logging.info("="*70)
-        
+    def run_performance_analysis(self):
+        """Run performance analysis."""
         try:
-            self.analyzer.load_trades(days_back=7)
-            performance = self.analyzer.analyze_performance()
-            recommendations = self.analyzer.generate_recommendations(performance)
+            logging.info("🔔 Time for performance analysis!")
+            logging.info("======================================================================")
+            logging.info("📊 RUNNING PERFORMANCE ANALYSIS")
+            logging.info("======================================================================")
             
-            self.analyzer.save_analysis(performance, recommendations)
-            self.analyzer.print_report(performance, recommendations)
-            self.analyzer.apply_recommendations(recommendations)
+            result = subprocess.run(
+                ['python3', '/home/zgx/personal-projects/ai-trade-agent/scripts/performance_analyzer.py'],
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
             
-            self.last_nightly_analysis = self.get_current_time()
-            logging.info("✅ Nightly analysis complete")
-        
-        except Exception as e:
-            logging.error(f"❌ Nightly analysis failed: {e}")
-            logging.error(traceback.format_exc())
-    
-    def run_weekend_analysis(self):
-        """Execute weekend deep analysis."""
-        logging.info("="*70)
-        logging.info("🏖️  RUNNING WEEKEND DEEP ANALYSIS")
-        logging.info("="*70)
-        
-        try:
-            self.weekend_strategist.run_weekend_analysis()
-            
-            now = self.get_current_time()
-            if now.weekday() == 5:
-                self.last_weekend_analysis_sat = now
+            if result.returncode == 0:
+                logging.info("✅ Performance analysis complete")
             else:
-                self.last_weekend_analysis_sun = now
-            
-            logging.info("✅ Weekend analysis complete")
-        
+                logging.error(f"❌ Performance analysis failed: {result.stderr}")
+                
         except Exception as e:
-            logging.error(f"❌ Weekend analysis failed: {e}")
-            logging.error(traceback.format_exc())
+            logging.error(f"❌ Performance analysis failed: {e}")
     
-    def run_forever(self):
-        """Main daemon loop - runs 24/7."""
-        logging.info("🚀 Starting Trading Daemon - Running 24/7")
-        logging.info(f"📅 Current time: {self.get_current_time()}")
+    def run_finetuning(self):
+        """Run model fine-tuning."""
+        try:
+            logging.info("🔔 Time for daily model fine-tuning!")
+            logging.info("======================================================================")
+            logging.info("🎓 RUNNING MODEL FINE-TUNING")
+            logging.info("======================================================================")
+            
+            result = subprocess.run(
+                ['python3', '/home/zgx/personal-projects/ai-trade-agent/scripts/finetune_model.py'],
+                capture_output=True,
+                text=True,
+                timeout=600
+            )
+            
+            if result.returncode == 0:
+                logging.info("✅ Model fine-tuning complete")
+            else:
+                logging.error(f"❌ Fine-tuning failed: {result.stderr}")
+                
+        except Exception as e:
+            logging.error(f"❌ Fine-tuning failed: {e}")
+    
+    def sleep_until_next_event(self):
+        """Sleep until next scheduled event."""
+        now = datetime.now(self.est)
         
-        check_interval = 60  # Check every minute
+        # Check for scheduled events today
+        events = []
+        
+        # Market open
+        if not self.is_market_open():
+            next_open = self.get_next_market_open()
+            events.append(('Market open', next_open))
+        
+        # Analysis time (5:00 PM)
+        analysis_dt = now.replace(hour=17, minute=0, second=0, microsecond=0)
+        if now < analysis_dt:
+            events.append(('Performance Analysis', analysis_dt))
+        
+        # Fine-tuning time (8:00 PM)
+        finetune_dt = now.replace(hour=20, minute=0, second=0, microsecond=0)
+        if now < finetune_dt:
+            events.append(('Model Fine-tuning', finetune_dt))
+        
+        # Find next event
+        if events:
+            events.sort(key=lambda x: x[1])
+            event_name, event_time = events[0]
+            sleep_seconds = (event_time - now).total_seconds()
+            
+            if sleep_seconds > 0:
+                hours = sleep_seconds / 3600
+                minutes = (sleep_seconds % 3600) / 60
+                logging.info(f"💤 Next event: {event_name} in {hours:.1f} hours" if hours >= 1 else f"💤 Next event: {event_name} in {minutes:.1f} minutes")
+                time.sleep(max(sleep_seconds - 60, 0))  # Wake up 1 min early
+        else:
+            # Sleep until tomorrow
+            tomorrow = now + timedelta(days=1)
+            tomorrow = tomorrow.replace(hour=0, minute=0, second=0, microsecond=0)
+            sleep_seconds = (tomorrow - now).total_seconds()
+            logging.info(f"💤 Sleeping until tomorrow ({sleep_seconds/3600:.1f} hours)")
+            time.sleep(sleep_seconds)
+    
+    def run(self):
+        """Main daemon loop."""
+        logging.info("🚀 Starting Trading Daemon - Running 24/7")
+        logging.info("📈 Trading: 9:30 AM - 4:00 PM EST")
+        logging.info("📊 Analysis: 5:00 PM EST (daily)")
+        logging.info("🎓 Learning: 8:00 PM EST (daily)")
+        
+        last_trade_time = None
+        analysis_done_today = False
+        finetune_done_today = False
         
         while True:
             try:
-                now = self.get_current_time()
+                now = datetime.now(self.est)
+                current_time = now.time()
+                current_date = now.date()
                 
-                # Hourly status update
-                if now.minute == 0:
-                    market_status = "OPEN" if self.is_market_hours() else "CLOSED"
-                    logging.info(f"⏰ Hourly check - Market: {market_status} - {now.strftime('%Y-%m-%d %H:%M %Z')}")
+                # Reset daily flags
+                if last_trade_time and last_trade_time.date() != current_date:
+                    analysis_done_today = False
+                    finetune_done_today = False
                 
-                # Check what to run
-                if self.should_run_trading():
-                    self.run_trading_session()
+                logging.info(f"📅 Current time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
                 
-                elif self.should_run_nightly_analysis():
-                    self.run_nightly_analysis()
+                # Performance analysis at 5:00 PM
+                if not analysis_done_today and current_time >= self.analysis_time:
+                    self.run_performance_analysis()
+                    analysis_done_today = True
                 
-                elif self.should_run_weekend_analysis():
-                    self.run_weekend_analysis()
+                # Fine-tuning at 8:00 PM
+                if not finetune_done_today and current_time >= self.finetune_time:
+                    self.run_finetuning()
+                    finetune_done_today = True
                 
-                # Sleep until next check
-                time.sleep(check_interval)
-            
+                # Trading during market hours
+                if self.is_market_open():
+                    should_trade = False
+                    
+                    if last_trade_time is None:
+                        should_trade = True
+                    else:
+                        time_since_trade = (now - last_trade_time).total_seconds()
+                        if time_since_trade >= self.trading_interval * 60:
+                            should_trade = True
+                    
+                    if should_trade:
+                        logging.info("🟢 Market is OPEN - Running trading session")
+                        self.run_trading_session()
+                        last_trade_time = now
+                        logging.info(f"⏰ Next session in {self.trading_interval} minutes")
+                        time.sleep(self.trading_interval * 60)
+                    else:
+                        time.sleep(60)
+                else:
+                    logging.info("🔴 Market is CLOSED")
+                    next_open = self.get_next_market_open()
+                    hours_until = (next_open - now).total_seconds() / 3600
+                    logging.info(f"⏰ Next market open: {next_open.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                    logging.info(f"⏰ Time until open: {hours_until:.1f} hours")
+                    self.sleep_until_next_event()
+                    
             except KeyboardInterrupt:
-                logging.info("🛑 Daemon stopped by user")
+                logging.info("🛑 Trading daemon stopped by user")
                 break
-            
             except Exception as e:
                 logging.error(f"❌ Daemon error: {e}")
                 logging.error(traceback.format_exc())
-                logging.info("⚠️  Continuing after error...")
-                time.sleep(check_interval)
+                time.sleep(60)
 
 if __name__ == "__main__":
     daemon = TradingDaemon()
-    daemon.run_forever()
+    daemon.run()
