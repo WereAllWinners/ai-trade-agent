@@ -200,5 +200,3 @@ MIT License - see LICENSE file
 - yfinance for market data
 
 ---
-
-**Built with ❤️ by autonomous AI traders**
