@@ -101,8 +101,8 @@ class AutonomousAgent:
         return elapsed < self.params['cooldown_minutes']
     
     def get_market_data(self, symbol, bars=100):
-        """Get recent market data for a symbol with fallback strategies."""
-        # Try hourly first (during market hours)
+        """Get recent market data for a symbol with Alpaca -> yfinance fallback."""
+        # Try Alpaca hourly first (during market hours)
         try:
             end = datetime.now()
             start = end - timedelta(days=30)
@@ -115,20 +115,18 @@ class AutonomousAgent:
             )
             
             bars_data = self.data_client.get_stock_bars(request_params)
-            
-            if symbol in bars_data:
-                df = bars_data[symbol].df
-                if not df.empty and len(df) >= 14:
-                    logging.info(f"✅ Got {len(df)} hourly bars for {symbol}")
-                    return df
+            df = bars_data.df
+            if not df.empty and len(df) >= 14:
+                logging.info(f"✅ Got {len(df)} hourly bars for {symbol} (Alpaca)")
+                return df
         
         except Exception as e:
-            logging.debug(f"Hourly data failed for {symbol}: {e}")
+            logging.debug(f"Alpaca hourly data failed for {symbol}: {e}")
         
-        # Fallback to daily bars (more reliable)
+        # Fallback to Alpaca daily bars
         try:
             end = datetime.now()
-            start = end - timedelta(days=365)  # Get full year of daily data
+            start = end - timedelta(days=365)
             
             request_params = StockBarsRequest(
                 symbol_or_symbols=symbol,
@@ -138,19 +136,39 @@ class AutonomousAgent:
             )
             
             bars_data = self.data_client.get_stock_bars(request_params)
-            
-            if symbol in bars_data:
-                df = bars_data[symbol].df
-                if not df.empty and len(df) >= 14:
-                    logging.info(f"✅ Got {len(df)} daily bars for {symbol}")
-                    return df
-            
-            logging.warning(f"⚠️  No data available for {symbol}")
-            return None
+            df = bars_data.df
+            if not df.empty and len(df) >= 14:
+                logging.info(f"✅ Got {len(df)} daily bars for {symbol} (Alpaca)")
+                return df
             
         except Exception as e:
-            logging.error(f"❌ Failed to get data for {symbol}: {e}")
-            return None
+            logging.debug(f"Alpaca daily data failed for {symbol}: {e}")
+        
+        # Final fallback to yfinance
+        try:
+            import yfinance as yf
+            logging.info(f"🔄 Trying yfinance for {symbol}...")
+            
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(period='1y')
+            
+            if not df.empty and len(df) >= 14:
+                # Rename columns to match Alpaca format
+                df = df.rename(columns={
+                    'Open': 'open',
+                    'High': 'high',
+                    'Low': 'low',
+                    'Close': 'close',
+                    'Volume': 'volume'
+                })
+                logging.info(f"✅ Got {len(df)} bars for {symbol} (yfinance)")
+                return df
+            
+        except Exception as e:
+            logging.debug(f"yfinance failed for {symbol}: {e}")
+        
+        logging.warning(f"⚠️  No data available for {symbol} from any source")
+        return None
     
     def calculate_indicators(self, df):
         """Calculate technical indicators."""

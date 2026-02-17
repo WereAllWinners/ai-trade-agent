@@ -72,12 +72,7 @@ class OptionsDaemon:
             logging.info("💰 RUNNING OPTIONS TRADING SESSION")
             logging.info("======================================================================")
             
-            result = subprocess.run(
-                ['python3', '/home/zgx/personal-projects/ai-trade-agent/scripts/options_agent.py'],
-                capture_output=True,
-                text=True,
-                timeout=300
-            )
+            result = subprocess.run(['python3', '/home/zgx/personal-projects/ai-trade-agent/scripts/options_agent.py'], timeout=1200)
             
             if result.returncode == 0:
                 logging.info("✅ Options trading session completed successfully")
@@ -97,12 +92,7 @@ class OptionsDaemon:
             logging.info("📊 RUNNING OPTIONS PERFORMANCE ANALYSIS")
             logging.info("======================================================================")
             
-            result = subprocess.run(
-                ['python3', '/home/zgx/personal-projects/ai-trade-agent/scripts/options_performance_analyzer.py'],
-                capture_output=True,
-                text=True,
-                timeout=300
-            )
+            result = subprocess.run(['python3', '/home/zgx/personal-projects/ai-trade-agent/scripts/options_performance_analyzer.py'], timeout=1200)
             
             if result.returncode == 0:
                 logging.info("✅ Options performance analysis complete")
