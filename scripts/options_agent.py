@@ -164,7 +164,7 @@ Based on this data, should we:
 
 Provide your decision, confidence (0-1), and reasoning."""
         
-        response = get_trading_decision(prompt, max_length=150)
+        response = get_trading_decision(prompt, max_new_tokens=150)
         decision = parse_decision(response)
         
         # Map to options-specific decisions

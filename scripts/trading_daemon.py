@@ -76,15 +76,13 @@ class TradingDaemon:
             
             result = subprocess.run(
                 ['python3', '/home/zgx/personal-projects/ai-trade-agent/scripts/autonomous_agent.py'],
-                capture_output=True,
-                text=True,
                 timeout=300
             )
             
             if result.returncode == 0:
                 logging.info("✅ Trading session completed")
             else:
-                logging.error(f"❌ Trading session failed: {result.stderr}")
+                logging.error(f"❌ Trading session failed with code: {result.returncode}")
                 
         except subprocess.TimeoutExpired:
             logging.error("❌ Trading session timed out")
@@ -101,15 +99,13 @@ class TradingDaemon:
             
             result = subprocess.run(
                 ['python3', '/home/zgx/personal-projects/ai-trade-agent/scripts/performance_analyzer.py'],
-                capture_output=True,
-                text=True,
                 timeout=300
             )
             
             if result.returncode == 0:
                 logging.info("✅ Performance analysis complete")
             else:
-                logging.error(f"❌ Performance analysis failed: {result.stderr}")
+                logging.error(f"❌ Performance analysis failed with code: {result.returncode}")
                 
         except Exception as e:
             logging.error(f"❌ Performance analysis failed: {e}")
@@ -124,15 +120,13 @@ class TradingDaemon:
             
             result = subprocess.run(
                 ['python3', '/home/zgx/personal-projects/ai-trade-agent/scripts/finetune_model.py'],
-                capture_output=True,
-                text=True,
                 timeout=600
             )
             
             if result.returncode == 0:
                 logging.info("✅ Model fine-tuning complete")
             else:
-                logging.error(f"❌ Fine-tuning failed: {result.stderr}")
+                logging.error(f"❌ Fine-tuning failed with code: {result.returncode}")
                 
         except Exception as e:
             logging.error(f"❌ Fine-tuning failed: {e}")
