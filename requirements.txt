@@ -26,3 +26,6 @@ pytz>=2023.3
 # Optional (for development)
 jupyter>=1.0.0
 matplotlib>=3.7.0
+
+# Testing
+pytest>=7.0.0

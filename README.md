@@ -541,8 +541,16 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 # Verify .env file exists and has correct keys
 cat .env
 
-# Test Alpaca connection
-python3 -c "from alpaca.trading.client import TradingClient; import os; from dotenv import load_dotenv; load_dotenv(); client = TradingClient(os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY'), paper=True); print(client.get_account())"
+# Test Alpaca connection (uses PAPER_TRADING env var from .env, defaults to paper=True)
+python3 -c "
+import os
+from dotenv import load_dotenv
+from alpaca.trading.client import TradingClient
+load_dotenv()
+paper = os.getenv('PAPER_TRADING', 'true').lower() != 'false'
+client = TradingClient(os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY'), paper=paper)
+print(client.get_account())
+"
 ```
 
 ### Issue: Service won't start

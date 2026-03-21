@@ -21,6 +21,7 @@ import numpy as np
 import ollama
 sys.path.append(str(Path(__file__).resolve().parent))
 from model_inference_lora import parse_decision
+from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
 
 OLLAMA_MODEL = "qwen3:8b"
 
@@ -70,15 +71,17 @@ class OptionsAgent:
             'max_loss_per_trade': 0.02,         # Max 2% loss per trade
             'take_profit': 0.50,                # Take profit at 50%
             'stop_loss': -0.50,                 # Stop loss at -50%
+            'max_daily_loss_pct': 0.05,         # Circuit breaker: halt after -5% day
         }
-        
+
         # Watchlist for options trading
         self.watchlist = ['SPY', 'QQQ', 'AAPL', 'MSFT', 'NVDA', 'TSLA', 'AMD']
-        
+
         # Trading state
         self.daily_trades = 0
         self.last_reset_date = datetime.now().date()
         self.trade_cooldown = {}  # Symbol -> last trade time
+        self.daily_start_equity = None  # Set at start of each trading day
         
         logging.info("🎯 Options Agent Initialized")
     
@@ -344,10 +347,15 @@ Provide your decision, confidence (0-1), and reasoning."""
                 f.write(json.dumps(trade_log) + '\n')
             
             logging.info(f"✅ Executed OPTIONS trade: {quantity} contracts of {symbol} {contract_type.value}")
+            alert_trade_executed(
+                'OptionsAgent', contract.symbol, 'buy',
+                quantity, option_price, str(submitted_order.id)
+            )
             return True
-            
+
         except Exception as e:
             logging.error(f"❌ Options trade execution failed: {e}")
+            alert_trade_failed('OptionsAgent', symbol, str(e))
             return False
     
     def manage_existing_positions(self):
@@ -415,13 +423,33 @@ Provide your decision, confidence (0-1), and reasoning."""
         if today != self.last_reset_date:
             self.daily_trades = 0
             self.last_reset_date = today
+            self.daily_start_equity = None
             logging.info("🔄 Daily options trade counter reset")
-        
+
+        # Circuit breaker: check daily P&L before doing anything
+        try:
+            account = self.trading_client.get_account()
+            equity = float(account.equity)
+            if self.daily_start_equity is None:
+                self.daily_start_equity = equity
+                logging.info(f"📌 Daily starting equity set: ${self.daily_start_equity:,.2f}")
+            daily_pnl_pct = (equity - self.daily_start_equity) / self.daily_start_equity
+            max_loss = self.params['max_daily_loss_pct']
+            if daily_pnl_pct <= -max_loss:
+                logging.warning(
+                    f"🛑 CIRCUIT BREAKER: daily P&L is {daily_pnl_pct:.1%} "
+                    f"(limit: -{max_loss:.1%}). Halting options trading for the day."
+                )
+                alert_circuit_breaker('OptionsAgent', daily_pnl_pct, equity)
+                return
+        except Exception as e:
+            logging.error(f"❌ Failed to check circuit breaker: {e}")
+
         logging.info(f"📊 Daily options trades: {self.daily_trades}/{self.params['max_daily_trades']}")
-        
+
         # Step 1: Manage existing positions
         self.manage_existing_positions()
-        
+
         # Step 2: Check if we can trade more
         if self.daily_trades >= self.params['max_daily_trades']:
             logging.info(f"⛔ Daily options trade limit reached ({self.params['max_daily_trades']})")

@@ -23,6 +23,7 @@ sys.path.append(str(Path(__file__).resolve().parent))
 import ollama
 from stock_discovery import StockDiscovery
 from model_inference_lora import parse_decision
+from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
 
 OLLAMA_MODEL = "qwen3:8b"
 
@@ -293,6 +294,10 @@ class AutonomousAgent:
                 f.write(json.dumps(trade_log) + '\n')
 
             logging.info(f"✅ Executed {decision['decision'].upper()} {shares} shares of {symbol}")
+            alert_trade_executed(
+                'StockAgent', symbol, decision['decision'],
+                shares, current_price, str(submitted_order.id)
+            )
 
             # Update cooldown
             self.cooldowns[symbol] = datetime.now()
@@ -302,6 +307,7 @@ class AutonomousAgent:
 
         except Exception as e:
             logging.error(f"❌ Trade execution failed for {symbol}: {e}")
+            alert_trade_failed('StockAgent', symbol, str(e))
             return False
     
     def run_trading_session(self):
@@ -332,6 +338,7 @@ class AutonomousAgent:
                 f"🛑 CIRCUIT BREAKER: daily P&L is {daily_pnl_pct:.1%} "
                 f"(limit: -{max_loss:.1%}). Halting trading for the day."
             )
+            alert_circuit_breaker('StockAgent', daily_pnl_pct, equity)
             return
         
         # Discover opportunities
