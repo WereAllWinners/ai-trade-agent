@@ -11,7 +11,7 @@ from collections import defaultdict
 import yfinance as yf
 import sys
 
-sys.path.append('/home/zgx/personal-projects/ai-trade-agent/scripts')
+sys.path.append(str(Path(__file__).resolve().parent))
 from performance_analyzer import PerformanceAnalyzer
 from stock_discovery import StockDiscovery
 from model_inference_lora import get_trading_decision, parse_decision

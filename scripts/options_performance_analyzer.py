@@ -19,10 +19,11 @@ logging.basicConfig(
 
 class OptionsPerformanceAnalyzer:
     def __init__(self):
+        _paper = os.getenv('PAPER_TRADING', 'true').lower() != 'false'
         self.trading_client = TradingClient(
             os.getenv('ALPACA_API_KEY'),
             os.getenv('ALPACA_SECRET_KEY'),
-            paper=True
+            paper=_paper
         )
         self.trade_log_path = 'logs/options_trade_log.jsonl'
         self.output_path = 'logs/options_performance_metrics.json'

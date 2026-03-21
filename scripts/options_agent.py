@@ -12,12 +12,27 @@ from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOptionContractsRequest, MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, ContractType
+from alpaca.data.historical.option import OptionHistoricalDataClient
+from alpaca.data.requests import OptionLatestQuoteRequest
 import yfinance as yf
 import pandas as pd
 import numpy as np
 
-sys.path.append('/home/zgx/personal-projects/ai-trade-agent/scripts')
-from model_inference_lora import get_trading_decision, parse_decision
+import ollama
+sys.path.append(str(Path(__file__).resolve().parent))
+from model_inference_lora import parse_decision
+
+OLLAMA_MODEL = "qwen3:8b"
+
+def get_trading_decision(prompt, max_new_tokens=200):
+    """Get trading decision via Ollama (model stays resident in memory)."""
+    response = ollama.generate(
+        model=OLLAMA_MODEL,
+        prompt=prompt,
+        think=False,
+        options={"temperature": 0.7, "top_p": 0.9, "num_predict": max_new_tokens}
+    )
+    return response['response']
 
 load_dotenv()
 
@@ -29,10 +44,17 @@ logging.basicConfig(
 class OptionsAgent:
     def __init__(self):
         """Initialize the options trading agent."""
+        _paper = os.getenv('PAPER_TRADING', 'true').lower() != 'false'
+        if not _paper:
+            logging.warning("LIVE TRADING MODE ENABLED - real money is at risk!")
         self.trading_client = TradingClient(
             os.getenv('ALPACA_API_KEY'),
             os.getenv('ALPACA_SECRET_KEY'),
-            paper=True
+            paper=_paper
+        )
+        self.option_data_client = OptionHistoricalDataClient(
+            os.getenv('ALPACA_API_KEY'),
+            os.getenv('ALPACA_SECRET_KEY')
         )
         
         # Options-specific parameters
@@ -168,9 +190,10 @@ Provide your decision, confidence (0-1), and reasoning."""
         decision = parse_decision(response)
         
         # Map to options-specific decisions
+        # Explicit model keywords take priority; fallback uses both AI action AND momentum
         if 'call' in response.lower() or (decision['decision'] == 'buy' and analysis['momentum'] > 0):
             decision['decision'] = 'buy_call'
-        elif 'put' in response.lower() or (decision['decision'] == 'sell' or analysis['momentum'] < 0):
+        elif 'put' in response.lower() or (decision['decision'] == 'sell' and analysis['momentum'] < 0):
             decision['decision'] = 'buy_put'
         else:
             decision['decision'] = 'hold'
@@ -193,15 +216,16 @@ Provide your decision, confidence (0-1), and reasoning."""
                 type=contract_type
             )
             
-            contracts = self.trading_client.get_option_contracts(request)
-            
+            resp = self.trading_client.get_option_contracts(request)
+            contracts = resp.option_contracts if resp and resp.option_contracts else []
+
             if not contracts:
                 return None
-            
+
             # Filter by strike price and DTE
             best_contract = None
             best_score = float('inf')
-            
+
             for contract in contracts:
                 strike = float(contract.strike_price)
                 dte = (datetime.strptime(contract.expiration_date, '%Y-%m-%d') - datetime.now()).days
@@ -237,6 +261,25 @@ Provide your decision, confidence (0-1), and reasoning."""
         
         return max(1, max_contracts)
     
+    def get_option_price(self, contract_symbol):
+        """Get current mid-price for an option contract from Alpaca market data."""
+        try:
+            request = OptionLatestQuoteRequest(symbol_or_symbols=contract_symbol)
+            quotes = self.option_data_client.get_option_latest_quote(request)
+            if quotes and contract_symbol in quotes:
+                q = quotes[contract_symbol]
+                bid = float(q.bid_price) if q.bid_price else 0.0
+                ask = float(q.ask_price) if q.ask_price else 0.0
+                if bid > 0 and ask > 0:
+                    return (bid + ask) / 2.0
+                elif ask > 0:
+                    return ask
+                elif bid > 0:
+                    return bid
+        except Exception as e:
+            logging.warning(f"⚠️ Could not fetch option price for {contract_symbol}: {e}")
+        return None
+
     def execute_options_trade(self, symbol, decision, analysis, available_capital):
         """Execute options trade."""
         try:
@@ -257,9 +300,12 @@ Provide your decision, confidence (0-1), and reasoning."""
                 logging.warning(f"⚠️  No suitable option contract found for {symbol}")
                 return False
             
-            # Get option price (simplified - would need market data in production)
-            option_price = 2.0  # Placeholder - would get from market
-            
+            # Get real option price from market data (bid/ask midpoint)
+            option_price = self.get_option_price(contract.symbol)
+            if option_price is None:
+                logging.warning(f"⚠️ No market price for {contract.symbol}, skipping trade")
+                return False
+
             # Calculate position size
             quantity = self.calculate_position_size(option_price, available_capital)
             
@@ -288,6 +334,7 @@ Provide your decision, confidence (0-1), and reasoning."""
                 'expiration': contract.expiration_date,
                 'action': 'buy',
                 'quantity': quantity,
+                'entry_price': option_price,
                 'confidence': decision['confidence'],
                 'reasoning': decision['reasoning'],
                 'order_id': str(submitted_order.id)

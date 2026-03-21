@@ -8,9 +8,11 @@ import time
 import logging
 import subprocess
 from datetime import datetime, timedelta
+from pathlib import Path
 import pytz
 
-sys.path.append('/home/zgx/personal-projects/ai-trade-agent/scripts')
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+sys.path.append(str(_SCRIPTS_DIR))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,7 +74,10 @@ class OptionsDaemon:
             logging.info("💰 RUNNING OPTIONS TRADING SESSION")
             logging.info("======================================================================")
             
-            result = subprocess.run(['python3', '/home/zgx/personal-projects/ai-trade-agent/scripts/options_agent.py'], timeout=1200)
+            result = subprocess.run(
+                [sys.executable, str(_SCRIPTS_DIR / 'options_agent.py')],
+                timeout=1200
+            )
             
             if result.returncode == 0:
                 logging.info("✅ Options trading session completed successfully")
@@ -92,7 +97,10 @@ class OptionsDaemon:
             logging.info("📊 RUNNING OPTIONS PERFORMANCE ANALYSIS")
             logging.info("======================================================================")
             
-            result = subprocess.run(['python3', '/home/zgx/personal-projects/ai-trade-agent/scripts/options_performance_analyzer.py'], timeout=1200)
+            result = subprocess.run(
+                [sys.executable, str(_SCRIPTS_DIR / 'options_performance_analyzer.py')],
+                timeout=1200
+            )
             
             if result.returncode == 0:
                 logging.info("✅ Options performance analysis complete")
@@ -105,20 +113,33 @@ class OptionsDaemon:
     def run_finetuning(self):
         """Run options model fine-tuning."""
         try:
-            training_data_path = '/home/zgx/personal-projects/ai-trade-agent/finetune/data/options_training_data.json'
-            
+            training_data_path = str(_SCRIPTS_DIR.parent / 'finetune' / 'data' / 'options_training_data.json')
+
             if not os.path.exists(training_data_path):
-                logging.info("🎓 No options training data yet - need at least 3 examples")
+                logging.info("🎓 No options training data yet - skipping fine-tuning")
                 return
-            
+
             logging.info("🔔 Time for options model fine-tuning!")
             logging.info("======================================================================")
             logging.info("🎓 RUNNING OPTIONS MODEL FINE-TUNING")
             logging.info("======================================================================")
-            
-            # Fine-tuning would go here (similar to stock bot)
-            logging.info("✅ Options fine-tuning complete")
-            
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(_SCRIPTS_DIR / 'finetune_model.py'),
+                    '--data', training_data_path,
+                ],
+                timeout=3600  # 1 hour max
+            )
+
+            if result.returncode == 0:
+                logging.info("✅ Options fine-tuning complete")
+            else:
+                logging.error(f"❌ Options fine-tuning failed with code: {result.returncode}")
+
+        except subprocess.TimeoutExpired:
+            logging.error("❌ Options fine-tuning timed out after 1 hour")
         except Exception as e:
             logging.error(f"❌ Options fine-tuning failed: {e}")
     

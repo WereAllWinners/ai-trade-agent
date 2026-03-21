@@ -2,10 +2,14 @@
 """
 Model Inference with LoRA - OPTIMIZED with model caching
 """
+import os
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel
 import re
+from pathlib import Path
+
+_SCRIPTS_DIR = Path(__file__).resolve().parent
 
 # Global model cache - load once, use many times
 _MODEL_CACHE = {
@@ -21,8 +25,11 @@ def load_model_once():
         return _MODEL_CACHE['model'], _MODEL_CACHE['tokenizer']
     
     print("Loading base model and tokenizer...")
-    base_model_path = "Qwen/Qwen2.5-32B-Instruct"
-    lora_adapter_path = "/home/zgx/personal-projects/ai-trade-agent/finetune/finance_qwen_32b_lora"
+    base_model_path = os.getenv('BASE_MODEL', 'Qwen/Qwen2.5-32B-Instruct')
+    lora_adapter_path = os.getenv(
+        'LORA_ADAPTER_PATH',
+        str(_SCRIPTS_DIR.parent / 'finetune' / 'finance_qwen_32b_lora')
+    )
     
     # Configure 4-bit quantization
     bnb_config = BitsAndBytesConfig(
@@ -119,8 +126,12 @@ def parse_decision(response):
             if conf_val > 1:
                 conf_val = conf_val / 100
             confidence = max(0.0, min(1.0, conf_val))
-        except:
-            pass
+        except (ValueError, TypeError) as e:
+            import logging as _log
+            _log.warning(f"Could not parse confidence value '{confidence_match.group(1)}': {e}. Defaulting to 0.5")
+    else:
+        import logging as _log
+        _log.debug("No confidence value found in model response, defaulting to 0.5")
     
     # Extract reasoning (first 200 chars of response)
     reasoning = response[:200].replace('\n', ' ').strip()

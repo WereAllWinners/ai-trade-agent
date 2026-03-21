@@ -8,6 +8,8 @@ import json
 import logging
 from pathlib import Path
 
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -16,7 +18,7 @@ logging.basicConfig(
 def finetune_model():
     """Fine-tune the trading model with new data."""
     try:
-        training_data_path = '/home/zgx/personal-projects/ai-trade-agent/finetune/data/training_data.json'
+        training_data_path = str(_SCRIPTS_DIR.parent / 'finetune' / 'data' / 'training_data.json')
         
         # Check if training data exists
         if not os.path.exists(training_data_path):

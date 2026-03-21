@@ -90,11 +90,21 @@ nano .env  # Edit with your API keys
 
 Your `.env` file should look like:
 ```env
-ALPACA_API_KEY=your_api_key_here
-ALPACA_SECRET_KEY=your_secret_key_here
+ALPACA_API_KEY=your_paper_api_key_here
+ALPACA_SECRET_KEY=your_paper_secret_key_here
+
+# IMPORTANT: Keep true until you have 1-3 months of validated paper trading
+PAPER_TRADING=true
+
+# Optional overrides
+# BASE_MODEL=Qwen/Qwen2.5-32B-Instruct
+# LORA_ADAPTER_PATH=/absolute/path/to/lora/adapter
 ```
 
 Get your API keys from [Alpaca Markets](https://alpaca.markets/)
+
+> **`PAPER_TRADING=true` is the default and must stay `true`** during development and validation.
+> Only set it to `false` when you are fully ready for live trading (see the Live Trading Checklist below).
 
 ## 🧠 Model Setup & Fine-tuning
 
@@ -561,11 +571,44 @@ python3 finetune/fine_tune_llm.py \
   --epochs 2
 ```
 
+## 🔴 Live Trading Checklist
+
+**Do NOT set `PAPER_TRADING=false` until every item below is checked:**
+
+### Regulatory & Broker Requirements
+- [ ] You have **$25,000+ in equity** to avoid the Pattern Day Trader (PDT) rule (US accounts trading stocks more than 3 times in 5 days)
+- [ ] Your Alpaca account has **Options Level 2+ approval** (required for buying calls/puts)
+- [ ] You have reviewed [Alpaca's TOS for automated trading](https://alpaca.markets/docs/trading/)
+- [ ] You understand you are personally liable for any losses, errors, or regulatory violations caused by this bot
+
+### Strategy Validation (Minimum 1-3 Months Paper Trading)
+- [ ] Paper mode has run continuously for at least 30 trading days without crashes
+- [ ] Win rate, Sharpe ratio, and max drawdown are acceptable over a full market cycle
+- [ ] You have manually reviewed every trade for the first 2 weeks
+- [ ] The circuit breaker (5% daily loss limit) has been tested and works
+- [ ] Bracket orders (SL/TP) are confirmed to trigger correctly in paper mode
+- [ ] LLM decisions have been spot-checked — no obviously wrong or hallucinated trades
+
+### Operational Readiness
+- [ ] Systemd services restart cleanly after crashes and reboots
+- [ ] GPU/RAM are stable under 24/7 inference load
+- [ ] You have monitoring/alerts set up (at minimum, check `journalctl` daily)
+- [ ] You have a manual kill-switch procedure: `sudo systemctl stop ai-trading-bot.service ai-options-bot.service`
+
+### Going Live
+1. Switch to a **live Alpaca account** and update `.env` with live credentials
+2. Set `PAPER_TRADING=false`
+3. Start with minimal capital (1-2% of your intended allocation)
+4. Keep manual oversight for the first 2 weeks of live trading
+5. Scale up only after consistent live performance
+
+---
+
 ## ⚠️ Disclaimer
 
 This is an experimental trading system. **Use at your own risk.**
 
-- ⚠️ Start with **paper trading** only
+- ⚠️ Start with **paper trading** only (`PAPER_TRADING=true`)
 - ⚠️ Never invest more than you can afford to lose
 - ⚠️ Past performance does not guarantee future results
 - ⚠️ The author is not responsible for any financial losses
@@ -573,6 +616,9 @@ This is an experimental trading system. **Use at your own risk.**
 - ⚠️ Always do your own research
 - ⚠️ Test thoroughly before using real money
 - ⚠️ Markets are inherently risky
+- ⚠️ **PDT Rule**: Day-trading US stocks more than 3 times in 5 business days requires $25,000+ account equity (Pattern Day Trader rule). Violations can result in a 90-day trading restriction.
+- ⚠️ **Options Approval**: Buying options requires Level 2 options approval from Alpaca. Apply in your Alpaca account settings before running the options bot live.
+- ⚠️ **Automated Bot TOS**: Review Alpaca's Terms of Service regarding automated trading. You are responsible for ensuring your use of this software complies with all applicable laws and broker rules.
 
 ## 🤝 Contributing
 

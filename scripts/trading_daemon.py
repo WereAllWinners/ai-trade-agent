@@ -9,9 +9,11 @@ import logging
 import subprocess
 import traceback
 from datetime import datetime, timedelta
+from pathlib import Path
 import pytz
 
-sys.path.append('/home/zgx/personal-projects/ai-trade-agent/scripts')
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+sys.path.append(str(_SCRIPTS_DIR))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,6 +28,7 @@ class TradingDaemon:
         self.trading_interval = 30  # 30 minutes
         self.analysis_time = datetime.strptime('17:00', '%H:%M').time()  # 5:00 PM
         self.finetune_time = datetime.strptime('20:00', '%H:%M').time()  # 8:00 PM
+        self.weekly_report_time = datetime.strptime('10:00', '%H:%M').time()  # Sat 10:00 AM
         
         logging.info("🤖 Trading Daemon Initialized")
         logging.info("⏰ Stock trading every 30 minutes")
@@ -75,8 +78,8 @@ class TradingDaemon:
             logging.info("🔄 Initializing trading agent...")
             
             result = subprocess.run(
-                ['python3', '/home/zgx/personal-projects/ai-trade-agent/scripts/autonomous_agent.py'],
-                timeout=300
+                [sys.executable, str(_SCRIPTS_DIR / 'autonomous_agent.py')],
+                timeout=900
             )
             
             if result.returncode == 0:
@@ -90,26 +93,54 @@ class TradingDaemon:
             logging.error(f"❌ Trading session failed: {e}")
     
     def run_performance_analysis(self):
-        """Run performance analysis."""
+        """Run outcome tracking then performance analysis."""
+        # Step 1: Enrich trade log with fill prices and compute P&L
+        try:
+            logging.info("📥 Fetching trade fill prices and computing P&L...")
+            result = subprocess.run(
+                [sys.executable, str(_SCRIPTS_DIR / 'outcome_tracker.py')],
+                timeout=120
+            )
+            if result.returncode != 0:
+                logging.warning(f"⚠️ Outcome tracker exited with code: {result.returncode}")
+        except Exception as e:
+            logging.warning(f"⚠️ Outcome tracker failed: {e}")
+
+        # Step 2: Run core performance analysis
         try:
             logging.info("🔔 Time for performance analysis!")
             logging.info("======================================================================")
             logging.info("📊 RUNNING PERFORMANCE ANALYSIS")
             logging.info("======================================================================")
-            
+
             result = subprocess.run(
-                ['python3', '/home/zgx/personal-projects/ai-trade-agent/scripts/performance_analyzer.py'],
+                [sys.executable, str(_SCRIPTS_DIR / 'performance_analyzer.py')],
                 timeout=300
             )
-            
+
             if result.returncode == 0:
                 logging.info("✅ Performance analysis complete")
             else:
                 logging.error(f"❌ Performance analysis failed with code: {result.returncode}")
-                
+
         except Exception as e:
             logging.error(f"❌ Performance analysis failed: {e}")
     
+    def run_weekly_report(self):
+        """Generate the weekly performance report (runs Saturday morning)."""
+        try:
+            logging.info("📊 Running weekly performance report...")
+            result = subprocess.run(
+                [sys.executable, str(_SCRIPTS_DIR / 'weekly_report.py'), '--days', '7'],
+                timeout=300
+            )
+            if result.returncode == 0:
+                logging.info("✅ Weekly report complete")
+            else:
+                logging.error(f"❌ Weekly report failed with code: {result.returncode}")
+        except Exception as e:
+            logging.error(f"❌ Weekly report failed: {e}")
+
     def run_finetuning(self):
         """Run model fine-tuning."""
         try:
@@ -119,7 +150,7 @@ class TradingDaemon:
             logging.info("======================================================================")
             
             result = subprocess.run(
-                ['python3', '/home/zgx/personal-projects/ai-trade-agent/scripts/finetune_model.py'],
+                [sys.executable, str(_SCRIPTS_DIR / 'finetune_model.py')],
                 timeout=600
             )
             
@@ -182,20 +213,35 @@ class TradingDaemon:
         last_trade_time = None
         analysis_done_today = False
         finetune_done_today = False
-        
+        weekly_report_done_this_week = False
+        last_weekly_report_week = None
+
         while True:
             try:
                 now = datetime.now(self.est)
                 current_time = now.time()
                 current_date = now.date()
-                
-                # Reset daily flags
+                current_week = now.isocalendar()[1]
+
+                # Reset daily flags on date change
                 if last_trade_time and last_trade_time.date() != current_date:
                     analysis_done_today = False
                     finetune_done_today = False
+
+                # Reset weekly report flag on new calendar week
+                if last_weekly_report_week != current_week:
+                    weekly_report_done_this_week = False
                 
                 logging.info(f"📅 Current time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
                 
+                # Weekly report on Saturday at 10:00 AM
+                if (now.weekday() == 5  # Saturday
+                        and not weekly_report_done_this_week
+                        and current_time >= self.weekly_report_time):
+                    self.run_weekly_report()
+                    weekly_report_done_this_week = True
+                    last_weekly_report_week = current_week
+
                 # Performance analysis at 5:00 PM
                 if not analysis_done_today and current_time >= self.analysis_time:
                     self.run_performance_analysis()

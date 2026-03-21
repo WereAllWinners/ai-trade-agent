@@ -1,0 +1,30 @@
+[Unit]
+Description=AI Options Trading Bot (options_agent via options_daemon)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Update User/Group and paths to match your setup
+User=zgx
+Group=zgx
+WorkingDirectory=/home/zgx/personal-projects/ai-trade-agent
+
+# Load environment variables from .env
+EnvironmentFile=/home/zgx/personal-projects/ai-trade-agent/.env
+
+# Use the venv Python if present, otherwise system Python
+ExecStart=/home/zgx/personal-projects/ai-trade-agent/venv/bin/python \
+    /home/zgx/personal-projects/ai-trade-agent/scripts/options_daemon.py
+
+# Restart on crash (but not on clean exit)
+Restart=on-failure
+RestartSec=30s
+
+# Log to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-options-bot
+
+[Install]
+WantedBy=multi-user.target

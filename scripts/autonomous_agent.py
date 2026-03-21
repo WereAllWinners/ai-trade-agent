@@ -14,19 +14,29 @@ from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 # Add project root to path
-sys.path.append('/home/zgx/personal-projects/ai-trade-agent/scripts')
+sys.path.append(str(Path(__file__).resolve().parent))
 
+import ollama
 from stock_discovery import StockDiscovery
-from model_inference_lora import get_trading_decision, parse_decision
+from model_inference_lora import parse_decision
+
+OLLAMA_MODEL = "qwen3:8b"
+
+def get_trading_decision(prompt):
+    """Get trading decision via Ollama (model stays resident in memory)."""
+    response = ollama.generate(
+        model=OLLAMA_MODEL,
+        prompt=prompt,
+        think=False,
+        options={"temperature": 0.7, "top_p": 0.9, "num_predict": 200}
+    )
+    return response['response']
 
 load_dotenv()
-
-print("API Key:", os.getenv('ALPACA_API_KEY'))
-print("Secret Key:", os.getenv('ALPACA_SECRET_KEY'))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,10 +47,13 @@ class AutonomousAgent:
     def __init__(self):
         """Initialize the autonomous trading agent."""
         # Alpaca clients
+        _paper = os.getenv('PAPER_TRADING', 'true').lower() != 'false'
+        if not _paper:
+            logging.warning("LIVE TRADING MODE ENABLED - real money is at risk!")
         self.trading_client = TradingClient(
             os.getenv('ALPACA_API_KEY'),
             os.getenv('ALPACA_SECRET_KEY'),
-            paper=True
+            paper=_paper
         )
         self.data_client = StockHistoricalDataClient(
             os.getenv('ALPACA_API_KEY'),
@@ -57,6 +70,7 @@ class AutonomousAgent:
         self.cooldowns = {}
         self.daily_trades = 0
         self.last_reset_date = datetime.now().date()
+        self.daily_start_equity = None  # Set at start of each trading day
         
         logging.info("🤖 Autonomous Agent Initialized")
     
@@ -68,25 +82,29 @@ class AutonomousAgent:
             'min_confidence': 0.60,     # AI confidence threshold
             'max_stocks_to_analyze': 25,
             'max_daily_trades': 10,
-            'cooldown_minutes': 15
+            'cooldown_minutes': 15,
+            'stop_loss': -0.07,         # -7% stop loss
+            'take_profit': 0.15,        # +15% take profit
+            'max_daily_loss_pct': 0.05, # Circuit breaker: stop trading after -5% day
         }
         
         # Try Monday params first (from weekend analysis)
+        monday_params = {}
         monday_path = Path('logs/monday_params.json')
         if monday_path.exists():
             with open(monday_path) as f:
                 monday_params = json.load(f)
                 defaults.update(monday_params)
                 logging.info("📅 Loaded Monday parameters")
-        
+
         # Try adaptive params (from nightly analysis)
+        # Only apply keys that Monday params didn't already set
         adaptive_path = Path('logs/adaptive_params.json')
         if adaptive_path.exists():
             with open(adaptive_path) as f:
                 adaptive_params = json.load(f)
-                # Only update if not already updated by Monday params
                 for k, v in adaptive_params.items():
-                    if k not in monday_params if monday_path.exists() else defaults:
+                    if k not in monday_params:
                         defaults[k] = v
                 logging.info("🔧 Loaded adaptive parameters")
         
@@ -203,36 +221,63 @@ class AutonomousAgent:
             'current_price': df['close'].iloc[-1]
         }
     
+    def get_position(self, symbol):
+        """Return the current position for symbol, or None if not held."""
+        try:
+            return self.trading_client.get_open_position(symbol)
+        except Exception:
+            return None
+
     def execute_trade(self, symbol, decision, equity):
         """Execute a trade based on AI decision."""
         try:
-            # Calculate shares
-            position_value = equity * self.params['max_position_size']
+            side = OrderSide.BUY if decision['decision'] == 'buy' else OrderSide.SELL
             current_price = decision.get('current_price', 0)
-            
+
             if current_price == 0:
                 logging.error(f"❌ Cannot execute trade for {symbol}: no price data")
                 return False
-            
-            shares = int(position_value / current_price)
-            
+
+            # For sells, verify we actually hold the position
+            if side == OrderSide.SELL:
+                position = self.get_position(symbol)
+                if position is None:
+                    logging.warning(f"⚠️  Skipping SELL {symbol}: no open position held")
+                    return False
+                shares = int(float(position.qty))
+            else:
+                position_value = equity * self.params['max_position_size']
+                shares = int(position_value / current_price)
+
             if shares == 0:
                 logging.warning(f"⚠️  Position too small for {symbol}")
                 return False
-            
-            # Create order
-            side = OrderSide.BUY if decision['decision'] == 'buy' else OrderSide.SELL
-            
-            order = MarketOrderRequest(
-                symbol=symbol,
-                qty=shares,
-                side=side,
-                time_in_force=TimeInForce.DAY
-            )
-            
+
+            # Build order — bracket for buys, plain market for sells
+            if side == OrderSide.BUY:
+                stop_price = round(current_price * (1 + self.params['stop_loss']), 2)
+                take_profit_price = round(current_price * (1 + self.params['take_profit']), 2)
+                order = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=shares,
+                    side=side,
+                    time_in_force=TimeInForce.DAY,
+                    order_class='bracket',
+                    take_profit=TakeProfitRequest(limit_price=take_profit_price),
+                    stop_loss=StopLossRequest(stop_price=stop_price),
+                )
+                logging.info(f"  Bracket: SL=${stop_price:.2f} / TP=${take_profit_price:.2f}")
+            else:
+                order = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=shares,
+                    side=side,
+                    time_in_force=TimeInForce.DAY,
+                )
+
             # Submit order
             submitted_order = self.trading_client.submit_order(order)
-            
+
             # Log trade
             trade_log = {
                 'timestamp': datetime.now().isoformat(),
@@ -243,18 +288,18 @@ class AutonomousAgent:
                 'reasoning': decision['reasoning'],
                 'order_id': str(submitted_order.id)
             }
-            
+
             with open('logs/trade_log.jsonl', 'a') as f:
                 f.write(json.dumps(trade_log) + '\n')
-            
+
             logging.info(f"✅ Executed {decision['decision'].upper()} {shares} shares of {symbol}")
-            
+
             # Update cooldown
             self.cooldowns[symbol] = datetime.now()
             self.daily_trades += 1
-            
+
             return True
-            
+
         except Exception as e:
             logging.error(f"❌ Trade execution failed for {symbol}: {e}")
             return False
@@ -266,12 +311,28 @@ class AutonomousAgent:
         if today != self.last_reset_date:
             self.daily_trades = 0
             self.last_reset_date = today
+            self.daily_start_equity = None
             logging.info("🔄 Daily trade counter reset")
-        
+
         # Get account info
         account = self.trading_client.get_account()
         equity = float(account.equity)
         logging.info(f"💰 Account Equity: ${equity:,.2f}")
+
+        # Record starting equity for circuit breaker
+        if self.daily_start_equity is None:
+            self.daily_start_equity = equity
+            logging.info(f"📌 Daily starting equity set: ${self.daily_start_equity:,.2f}")
+
+        # Circuit breaker: stop trading if daily loss exceeds threshold
+        daily_pnl_pct = (equity - self.daily_start_equity) / self.daily_start_equity
+        max_loss = self.params['max_daily_loss_pct']
+        if daily_pnl_pct <= -max_loss:
+            logging.warning(
+                f"🛑 CIRCUIT BREAKER: daily P&L is {daily_pnl_pct:.1%} "
+                f"(limit: -{max_loss:.1%}). Halting trading for the day."
+            )
+            return
         
         # Discover opportunities
         max_stocks = self.params['max_stocks_to_analyze']
@@ -295,8 +356,8 @@ class AutonomousAgent:
                 else:
                     symbol = opp['symbol']
             except Exception as e:
-                logger.error(f"Error processing opportunity: {opp}. Error: {str(e)}")
-                continue  # This is now properly inside the for loop
+                logging.error(f"Error processing opportunity: {opp}. Error: {str(e)}")
+                continue
             
             # Check limits
             if self.daily_trades >= self.params['max_daily_trades']:
@@ -326,7 +387,7 @@ class AutonomousAgent:
             Volume Ratio: {indicators['volume_ratio']:.1f}x average
             Price Change (100 bars): {indicators['price_change_pct']:+.1f}%
 
-            Discovery Signals: {', '.join(opp['signals'])}
+            Discovery Signals: {', '.join(self.discovery.opportunities.get(symbol, []))}
 
             Based on this data, should we BUY, SELL, or HOLD? 
             Provide your decision, confidence (0-1), and reasoning."""
