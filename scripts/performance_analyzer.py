@@ -43,20 +43,20 @@ class PerformanceAnalyzer:
         total_trades = len(df)
         buy_trades = len(df[df['action'] == 'buy'])
         sell_trades = len(df[df['action'] == 'sell'])
-        failed_trades = len(df[df['action'].str.contains('FAILED')])
-        
+        failed_trades = len(df[df['action'].str.contains('FAILED', na=False)])
+
         # Average confidence
-        avg_confidence = df['confidence'].mean()
-        
+        avg_confidence = df['confidence'].mean() if 'confidence' in df.columns else 0.0
+
         # Most traded symbols
-        symbol_counts = df['symbol'].value_counts().head(5).to_dict()
-        
+        symbol_counts = df['symbol'].value_counts().head(5).to_dict() if 'symbol' in df.columns else {}
+
         # Action distribution
         action_dist = df['action'].value_counts().to_dict()
-        
-        # Calculate total capital deployed
-        total_deployed = (df['qty'] * df['price']).sum()
-        
+
+        # Total shares traded (price not logged at entry — tracked separately by outcome tracker)
+        total_shares = int(df['shares'].sum()) if 'shares' in df.columns else 0
+
         self.insights = {
             'total_trades': total_trades,
             'buy_trades': buy_trades,
@@ -66,7 +66,7 @@ class PerformanceAnalyzer:
             'avg_confidence': avg_confidence,
             'most_traded': symbol_counts,
             'action_distribution': action_dist,
-            'total_capital_deployed': total_deployed,
+            'total_shares_traded': total_shares,
             'analysis_date': datetime.now().isoformat()
         }
         
@@ -99,14 +99,14 @@ class PerformanceAnalyzer:
                 'reason': 'Trading too few symbols, expand discovery to 15+ stocks'
             })
         
-        # Recommendation 3: Position sizing
-        total_deployed = self.insights.get('total_capital_deployed', 0)
-        if total_deployed > 50000:
+        # Recommendation 3: Position sizing (based on trade frequency as a proxy)
+        total_trades = self.insights.get('total_trades', 0)
+        if total_trades > 50:
             recommendations.append({
                 'type': 'position_size',
                 'action': 'reduce',
                 'value': 0.03,
-                'reason': f'High capital deployment (${total_deployed:.0f}), reduce position size to 3%'
+                'reason': f'High trade volume ({total_trades} trades), consider reducing position size to 3% to limit risk'
             })
         
         # Recommendation 4: Failed trades
@@ -148,7 +148,7 @@ class PerformanceAnalyzer:
         print(f"  - Failed: {self.insights.get('failed_trades', 0)}")
         print(f"Success Rate: {self.insights.get('success_rate', 0):.1f}%")
         print(f"Avg Confidence: {self.insights.get('avg_confidence', 0):.2f}")
-        print(f"Capital Deployed: ${self.insights.get('total_capital_deployed', 0):,.2f}")
+        print(f"Total Shares Traded: {self.insights.get('total_shares_traded', 0):,}")
         
         print("\nMost Traded Symbols:")
         for symbol, count in self.insights.get('most_traded', {}).items():

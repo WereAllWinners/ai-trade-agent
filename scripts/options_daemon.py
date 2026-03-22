@@ -2,6 +2,7 @@
 """
 Options Trading Daemon - Runs options bot 24/7
 """
+import json
 import os
 import sys
 import time
@@ -12,7 +13,22 @@ from pathlib import Path
 import pytz
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
+_HEARTBEAT_FILE = _SCRIPTS_DIR.parent / 'logs' / 'heartbeat_options.json'
 sys.path.append(str(_SCRIPTS_DIR))
+
+
+def _write_heartbeat(status: str, market_open: bool) -> None:
+    """Update heartbeat file so health_server.py can report daemon liveness."""
+    try:
+        _HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _HEARTBEAT_FILE.write_text(json.dumps({
+            'daemon': 'options',
+            'status': status,
+            'market_open': market_open,
+            'ts': datetime.utcnow().isoformat() + 'Z',
+        }))
+    except Exception:
+        pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -207,6 +223,7 @@ class OptionsDaemon:
                     finetune_done_today = False
                 
                 logging.info(f"📅 Current time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                _write_heartbeat('running', self.is_market_open())
                 
                 # Performance analysis at 5:30 PM
                 if not analysis_done_today and current_time >= self.analysis_time:

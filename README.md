@@ -347,6 +347,16 @@ python3 scripts/model_inference_lora.py
 
 # Test weekend analysis
 python3 scripts/weekend_strategist.py
+
+# Run backtest (no GPU required — uses rule-based signals on historical data)
+python3 scripts/backtester.py --symbols SPY QQQ AAPL MSFT NVDA --days 365
+python3 scripts/backtester.py --symbols SPY --days 730 --stop-loss -0.05 --take-profit 0.12
+
+# Run unit tests
+python3 -m pytest tests/ -v
+
+# Test alerts system (writes to logs/alerts.jsonl, sends email if configured)
+python3 scripts/alerts.py
 ```
 
 ### Production Deployment (Systemd)
@@ -389,6 +399,75 @@ sudo systemctl restart ai-trading-bot.service
 # Check status
 sudo systemctl status ai-trading-bot.service
 ```
+
+## 🔔 Alerts & Health Monitoring
+
+### Alert Channels
+
+| Channel | Always active? | Config required |
+|---------|---------------|-----------------|
+| File log (`logs/alerts.jsonl`) | Yes | None |
+| Email (SMTP) | Optional | See `.env.example` |
+
+**Events that trigger alerts:**
+- `circuit_breaker` — CRITICAL — daily loss limit hit, trading halted
+- `trade_executed` — INFO — every successfully placed order
+- `trade_failed` — WARNING — order rejected or API error
+
+**Email setup (Gmail example):**
+```env
+# In .env — create an App Password at https://myaccount.google.com/apppasswords
+ALERT_EMAIL_FROM=yourbot@gmail.com
+ALERT_EMAIL_TO=you@example.com
+ALERT_SMTP_HOST=smtp.gmail.com
+ALERT_SMTP_PORT=587
+ALERT_SMTP_USER=yourbot@gmail.com
+ALERT_SMTP_PASSWORD=your_16_char_app_password
+```
+
+For other providers (Outlook, SendGrid, AWS SES), change `ALERT_SMTP_HOST` and `ALERT_SMTP_PORT` accordingly.  Leave all `ALERT_*` vars unset to disable email and use file-only logging.
+
+**View recent alert log:**
+```bash
+tail -20 logs/alerts.jsonl | jq
+```
+
+### Health Check Endpoint (UptimeRobot)
+
+The health server exposes `GET /health` and reports daemon liveness based on heartbeat files written every loop iteration by each daemon.
+
+**Start the health server:**
+```bash
+# Manual
+python3 scripts/health_server.py --port 8765
+
+# Via systemd (recommended)
+sudo cp services/ai-health-server.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ai-health-server.service
+```
+
+**Sample response:**
+```json
+{
+  "status": "ok",
+  "daemons": {
+    "stock":   { "healthy": true,  "age_seconds": 42,  "market_open": true },
+    "options": { "healthy": true,  "age_seconds": 61,  "market_open": true }
+  },
+  "recent_warnings": []
+}
+```
+
+`status` is `"ok"` | `"degraded"` (one daemon stale) | `"down"` (both stale, returns HTTP 503).
+
+**UptimeRobot configuration:**
+1. Add new monitor → **HTTP(s)**
+2. URL: `http://<your-server-ip>:8765/health`
+3. Keyword monitoring → alert if keyword `"ok"` is **not present**
+4. Check interval: every 5 minutes
+
+---
 
 ## 📊 Performance Tracking
 

@@ -2,6 +2,7 @@
 """
 Trading Daemon - Runs stock trading bot 24/7
 """
+import json
 import os
 import sys
 import time
@@ -13,7 +14,22 @@ from pathlib import Path
 import pytz
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
+_HEARTBEAT_FILE = _SCRIPTS_DIR.parent / 'logs' / 'heartbeat_stock.json'
 sys.path.append(str(_SCRIPTS_DIR))
+
+
+def _write_heartbeat(status: str, market_open: bool) -> None:
+    """Update heartbeat file so health_server.py can report daemon liveness."""
+    try:
+        _HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _HEARTBEAT_FILE.write_text(json.dumps({
+            'daemon': 'stock',
+            'status': status,
+            'market_open': market_open,
+            'ts': datetime.utcnow().isoformat() + 'Z',
+        }))
+    except Exception:
+        pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -233,6 +249,7 @@ class TradingDaemon:
                     weekly_report_done_this_week = False
                 
                 logging.info(f"📅 Current time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                _write_heartbeat('running', self.is_market_open())
                 
                 # Weekly report on Saturday at 10:00 AM
                 if (now.weekday() == 5  # Saturday

@@ -1,0 +1,27 @@
+[Unit]
+Description=AI Trade Agent Health Check Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zgx
+Group=zgx
+WorkingDirectory=/home/zgx/personal-projects/ai-trade-agent
+
+EnvironmentFile=/home/zgx/personal-projects/ai-trade-agent/.env
+Environment=HEALTH_PORT=8765
+Environment=HEALTH_MAX_AGE_SECONDS=300
+
+ExecStart=/home/zgx/personal-projects/ai-trade-agent/venv/bin/python \
+    /home/zgx/personal-projects/ai-trade-agent/scripts/health_server.py
+
+Restart=always
+RestartSec=10s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-health-server
+
+[Install]
+WantedBy=multi-user.target

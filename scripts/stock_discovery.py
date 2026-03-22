@@ -135,12 +135,13 @@ class StockDiscovery:
                         avg_volume = hist['Volume'].mean()
                         current_price = hist['Close'].iloc[-1]
                         
-                        if (avg_volume >= min_volume and 
-                            current_price >= 5.0 and 
+                        if (avg_volume >= min_volume and
+                            current_price >= 5.0 and
                             current_price <= 2000.0):
                             liquid_stocks.append(symbol)
-                
-                except:
+
+                except Exception as e:
+                    logging.debug(f"Skipping {symbol} in liquidity filter: {e}")
                     continue
             
             if (i // batch_size) % 10 == 0 and i > 0:
@@ -171,8 +172,9 @@ class StockDiscovery:
                 if volume_ratio >= 2.0:
                     unusual_stocks.append((symbol, volume_ratio))
                     self.opportunities[symbol].append(f"Unusual volume: {volume_ratio:.1f}x")
-            
-            except:
+
+            except Exception as e:
+                logging.debug(f"Skipping {symbol} in volume scan: {e}")
                 continue
         
         unusual_stocks.sort(key=lambda x: x[1], reverse=True)
@@ -202,8 +204,9 @@ class StockDiscovery:
                     pct_from_high = ((current_price - high_52week) / high_52week) * 100
                     breakout_stocks.append((symbol, pct_from_high))
                     self.opportunities[symbol].append(f"52W breakout: {pct_from_high:+.1f}%")
-            
-            except:
+
+            except Exception as e:
+                logging.debug(f"Skipping {symbol} in breakout scan: {e}")
                 continue
         
         breakout_stocks.sort(key=lambda x: x[1], reverse=True)
@@ -236,8 +239,9 @@ class StockDiscovery:
                 if current_rsi < 30:
                     oversold_stocks.append((symbol, current_rsi))
                     self.opportunities[symbol].append(f"Oversold RSI: {current_rsi:.1f}")
-            
-            except:
+
+            except Exception as e:
+                logging.debug(f"Skipping {symbol} in oversold scan: {e}")
                 continue
         
         oversold_stocks.sort(key=lambda x: x[1])
@@ -267,8 +271,9 @@ class StockDiscovery:
                 if return_pct >= 5.0:
                     momentum_stocks.append((symbol, return_pct))
                     self.opportunities[symbol].append(f"20D momentum: +{return_pct:.1f}%")
-            
-            except:
+
+            except Exception as e:
+                logging.debug(f"Skipping {symbol} in momentum scan: {e}")
                 continue
         
         momentum_stocks.sort(key=lambda x: x[1], reverse=True)
@@ -299,8 +304,9 @@ class StockDiscovery:
                     gap_stocks.append((symbol, gap_pct))
                     direction = "up" if gap_pct > 0 else "down"
                     self.opportunities[symbol].append(f"Gap {direction}: {gap_pct:+.1f}%")
-            
-            except:
+
+            except Exception as e:
+                logging.debug(f"Skipping {symbol} in gap scan: {e}")
                 continue
         
         gap_stocks.sort(key=lambda x: abs(x[1]), reverse=True)
@@ -333,8 +339,9 @@ class StockDiscovery:
                 if below_avg_pct <= -10 and below_high_pct >= -30:
                     reversion_stocks.append((symbol, below_avg_pct))
                     self.opportunities[symbol].append(f"Mean reversion: {below_avg_pct:.1f}% below avg")
-            
-            except:
+
+            except Exception as e:
+                logging.debug(f"Skipping {symbol} in mean reversion scan: {e}")
                 continue
         
         reversion_stocks.sort(key=lambda x: x[1])
@@ -378,10 +385,11 @@ class StockDiscovery:
                 if not hist.empty:
                     avg_volume = hist['Volume'].mean()
                     current_price = hist['Close'].iloc[-1]
-                    
+
                     if avg_volume >= min_volume and current_price >= min_price:
                         liquid_stocks.append(symbol)
-            except:
+            except Exception as e:
+                logging.debug(f"Skipping {symbol} in final liquidity filter: {e}")
                 continue
         
         return liquid_stocks

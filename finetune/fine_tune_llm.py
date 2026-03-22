@@ -5,6 +5,7 @@ Supports fresh training, continuing from adapters, and resuming from checkpoints
 """
 
 import os
+import sys
 import json
 import torch
 import argparse
@@ -227,8 +228,13 @@ def main():
         default_path = '/home/zgx/personal-projects/ai-trade-agent/finetune/finance_qwen_32b_lora'
         if Path(default_path).exists():
             print(f"🔍 Found existing model at: {default_path}")
-            response = input("Continue training from this model? [Y/n]: ").strip().lower()
-            if response != 'n':
+            if sys.stdin.isatty():
+                response = input("Continue training from this model? [Y/n]: ").strip().lower()
+                if response != 'n':
+                    adapter_source = default_path
+            else:
+                # Non-interactive (daemon): auto-continue from existing adapter
+                print(f"🔄 Non-interactive mode: auto-continuing from {default_path}")
                 adapter_source = default_path
 
     trainer = AdvancedModelTrainer(existing_adapter=adapter_source)
