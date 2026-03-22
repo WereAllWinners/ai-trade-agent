@@ -25,7 +25,7 @@ def _write_heartbeat(status: str, market_open: bool) -> None:
             'daemon': 'options',
             'status': status,
             'market_open': market_open,
-            'ts': datetime.utcnow().isoformat() + 'Z',
+            'ts': datetime.now(datetime.UTC).isoformat(),
         }))
     except Exception:
         pass
@@ -42,12 +42,12 @@ class OptionsDaemon:
         self.market_close = datetime.strptime('16:00', '%H:%M').time()
         self.trading_interval = 60  # 60 minutes
         self.analysis_time = datetime.strptime('17:30', '%H:%M').time()  # 5:30 PM
-        self.finetune_time = datetime.strptime('21:00', '%H:%M').time()  # 9:00 PM
+        self.finetune_time = datetime.strptime('02:00', '%H:%M').time()  # 2:00 AM
         
         logging.info("🤖 Options Trading Daemon Initialized")
         logging.info("⏰ Options trading every 60 minutes")
         logging.info("📊 Performance analysis scheduled for 5:30 PM EST daily")
-        logging.info("🎓 Model fine-tuning scheduled for 9:00 PM EST daily")
+        logging.info("🎓 Model fine-tuning scheduled for 2:00 AM EST daily")
     
     def is_market_open(self):
         """Check if market is currently open."""
@@ -176,10 +176,11 @@ class OptionsDaemon:
         if now < analysis_dt:
             events.append(('Options Analysis', analysis_dt))
         
-        # Fine-tuning time (9:00 PM)
-        finetune_dt = now.replace(hour=21, minute=0, second=0, microsecond=0)
-        if now < finetune_dt:
-            events.append(('Options Fine-tuning', finetune_dt))
+        # Fine-tuning time (2:00 AM) - may be next calendar day
+        finetune_dt = now.replace(hour=2, minute=0, second=0, microsecond=0)
+        if now >= finetune_dt:
+            finetune_dt += timedelta(days=1)
+        events.append(('Options Fine-tuning', finetune_dt))
         
         # Find next event
         if events:
@@ -205,7 +206,7 @@ class OptionsDaemon:
         logging.info("🚀 Starting Options Daemon - Running 24/7")
         logging.info("💰 Options Trading: 9:30 AM - 4:00 PM EST")
         logging.info("📊 Analysis: 5:30 PM EST (daily)")
-        logging.info("🎓 Learning: 9:00 PM EST (daily)")
+        logging.info("🎓 Learning: 2:00 AM EST (daily)")
         
         last_trade_time = None
         analysis_done_today = False

@@ -26,7 +26,7 @@ def _write_heartbeat(status: str, market_open: bool) -> None:
             'daemon': 'stock',
             'status': status,
             'market_open': market_open,
-            'ts': datetime.utcnow().isoformat() + 'Z',
+            'ts': datetime.now(datetime.UTC).isoformat(),
         }))
     except Exception:
         pass
