@@ -1,6 +1,9 @@
 import json
+import math
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
+from pathlib import Path
 import logging
 from collections import defaultdict
 
@@ -9,8 +12,10 @@ logging.basicConfig(level=logging.INFO)
 class PerformanceAnalyzer:
     def __init__(self, log_file='logs/trade_log.jsonl'):
         self.log_file = log_file
+        self.outcomes_file = str(Path(log_file).parent / 'trade_outcomes.jsonl')
         self.trades = []
         self.insights = {}
+        self.pnl_metrics = {}
     
     def load_trades(self, days_back=7):
         """Load trades from the last N days."""
@@ -31,6 +36,114 @@ class PerformanceAnalyzer:
         except Exception as e:
             logging.error(f"Error loading trades: {e}")
     
+    def load_outcomes(self, days_back=None):
+        """Load realized P&L records from trade_outcomes.jsonl."""
+        outcomes = []
+        try:
+            cutoff = datetime.now() - timedelta(days=days_back) if days_back else None
+            with open(self.outcomes_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        o = json.loads(line)
+                        if cutoff:
+                            exit_dt = datetime.fromisoformat(o['exit_timestamp'])
+                            if exit_dt < cutoff:
+                                continue
+                        outcomes.append(o)
+                    except Exception:
+                        pass
+        except FileNotFoundError:
+            logging.info("No trade_outcomes.jsonl yet — outcome tracker hasn't run or no closed trades.")
+        except Exception as e:
+            logging.error(f"Error loading outcomes: {e}")
+        return outcomes
+
+    def analyze_pnl_metrics(self, days_back=30):
+        """
+        Compute real trading metrics from closed trade outcomes.
+
+        Uses trade_outcomes.jsonl (written by outcome_tracker.py after each
+        nightly run) which contains actual fill prices and realized P&L.
+
+        Returns a dict with Sharpe, profit factor, win rate, and a
+        go_live_ready boolean against the target thresholds.
+        """
+        outcomes = self.load_outcomes(days_back=days_back)
+        if not outcomes:
+            logging.info("No closed outcomes yet — keep paper trading.")
+            return {}
+
+        pnl_pcts    = [o['pnl_pct']     for o in outcomes]
+        pnl_dollars = [o['realized_pnl'] for o in outcomes]
+        winners     = [o for o in outcomes if o['won']]
+        losers      = [o for o in outcomes if not o['won']]
+
+        gross_profit = sum(o['realized_pnl'] for o in winners)
+        gross_loss   = abs(sum(o['realized_pnl'] for o in losers))
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+
+        win_rate     = len(winners) / len(outcomes)
+        avg_win_pct  = float(np.mean([o['pnl_pct'] for o in winners])) if winners else 0.0
+        avg_loss_pct = float(np.mean([o['pnl_pct'] for o in losers]))  if losers  else 0.0
+        total_pnl    = sum(pnl_dollars)
+
+        # Annualised Sharpe: scale by sqrt(estimated trades per year)
+        # based on average hold duration so it's comparable to the backtester
+        avg_hold_hours = float(np.mean([o['hold_hours'] for o in outcomes]))
+        avg_hold_days  = max(avg_hold_hours / 6.5, 0.1)   # 6.5 trading hours/day
+        trades_per_year = 252 / avg_hold_days
+        mean_r = float(np.mean(pnl_pcts))
+        std_r  = float(np.std(pnl_pcts))
+        sharpe = (mean_r / std_r) * math.sqrt(trades_per_year) if std_r > 0 else 0.0
+
+        # Max consecutive losses
+        max_consec = consec = 0
+        for o in outcomes:
+            if not o['won']:
+                consec += 1
+                max_consec = max(max_consec, consec)
+            else:
+                consec = 0
+
+        # Expectancy per trade
+        expectancy = (win_rate * avg_win_pct) + ((1 - win_rate) * avg_loss_pct)
+
+        # Go-live gate (matches roadmap targets)
+        go_live_ready = (
+            win_rate      >= 0.55 and
+            profit_factor >= 1.4  and
+            sharpe        >= 0.8
+        )
+
+        self.pnl_metrics = {
+            'total_closed_trades':    len(outcomes),
+            'winners':                len(winners),
+            'losers':                 len(losers),
+            'win_rate':               round(win_rate, 4),
+            'avg_win_pct':            round(avg_win_pct, 4),
+            'avg_loss_pct':           round(avg_loss_pct, 4),
+            'expectancy_per_trade':   round(expectancy, 4),
+            'profit_factor':          round(profit_factor, 3),
+            'sharpe_ratio':           round(sharpe, 3),
+            'total_realized_pnl':     round(total_pnl, 2),
+            'gross_profit':           round(gross_profit, 2),
+            'gross_loss':             round(gross_loss, 2),
+            'avg_hold_hours':         round(avg_hold_hours, 1),
+            'max_consecutive_losses': max_consec,
+            'go_live_ready':          go_live_ready,
+            'metrics_period_days':    days_back,
+            'targets': {
+                'win_rate_target':      0.55,
+                'profit_factor_target': 1.4,
+                'sharpe_target':        0.8,
+            },
+            'computed_at': datetime.now().isoformat(),
+        }
+        return self.pnl_metrics
+
     def analyze_performance(self):
         """Analyze trading performance and extract insights."""
         if not self.trades:
@@ -122,23 +235,32 @@ class PerformanceAnalyzer:
         return recommendations
     
     def save_analysis(self, output_file='logs/daily_analysis.jsonl'):
-        """Save analysis to file."""
+        """Save analysis to rolling JSONL and export a standalone performance_metrics.json."""
+        if not self.pnl_metrics:
+            self.analyze_pnl_metrics(days_back=30)
+
         analysis_record = {
-            'timestamp': datetime.now().isoformat(),
-            'insights': self.insights,
-            'recommendations': self.generate_recommendations()
+            'timestamp':       datetime.now().isoformat(),
+            'insights':        self.insights,
+            'pnl_metrics':     self.pnl_metrics,
+            'recommendations': self.generate_recommendations(),
         }
-        
+
         with open(output_file, 'a') as f:
             f.write(json.dumps(analysis_record) + '\n')
-        
         logging.info(f"Analysis saved to {output_file}")
+
+        # Standalone export for easy review (overwrites each run)
+        metrics_path = Path(output_file).parent / 'performance_metrics.json'
+        with open(metrics_path, 'w') as f:
+            json.dump(analysis_record, f, indent=2)
+        logging.info(f"Performance metrics exported to {metrics_path}")
     
     def print_report(self):
         """Print a human-readable report."""
         if not self.insights:
             self.analyze_performance()
-        
+
         print("\n" + "="*60)
         print("📊 TRADING PERFORMANCE REPORT")
         print("="*60)
@@ -149,17 +271,43 @@ class PerformanceAnalyzer:
         print(f"Success Rate: {self.insights.get('success_rate', 0):.1f}%")
         print(f"Avg Confidence: {self.insights.get('avg_confidence', 0):.2f}")
         print(f"Total Shares Traded: {self.insights.get('total_shares_traded', 0):,}")
-        
+
         print("\nMost Traded Symbols:")
         for symbol, count in self.insights.get('most_traded', {}).items():
             print(f"  {symbol}: {count} trades")
-        
+
+        # P&L metrics section (requires closed trades from outcome_tracker)
+        m = self.analyze_pnl_metrics(days_back=30)
+        if m:
+            targets = m.get('targets', {})
+            print("\n" + "-"*60)
+            print("💰 REALIZED P&L METRICS  (last 30 days, closed trades only)")
+            print("-"*60)
+            print(f"Closed Trades:    {m['total_closed_trades']}  "
+                  f"({m['winners']}W / {m['losers']}L)")
+            print(f"Win Rate:         {m['win_rate']:.1%}  "
+                  f"(target ≥ {targets.get('win_rate_target', 0.55):.0%})")
+            print(f"Profit Factor:    {m['profit_factor']:.2f}  "
+                  f"(target ≥ {targets.get('profit_factor_target', 1.4):.1f})")
+            print(f"Sharpe Ratio:     {m['sharpe_ratio']:.2f}  "
+                  f"(target ≥ {targets.get('sharpe_target', 0.8):.1f})")
+            print(f"Avg Win:          {m['avg_win_pct']:+.2%}    "
+                  f"Avg Loss: {m['avg_loss_pct']:+.2%}")
+            print(f"Expectancy/Trade: {m['expectancy_per_trade']:+.2%}")
+            print(f"Total Realized:   ${m['total_realized_pnl']:+,.2f}")
+            print(f"Avg Hold:         {m['avg_hold_hours']:.1f}h    "
+                  f"Max Consec Losses: {m['max_consecutive_losses']}")
+            gate = "✅ PASSES — consider go-live" if m['go_live_ready'] else "❌ FAILS — keep paper trading"
+            print(f"\nGo-Live Gate:     {gate}")
+        else:
+            print("\n⏳ No closed trade outcomes yet — outcome tracker hasn't run or no completed trades.")
+
         recommendations = self.generate_recommendations()
         if recommendations:
             print("\n💡 RECOMMENDATIONS:")
             for i, rec in enumerate(recommendations, 1):
                 print(f"{i}. {rec['reason']}")
-        
+
         print("="*60 + "\n")
 
 if __name__ == "__main__":

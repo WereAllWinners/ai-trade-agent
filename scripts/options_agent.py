@@ -22,8 +22,11 @@ import ollama
 sys.path.append(str(Path(__file__).resolve().parent))
 from model_inference_lora import parse_decision
 from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
+import news_fetcher
+import unusual_flow_scanner
 
 OLLAMA_MODEL = "qwen3:8b"
+_DEBATE_CONFIDENCE_THRESHOLD = 0.85   # Options trades require higher bar for debate
 
 def get_trading_decision(prompt, max_new_tokens=200):
     """Get trading decision via Ollama (model stays resident in memory)."""
@@ -34,6 +37,42 @@ def get_trading_decision(prompt, max_new_tokens=200):
         options={"temperature": 0.7, "top_p": 0.9, "num_predict": max_new_tokens}
     )
     return response['response']
+
+
+def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) -> dict:
+    """
+    Contrarian second LLM call — challenges a high-conviction options trade.
+    Returns {'verdict': 'PROCEED'|'ABORT', 'reason': str}.
+    Defaults to PROCEED on failure so the trade isn't silently blocked.
+    """
+    debate_prompt = (
+        f"You are a skeptical options risk analyst reviewing a proposed trade.\n"
+        f"Proposal: {action.upper()} on {symbol}  (confidence: {confidence:.0%})\n"
+        f"Bull/Bear argument: {reasoning}\n\n"
+        f"List 2 specific risks (IV crush, event risk, liquidity, wrong direction) "
+        f"that could make this trade lose money. "
+        f"Then state your verdict on a NEW LINE as exactly one of:\n"
+        f"VERDICT: PROCEED\n"
+        f"VERDICT: ABORT\n"
+        f"Abort only if the risks clearly outweigh the opportunity."
+    )
+    try:
+        resp = ollama.generate(
+            model=OLLAMA_MODEL,
+            prompt=debate_prompt,
+            think=False,
+            options={"temperature": 0.5, "top_p": 0.9, "num_predict": 150}
+        )
+        text = resp['response']
+        verdict = 'PROCEED'
+        for line in text.splitlines():
+            if 'VERDICT:' in line.upper():
+                verdict = 'ABORT' if 'ABORT' in line.upper() else 'PROCEED'
+                break
+        return {'verdict': verdict, 'reason': text.strip()}
+    except Exception as e:
+        logging.warning(f"  Debate call failed for {symbol}: {e}")
+        return {'verdict': 'PROCEED', 'reason': 'debate unavailable'}
 
 load_dotenv()
 
@@ -80,6 +119,11 @@ class OptionsAgent:
         # Path to research params written by market_researcher / options_weekend_strategist
         self._params_file = Path(__file__).resolve().parent.parent / 'logs' / 'monday_params_options.json'
 
+        # Decision logging — unique ID per process run for replay correlation
+        self.session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self._decision_log = Path(__file__).resolve().parent.parent / 'logs' / 'options_decision_log.jsonl'
+        self._decision_log.parent.mkdir(exist_ok=True)
+
         # Trading state
         self.daily_trades = 0
         self.last_reset_date = datetime.now().date()
@@ -88,6 +132,32 @@ class OptionsAgent:
         
         logging.info("🎯 Options Agent Initialized")
     
+    def _log_decision(self, symbol: str, prompt: str, raw_response: str,
+                      decision: dict, indicators: dict, market_context: dict,
+                      executed: bool, debate: dict | None = None) -> None:
+        """Append one options decision record to options_decision_log.jsonl."""
+        record = {
+            'timestamp':      datetime.now().isoformat(),
+            'session_id':     self.session_id,
+            'bot':            'options',
+            'model':          OLLAMA_MODEL,
+            'symbol':         symbol,
+            'indicators':     indicators,
+            'market_context': market_context,
+            'prompt':         prompt,
+            'raw_response':   raw_response,
+            'decision':       decision.get('decision'),
+            'confidence':     decision.get('confidence'),
+            'reasoning':      decision.get('reasoning', ''),
+            'executed':       executed,
+            'debate':         debate,
+        }
+        try:
+            with open(self._decision_log, 'a') as f:
+                f.write(json.dumps(record) + '\n')
+        except Exception as e:
+            logging.warning(f"⚠️  Could not write options decision log: {e}")
+
     def load_research_params(self) -> dict:
         """Load latest research params from market_researcher or options_weekend_strategist."""
         try:
@@ -192,8 +262,17 @@ class OptionsAgent:
             logging.error(f"❌ Analysis failed for {symbol}: {e}")
             return None
     
-    def get_ai_options_decision(self, analysis, market_bias: str = 'neutral', symbol_bias: str = 'neutral'):
-        """Get AI decision for options trading."""
+    def get_ai_options_decision(self, analysis, market_bias: str = 'neutral',
+                               symbol_bias: str = 'neutral',
+                               news_snippet: str = '', flow_snippet: str = ''):
+        """Get AI decision for options trading.
+
+        Returns (decision, prompt, raw_response) so callers can log all three
+        without making a second LLM call.
+        """
+        extra_context = (news_snippet + flow_snippet).strip()
+        context_block = f"\n{extra_context}" if extra_context else ''
+
         prompt = f"""Analyze {analysis['symbol']} for OPTIONS trading:
 
 Current Price: ${analysis['current_price']:.2f}
@@ -203,7 +282,7 @@ Momentum (20d): {analysis['momentum']:.1%}
 
 Market Context (from overnight research):
 - Overall market bias: {market_bias}
-- Symbol-specific bias: {symbol_bias}
+- Symbol-specific bias: {symbol_bias}{context_block}
 
 Based on this data, should we:
 - BUY_CALL (bullish, expect price to rise)
@@ -211,10 +290,10 @@ Based on this data, should we:
 - HOLD (wait for better opportunity)
 
 Provide your decision, confidence (0-1), and reasoning."""
-        
+
         response = get_trading_decision(prompt, max_new_tokens=150)
         decision = parse_decision(response)
-        
+
         # Map to options-specific decisions
         # Explicit model keywords take priority; fallback uses both AI action AND momentum
         if 'call' in response.lower() or (decision['decision'] == 'buy' and analysis['momentum'] > 0):
@@ -223,8 +302,8 @@ Provide your decision, confidence (0-1), and reasoning."""
             decision['decision'] = 'buy_put'
         else:
             decision['decision'] = 'hold'
-        
-        return decision
+
+        return decision, prompt, response
     
     def find_optimal_option(self, symbol, contract_type, strike_price):
         """Find the best option contract."""
@@ -518,29 +597,58 @@ Provide your decision, confidence (0-1), and reasoning."""
             if not analysis:
                 continue
 
-            # Get AI decision — pass research context into the prompt
+            # Fetch enrichment snippets (both are no-ops if APIs unavailable)
+            news_snippet = news_fetcher.format_for_prompt(symbol)
+            flow_result  = unusual_flow_scanner.scan_symbol(symbol)
+            flow_snippet = unusual_flow_scanner.format_for_prompt(symbol, flow_result)
+
+            # Get AI decision — returns (decision, prompt, raw_response) in one LLM call
             sym_bias = symbol_bias.get(symbol, 'neutral')
-            decision = self.get_ai_options_decision(analysis, market_bias=market_bias, symbol_bias=sym_bias)
+            decision, prompt, raw_response = self.get_ai_options_decision(
+                analysis, market_bias=market_bias, symbol_bias=sym_bias,
+                news_snippet=news_snippet, flow_snippet=flow_snippet
+            )
 
             logging.info(f"📊 {symbol}: {decision['decision'].upper()} "
                          f"(confidence: {decision['confidence']:.0%}, "
                          f"bias: {sym_bias}, min_conf: {min_conf:.0%})")
 
-            # Execute if confidence meets (possibly research-adjusted) threshold
-            if decision['decision'] in ['buy_call', 'buy_put'] and decision['confidence'] >= min_conf:
-                if self.execute_options_trade(symbol, decision, analysis, available_capital,
-                                              size_multiplier=size_mult):
+            # Multi-agent debate for high-conviction trades
+            debate_result = None
+            will_execute = decision['decision'] in ['buy_call', 'buy_put'] and decision['confidence'] >= min_conf
+            if will_execute and decision['confidence'] >= _DEBATE_CONFIDENCE_THRESHOLD:
+                logging.info(f"⚖️  Debating {symbol} ({decision['decision'].upper()} @ {decision['confidence']:.0%})...")
+                debate_result = debate_trade(
+                    symbol, decision['decision'],
+                    decision['confidence'], decision.get('reasoning', '')
+                )
+                if debate_result['verdict'] == 'ABORT':
+                    logging.info(f"🚫 Debate ABORTED {symbol} options trade: {debate_result['reason'][:80]}...")
+                    will_execute = False
+                else:
+                    logging.info(f"✅ Debate confirmed {symbol}: PROCEED")
+
+            executed = False
+            market_ctx = {'market_bias': market_bias, 'symbol_bias': sym_bias}
+            if will_execute:
+                executed = self.execute_options_trade(symbol, decision, analysis, available_capital,
+                                                      size_multiplier=size_mult)
+                if executed:
                     self.daily_trades += 1
                     trades_executed += 1
                     self.trade_cooldown[symbol] = datetime.now()
-
-                    # Recalculate available capital
                     available_capital = self.get_available_capital()
                     if available_capital < 100:
+                        self._log_decision(symbol, prompt, raw_response, decision, analysis,
+                                           market_ctx, executed, debate=debate_result)
                         break
             else:
                 logging.info(f"⏭️  Skipping {symbol}: {decision['decision']} "
                              f"(confidence: {decision['confidence']:.0%})")
+
+            # Log every decision (including HOLDs) for replay and validation
+            self._log_decision(symbol, prompt, raw_response, decision, analysis,
+                               market_ctx, executed, debate=debate_result)
         
         logging.info(f"✅ Options session complete: {trades_executed} trades executed")
 

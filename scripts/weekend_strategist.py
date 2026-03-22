@@ -15,6 +15,8 @@ sys.path.append(str(Path(__file__).resolve().parent))
 from performance_analyzer import PerformanceAnalyzer
 from stock_discovery import StockDiscovery
 from model_inference_lora import get_trading_decision, parse_decision
+import congressional_tracker
+import unusual_flow_scanner
 
 logging.basicConfig(
     level=logging.INFO,
@@ -353,6 +355,48 @@ Is this a good opportunity for next week? Provide decision and reasoning."""
         
         return strategy
     
+    def congressional_analysis(self) -> dict:
+        """Fetch latest congressional trades and build a symbol sentiment map."""
+        logging.info("🏛️  Fetching congressional trade data (last 45 days)...")
+        try:
+            data = congressional_tracker.load_cached()
+            symbol_map = data.get('symbol_map', {})
+            top = data.get('top_symbols', [])[:20]
+            # Build a compact summary for the report
+            summary = {
+                'total_trades': data.get('total_trades', 0),
+                'top_symbols': top,
+                'bullish': [s for s in top if (symbol_map.get(s) or {}).get('signal') == 'bullish'],
+                'bearish': [s for s in top if (symbol_map.get(s) or {}).get('signal') == 'bearish'],
+                'symbol_map': {s: symbol_map[s] for s in top if s in symbol_map},
+            }
+            logging.info(
+                f"  ✅ Congressional data: {summary['total_trades']} trades | "
+                f"bullish: {summary['bullish'][:5]} | bearish: {summary['bearish'][:5]}"
+            )
+            return summary
+        except Exception as e:
+            logging.warning(f"  ⚠️ Congressional analysis failed: {e}")
+            return {}
+
+    def unusual_flow_analysis(self, watchlist: list | None = None) -> dict:
+        """Scan options flow across the watchlist for unusual activity."""
+        symbols = watchlist or ['SPY', 'QQQ', 'AAPL', 'MSFT', 'NVDA', 'TSLA', 'AMD',
+                                'META', 'AMZN', 'GOOGL']
+        logging.info(f"🌊 Scanning unusual options flow for {len(symbols)} symbols...")
+        try:
+            result = unusual_flow_scanner.scan_watchlist(symbols)
+            unusual = result.get('unusual_symbols', [])
+            logging.info(
+                f"  ✅ Unusual flow: {result.get('unusual_count', 0)}/{result.get('total_scanned', 0)} symbols"
+            )
+            for r in unusual:
+                logging.info(f"    {r['symbol']:<6} {r['signal']:<28} P/C={r['pcr_volume']:.2f}")
+            return result
+        except Exception as e:
+            logging.warning(f"  ⚠️ Unusual flow scan failed: {e}")
+            return {}
+
     def run_weekend_analysis(self):
         """Main weekend analysis orchestrator."""
         logging.info("="*70)
@@ -369,9 +413,11 @@ Is this a good opportunity for next week? Provide decision and reasoning."""
             'correlations': {},
             'model_performance': {},
             'opportunities': [],
-            'strategy': {}
+            'strategy': {},
+            'congressional': {},
+            'unusual_flow': {},
         }
-        
+
         # Run all analyses
         try:
             analysis_results['weekly_performance'] = self.analyze_weekly_performance()
@@ -382,7 +428,9 @@ Is this a good opportunity for next week? Provide decision and reasoning."""
             analysis_results['model_performance'] = self.ai_model_performance_review()
             analysis_results['opportunities'] = self.opportunity_pipeline_for_week()
             analysis_results['strategy'] = self.generate_weekly_strategy()
-        
+            analysis_results['congressional'] = self.congressional_analysis()
+            analysis_results['unusual_flow'] = self.unusual_flow_analysis()
+
         except Exception as e:
             logging.error(f"Weekend analysis error: {e}")
         
@@ -450,31 +498,73 @@ Is this a good opportunity for next week? Provide decision and reasoning."""
             print(f"  Position Size: {strategy.get('position_size_adjustment', 1.0):.1%}")
             print(f"  Focus Sectors: {', '.join(strategy.get('focus_sectors', []))}")
             print(f"  Preferred Strategies: {', '.join(strategy.get('preferred_strategies', []))}")
-        
+
+        # Congressional signals
+        cong = results.get('congressional', {})
+        if cong.get('total_trades', 0) > 0:
+            print(f"\n🏛️  CONGRESSIONAL ACTIVITY (last 45d):")
+            print(f"  Total trades: {cong['total_trades']}")
+            if cong.get('bullish'):
+                print(f"  Bullish (net buys): {', '.join(cong['bullish'][:8])}")
+            if cong.get('bearish'):
+                print(f"  Bearish (net sells): {', '.join(cong['bearish'][:8])}")
+
+        # Unusual flow
+        flow = results.get('unusual_flow', {})
+        unusual = flow.get('unusual_symbols', [])
+        if unusual:
+            print(f"\n🌊 UNUSUAL OPTIONS FLOW:")
+            for r in unusual[:8]:
+                print(f"  {r['symbol']:<6} {r['signal']:<28} P/C={r['pcr_volume']:.2f}")
+
         print("="*70 + "\n")
     
     def update_parameters_for_monday(self, results):
         """Update trading parameters based on weekend analysis."""
         logging.info("🔧 Updating parameters for Monday trading...")
-        
+
         strategy = results.get('strategy', {})
-        
+        cong     = results.get('congressional', {})
+        flow     = results.get('unusual_flow', {})
+
+        # Congressional-boosted watchlist additions (bullish net-buy symbols)
+        cong_bullish = cong.get('bullish', [])[:10]
+        cong_bearish = cong.get('bearish', [])[:10]
+
+        # Unusual-flow bullish/bearish signals
+        flow_call_symbols = [
+            r['symbol'] for r in flow.get('unusual_symbols', [])
+            if r.get('signal') in ('unusual_call_buying', 'heavy_call_flow')
+        ]
+        flow_put_symbols = [
+            r['symbol'] for r in flow.get('unusual_symbols', [])
+            if r.get('signal') in ('unusual_put_buying', 'heavy_put_flow')
+        ]
+
         updated_params = {
             'max_position_size': 0.05 * strategy.get('position_size_adjustment', 1.0),
             'min_confidence': strategy.get('confidence_threshold', 0.6),
             'max_stocks_to_analyze': 25,
             'preferred_sectors': strategy.get('focus_sectors', []),
             'avoid_sectors': strategy.get('avoid_sectors', []),
-            'strategy_focus': strategy.get('preferred_strategies', ['multi_signal'])
+            'strategy_focus': strategy.get('preferred_strategies', ['multi_signal']),
+            'congressional_bullish': cong_bullish,
+            'congressional_bearish': cong_bearish,
+            'flow_call_signals': flow_call_symbols,
+            'flow_put_signals': flow_put_symbols,
         }
-        
+
         # Save for Monday
         with open('logs/monday_params.json', 'w') as f:
             json.dump(updated_params, f, indent=2)
-        
+
         logging.info(f"  ✅ Parameters updated for Monday")
         logging.info(f"  Position size: {updated_params['max_position_size']:.2%}")
         logging.info(f"  Min confidence: {updated_params['min_confidence']:.2f}")
+        if cong_bullish:
+            logging.info(f"  Congressional bullish: {cong_bullish}")
+        if flow_call_symbols:
+            logging.info(f"  Unusual call flow: {flow_call_symbols}")
 
 if __name__ == "__main__":
     strategist = WeekendStrategist()

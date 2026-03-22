@@ -28,6 +28,9 @@ _LOGS_DIR.mkdir(exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+sys.path.append(str(_SCRIPTS_DIR))
+import unusual_flow_scanner
+
 CONTEXT_FILES = {
     'trading': _LOGS_DIR / 'market_context_trading.json',
     'options': _LOGS_DIR / 'market_context_options.json',
@@ -252,7 +255,6 @@ def run_trading_research() -> None:
     logging.info(f"  SPY: {macro.get('spy', {}).get('trend')} | "
                  f"TLT safety: {macro.get('tlt', {}).get('flight_to_safety')}")
 
-    sys.path.append(str(_SCRIPTS_DIR))
     from stock_discovery import StockDiscovery
     disc    = StockDiscovery()
     universe = disc.get_index_constituents()
@@ -290,11 +292,36 @@ def run_options_research() -> None:
     logging.info(f"  Earnings risk (next 3d): {params['avoid_earnings_risk']}")
     logging.info(f"  IV elevated: {params['iv_elevated_tickers']}")
 
+    # Unusual options flow scan — augments symbol_bias in params
+    logging.info("🌊 Scanning unusual options flow...")
+    try:
+        flow = unusual_flow_scanner.scan_watchlist(OPTIONS_WATCHLIST)
+        unusual = flow.get('unusual_symbols', [])
+        if unusual:
+            logging.info(f"  Unusual flow detected on {len(unusual)} symbols:")
+            for r in unusual:
+                logging.info(f"    {r['symbol']:<6} {r['signal']:<28} P/C={r['pcr_volume']:.2f}")
+        # Inject flow signals into params for options_agent to consume
+        params['flow_call_signals'] = [
+            r['symbol'] for r in unusual
+            if r.get('signal') in ('unusual_call_buying', 'heavy_call_flow')
+        ]
+        params['flow_put_signals'] = [
+            r['symbol'] for r in unusual
+            if r.get('signal') in ('unusual_put_buying', 'heavy_put_flow')
+        ]
+    except Exception as e:
+        logging.warning(f"  ⚠️  Flow scan failed: {e}")
+        flow = {}
+        params.setdefault('flow_call_signals', [])
+        params.setdefault('flow_put_signals', [])
+
     entry = {
-        'timestamp':         datetime.now().isoformat(),
-        'type':              'weeknight',
-        'macro':             macro,
-        'iv_snapshot':       iv_snap,
+        'timestamp':          datetime.now().isoformat(),
+        'type':               'weeknight',
+        'macro':              macro,
+        'iv_snapshot':        iv_snap,
+        'unusual_flow':       flow,
         'recommended_params': params,
     }
     write_rolling(CONTEXT_FILES['options'], entry)

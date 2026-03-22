@@ -33,6 +33,8 @@ from market_researcher import (
     write_rolling,
     OPTIONS_PARAMS_FILE,
 )
+import congressional_tracker
+import unusual_flow_scanner
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -219,6 +221,8 @@ def build_weekly_options_params(
     iv_analysis: dict,
     sectors: dict,
     earnings_events: list,
+    congressional: dict | None = None,
+    flow: dict | None = None,
 ) -> dict:
     """Comprehensive weekly params for options_agent."""
     vix_regime = macro.get('vix', {}).get('regime', 'normal')
@@ -257,6 +261,21 @@ def build_weekly_options_params(
             sym_bias = 'neutral'
         symbol_bias[sym] = sym_bias
 
+    # Override symbol bias with unusual options flow signals
+    if flow:
+        for r in flow.get('unusual_symbols', []):
+            sym = r['symbol']
+            if sym in symbol_bias:
+                sig = r.get('signal', '')
+                if sig in ('unusual_call_buying', 'heavy_call_flow'):
+                    symbol_bias[sym] = 'lean_call'
+                elif sig in ('unusual_put_buying', 'heavy_put_flow'):
+                    symbol_bias[sym] = 'lean_put'
+
+    # Congressional signals as supplemental context
+    cong_bullish = (congressional or {}).get('bullish', [])
+    cong_bearish = (congressional or {}).get('bearish', [])
+
     # Top sectors (bullish, ranked by 1-month return)
     top_sectors  = [s for s, d in list(sectors.items())[:3] if d.get('trend') == 'bullish']
     weak_sectors = [s for s, d in list(sectors.items())[-2:]]
@@ -273,6 +292,8 @@ def build_weekly_options_params(
         'symbol_bias':             symbol_bias,
         'top_sectors':             top_sectors,
         'weak_sectors':            weak_sectors,
+        'congressional_bullish':   cong_bullish,
+        'congressional_bearish':   cong_bearish,
     }
 
 
@@ -284,11 +305,50 @@ def run_weekend_analysis() -> dict:
     logging.info(f"📅 {datetime.now().strftime('%A, %B %d, %Y')}")
     logging.info("=" * 70)
 
-    macro          = fetch_macro_pulse()
-    sectors        = sector_analysis()
+    macro           = fetch_macro_pulse()
+    sectors         = sector_analysis()
     earnings_events = earnings_next_week(EARNINGS_SCAN_UNIVERSE)
-    iv_analysis    = full_iv_analysis(OPTIONS_WATCHLIST)
-    params         = build_weekly_options_params(macro, iv_analysis, sectors, earnings_events)
+    iv_analysis     = full_iv_analysis(OPTIONS_WATCHLIST)
+
+    # Congressional trades — use cached data (refreshed only if >7 days old)
+    logging.info("🏛️  Loading congressional trade data...")
+    try:
+        cong_data    = congressional_tracker.load_cached()
+        cong_summary = {
+            'total_trades': cong_data.get('total_trades', 0),
+            'top_symbols':  cong_data.get('top_symbols', [])[:20],
+            'bullish': [
+                s for s in cong_data.get('top_symbols', [])[:20]
+                if (cong_data.get('symbol_map', {}).get(s) or {}).get('signal') == 'bullish'
+            ],
+            'bearish': [
+                s for s in cong_data.get('top_symbols', [])[:20]
+                if (cong_data.get('symbol_map', {}).get(s) or {}).get('signal') == 'bearish'
+            ],
+        }
+        logging.info(f"  Congressional: {cong_summary['total_trades']} trades | "
+                     f"bullish: {cong_summary['bullish'][:5]}")
+    except Exception as e:
+        logging.warning(f"  ⚠️  Congressional data unavailable: {e}")
+        cong_summary = {}
+
+    # Unusual options flow — full watchlist scan
+    logging.info("🌊 Scanning unusual options flow...")
+    try:
+        flow_data = unusual_flow_scanner.scan_watchlist(OPTIONS_WATCHLIST)
+        logging.info(f"  Unusual flow: {flow_data.get('unusual_count', 0)}/"
+                     f"{flow_data.get('total_scanned', 0)} symbols")
+        for r in flow_data.get('unusual_symbols', []):
+            logging.info(f"    {r['symbol']:<6} {r['signal']:<28} P/C={r['pcr_volume']:.2f}")
+    except Exception as e:
+        logging.warning(f"  ⚠️  Flow scan unavailable: {e}")
+        flow_data = {}
+
+    params = build_weekly_options_params(
+        macro, iv_analysis, sectors, earnings_events,
+        congressional=cong_summary,
+        flow=flow_data,
+    )
 
     entry = {
         'timestamp':            datetime.now().isoformat(),
@@ -297,6 +357,8 @@ def run_weekend_analysis() -> dict:
         'sector_analysis':      sectors,
         'earnings_next_7_days': earnings_events,
         'iv_analysis':          iv_analysis,
+        'congressional':        cong_summary,
+        'unusual_flow':         flow_data,
         'recommended_params':   params,
     }
 
@@ -308,12 +370,14 @@ def run_weekend_analysis() -> dict:
         json.dump(params, f, indent=2)
 
     logging.info("=" * 70)
-    logging.info(f"  Market bias:      {params['market_bias']}")
-    logging.info(f"  VIX regime:       {params['vix_regime']}")
-    logging.info(f"  Size multiplier:  {params['position_size_multiplier']}")
-    logging.info(f"  Avoid (earnings): {params['avoid_earnings_risk']}")
-    logging.info(f"  Top sectors:      {params['top_sectors']}")
-    logging.info(f"  Symbol biases:    {params['symbol_bias']}")
+    logging.info(f"  Market bias:        {params['market_bias']}")
+    logging.info(f"  VIX regime:         {params['vix_regime']}")
+    logging.info(f"  Size multiplier:    {params['position_size_multiplier']}")
+    logging.info(f"  Avoid (earnings):   {params['avoid_earnings_risk']}")
+    logging.info(f"  Top sectors:        {params['top_sectors']}")
+    logging.info(f"  Symbol biases:      {params['symbol_bias']}")
+    logging.info(f"  Cong. bullish:      {params['congressional_bullish'][:5]}")
+    logging.info(f"  Cong. bearish:      {params['congressional_bearish'][:5]}")
     logging.info("✅ OPTIONS WEEKEND ANALYSIS COMPLETE")
     logging.info("=" * 70)
 

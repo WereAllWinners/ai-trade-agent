@@ -24,8 +24,10 @@ import ollama
 from stock_discovery import StockDiscovery
 from model_inference_lora import parse_decision
 from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
+import news_fetcher
 
 OLLAMA_MODEL = "qwen3:8b"
+_DEBATE_CONFIDENCE_THRESHOLD = 0.75   # Only debate high-conviction trades
 
 def get_trading_decision(prompt):
     """Get trading decision via Ollama (model stays resident in memory)."""
@@ -36,6 +38,41 @@ def get_trading_decision(prompt):
         options={"temperature": 0.7, "top_p": 0.9, "num_predict": 200}
     )
     return response['response']
+
+
+def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) -> dict:
+    """
+    Contrarian second LLM call — challenges a high-conviction trade.
+    Returns {'verdict': 'PROCEED'|'ABORT', 'reason': str}.
+    On failure defaults to PROCEED (safe fallback: don't block the trade).
+    """
+    debate_prompt = (
+        f"You are a skeptical risk analyst reviewing a proposed trade.\n"
+        f"Proposal: {action.upper()} {symbol}  (confidence: {confidence:.0%})\n"
+        f"Bull argument: {reasoning}\n\n"
+        f"List 2 specific risks or counter-arguments for this trade. "
+        f"Then state your verdict on a NEW LINE as exactly one of:\n"
+        f"VERDICT: PROCEED\n"
+        f"VERDICT: ABORT\n"
+        f"Abort only if the risks clearly outweigh the opportunity."
+    )
+    try:
+        resp = ollama.generate(
+            model=OLLAMA_MODEL,
+            prompt=debate_prompt,
+            think=False,
+            options={"temperature": 0.5, "top_p": 0.9, "num_predict": 150}
+        )
+        text = resp['response']
+        verdict = 'PROCEED'
+        for line in text.splitlines():
+            if 'VERDICT:' in line.upper():
+                verdict = 'ABORT' if 'ABORT' in line.upper() else 'PROCEED'
+                break
+        return {'verdict': verdict, 'reason': text.strip()}
+    except Exception as e:
+        logging.warning(f"  Debate call failed for {symbol}: {e}")
+        return {'verdict': 'PROCEED', 'reason': 'debate unavailable'}
 
 load_dotenv()
 
@@ -72,7 +109,12 @@ class AutonomousAgent:
         self.daily_trades = 0
         self.last_reset_date = datetime.now().date()
         self.daily_start_equity = None  # Set at start of each trading day
-        
+
+        # Decision logging — unique ID per process run for replay correlation
+        self.session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self._decision_log = Path('logs/decision_log.jsonl')
+        self._decision_log.parent.mkdir(exist_ok=True)
+
         logging.info("🤖 Autonomous Agent Initialized")
     
     def load_parameters(self):
@@ -111,6 +153,35 @@ class AutonomousAgent:
         
         return defaults
     
+    def _log_decision(self, symbol: str, prompt: str, raw_response: str,
+                      decision: dict, indicators: dict, executed: bool,
+                      debate: dict | None = None) -> None:
+        """Append one decision record to decision_log.jsonl.
+
+        Every call to the LLM is logged — including HOLDs — so replay mode
+        has a complete history of what the model saw and decided.
+        """
+        record = {
+            'timestamp':    datetime.now().isoformat(),
+            'session_id':   self.session_id,
+            'bot':          'stock',
+            'model':        OLLAMA_MODEL,
+            'symbol':       symbol,
+            'indicators':   indicators,
+            'prompt':       prompt,
+            'raw_response': raw_response,
+            'decision':     decision.get('decision'),
+            'confidence':   decision.get('confidence'),
+            'reasoning':    decision.get('reasoning', ''),
+            'executed':     executed,
+            'debate':       debate,
+        }
+        try:
+            with open(self._decision_log, 'a') as f:
+                f.write(json.dumps(record) + '\n')
+        except Exception as e:
+            logging.warning(f"⚠️  Could not write decision log: {e}")
+
     def check_cooldown(self, symbol):
         """Check if symbol is on cooldown."""
         if symbol not in self.cooldowns:
@@ -385,6 +456,9 @@ class AutonomousAgent:
             if indicators is None:
                 continue
             
+            # Fetch recent news snippet (no-op if POLYGON_API_KEY not set)
+            news_snippet = news_fetcher.format_for_prompt(symbol)
+
             # Create AI prompt
             prompt = f"""Analyze {symbol} for trading:
 
@@ -394,25 +468,50 @@ class AutonomousAgent:
             Volume Ratio: {indicators['volume_ratio']:.1f}x average
             Price Change (100 bars): {indicators['price_change_pct']:+.1f}%
 
-            Discovery Signals: {', '.join(self.discovery.opportunities.get(symbol, []))}
+            Discovery Signals: {', '.join(self.discovery.opportunities.get(symbol, []))}{news_snippet}
 
-            Based on this data, should we BUY, SELL, or HOLD? 
+            Based on this data, should we BUY, SELL, or HOLD?
             Provide your decision, confidence (0-1), and reasoning."""
-            
+
             # Get AI decision
             logging.info(f"🤔 Analyzing {symbol}...")
             response = get_trading_decision(prompt)
             decision = parse_decision(response)
             decision['current_price'] = indicators['current_price']
-            
+
             logging.info(f"📊 {symbol}: {decision['decision'].upper()} (confidence: {decision['confidence']:.2f})")
-            
-            # Execute if confidence meets threshold
-            if decision['decision'] in ['buy', 'sell'] and decision['confidence'] >= self.params['min_confidence']:
-                if self.execute_trade(symbol, decision, equity):
+
+            # Multi-agent debate for high-conviction trades
+            debate_result = None
+            will_execute = (
+                decision['decision'] in ['buy', 'sell']
+                and decision['confidence'] >= self.params['min_confidence']
+            )
+            if will_execute and decision['confidence'] >= _DEBATE_CONFIDENCE_THRESHOLD:
+                logging.info(f"⚖️  Debating {symbol} ({decision['decision'].upper()} @ {decision['confidence']:.0%})...")
+                debate_result = debate_trade(
+                    symbol, decision['decision'],
+                    decision['confidence'], decision.get('reasoning', '')
+                )
+                if debate_result['verdict'] == 'ABORT':
+                    logging.info(f"🚫 Debate ABORTED {symbol} trade: {debate_result['reason'][:80]}...")
+                    will_execute = False
+                else:
+                    logging.info(f"✅ Debate confirmed {symbol}: PROCEED")
+
+            executed = False
+            if will_execute:
+                executed = self.execute_trade(symbol, decision, equity)
+                if executed:
                     trades_executed += 1
-            else:
+            elif not will_execute and decision['decision'] in ['buy', 'sell']:
                 logging.info(f"⏭️  Skipping {symbol}: confidence {decision['confidence']:.2f} < {self.params['min_confidence']:.2f}")
+
+            # Log every decision (including HOLDs) for replay and validation
+            log_indicators = {**indicators,
+                              'discovery_signals': self.discovery.opportunities.get(symbol, [])}
+            self._log_decision(symbol, prompt, response, decision, log_indicators, executed,
+                               debate=debate_result)
         
         logging.info(f"✅ Session complete: {trades_executed} trades executed")
 
