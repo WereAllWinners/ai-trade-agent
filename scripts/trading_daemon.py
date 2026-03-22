@@ -45,11 +45,13 @@ class TradingDaemon:
         self.analysis_time = datetime.strptime('17:00', '%H:%M').time()  # 5:00 PM
         self.finetune_time = datetime.strptime('20:00', '%H:%M').time()  # 8:00 PM
         self.weekly_report_time = datetime.strptime('10:00', '%H:%M').time()  # Sat 10:00 AM
-        
+        self.weekend_strategist_time = datetime.strptime('11:00', '%H:%M').time()  # Sat 11:00 AM
+
         logging.info("🤖 Trading Daemon Initialized")
         logging.info("⏰ Stock trading every 30 minutes")
         logging.info("📊 Performance analysis scheduled for 5:00 PM EST daily")
-        logging.info("🎓 Model fine-tuning scheduled for 8:00 PM EST daily")
+        logging.info("🔍 Market research + 🎓 Fine-tuning scheduled for 8:00 PM EST daily")
+        logging.info("🏖️  Weekend deep analysis scheduled for Saturday 11:00 AM EST")
     
     def is_market_open(self):
         """Check if market is currently open."""
@@ -157,24 +159,57 @@ class TradingDaemon:
         except Exception as e:
             logging.error(f"❌ Weekly report failed: {e}")
 
+    def run_market_research(self):
+        """Run nightly market research before fine-tuning."""
+        try:
+            logging.info("🔍 Running nightly market research...")
+            result = subprocess.run(
+                [sys.executable, str(_SCRIPTS_DIR / 'market_researcher.py'), '--bot', 'trading'],
+                timeout=600
+            )
+            if result.returncode == 0:
+                logging.info("✅ Market research complete")
+            else:
+                logging.warning(f"⚠️ Market research exited with code: {result.returncode}")
+        except Exception as e:
+            logging.warning(f"⚠️ Market research failed (continuing to fine-tune): {e}")
+
+    def run_weekend_strategist(self):
+        """Run deep weekend analysis (Saturday only)."""
+        try:
+            logging.info("======================================================================")
+            logging.info("🏖️  RUNNING WEEKEND DEEP ANALYSIS")
+            logging.info("======================================================================")
+            result = subprocess.run(
+                [sys.executable, str(_SCRIPTS_DIR / 'weekend_strategist.py')],
+                timeout=1800  # 30 min max
+            )
+            if result.returncode == 0:
+                logging.info("✅ Weekend analysis complete")
+            else:
+                logging.error(f"❌ Weekend analysis failed with code: {result.returncode}")
+        except Exception as e:
+            logging.error(f"❌ Weekend analysis failed: {e}")
+
     def run_finetuning(self):
-        """Run model fine-tuning."""
+        """Run market research then model fine-tuning."""
+        self.run_market_research()
         try:
             logging.info("🔔 Time for daily model fine-tuning!")
             logging.info("======================================================================")
             logging.info("🎓 RUNNING MODEL FINE-TUNING")
             logging.info("======================================================================")
-            
+
             result = subprocess.run(
                 [sys.executable, str(_SCRIPTS_DIR / 'finetune_model.py')],
                 timeout=600
             )
-            
+
             if result.returncode == 0:
                 logging.info("✅ Model fine-tuning complete")
             else:
                 logging.error(f"❌ Fine-tuning failed with code: {result.returncode}")
-                
+
         except Exception as e:
             logging.error(f"❌ Fine-tuning failed: {e}")
     
@@ -224,12 +259,14 @@ class TradingDaemon:
         logging.info("🚀 Starting Trading Daemon - Running 24/7")
         logging.info("📈 Trading: 9:30 AM - 4:00 PM EST")
         logging.info("📊 Analysis: 5:00 PM EST (daily)")
-        logging.info("🎓 Learning: 8:00 PM EST (daily)")
-        
+        logging.info("🔍 Research + 🎓 Learning: 8:00 PM EST (daily)")
+        logging.info("🏖️  Weekend analysis: Saturday 11:00 AM EST")
+
         last_trade_time = None
         analysis_done_today = False
         finetune_done_today = False
         weekly_report_done_this_week = False
+        weekend_strategist_done_this_week = False
         last_weekly_report_week = None
 
         while True:
@@ -244,9 +281,10 @@ class TradingDaemon:
                     analysis_done_today = False
                     finetune_done_today = False
 
-                # Reset weekly report flag on new calendar week
+                # Reset weekly flags on new calendar week
                 if last_weekly_report_week != current_week:
                     weekly_report_done_this_week = False
+                    weekend_strategist_done_this_week = False
                 
                 logging.info(f"📅 Current time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
                 _write_heartbeat('running', self.is_market_open())
@@ -258,6 +296,13 @@ class TradingDaemon:
                     self.run_weekly_report()
                     weekly_report_done_this_week = True
                     last_weekly_report_week = current_week
+
+                # Weekend deep analysis on Saturday at 11:00 AM
+                if (now.weekday() == 5  # Saturday
+                        and not weekend_strategist_done_this_week
+                        and current_time >= self.weekend_strategist_time):
+                    self.run_weekend_strategist()
+                    weekend_strategist_done_this_week = True
 
                 # Performance analysis at 5:00 PM
                 if not analysis_done_today and current_time >= self.analysis_time:

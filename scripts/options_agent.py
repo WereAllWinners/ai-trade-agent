@@ -77,6 +77,9 @@ class OptionsAgent:
         # Watchlist for options trading
         self.watchlist = ['SPY', 'QQQ', 'AAPL', 'MSFT', 'NVDA', 'TSLA', 'AMD']
 
+        # Path to research params written by market_researcher / options_weekend_strategist
+        self._params_file = Path(__file__).resolve().parent.parent / 'logs' / 'monday_params_options.json'
+
         # Trading state
         self.daily_trades = 0
         self.last_reset_date = datetime.now().date()
@@ -85,6 +88,22 @@ class OptionsAgent:
         
         logging.info("🎯 Options Agent Initialized")
     
+    def load_research_params(self) -> dict:
+        """Load latest research params from market_researcher or options_weekend_strategist."""
+        try:
+            if self._params_file.exists():
+                with open(self._params_file) as f:
+                    data = json.load(f)
+                logging.info(
+                    f"📋 Research params loaded — source: {data.get('source', 'unknown')} | "
+                    f"bias: {data.get('market_bias')} | "
+                    f"VIX regime: {data.get('vix_regime')}"
+                )
+                return data
+        except Exception as e:
+            logging.warning(f"⚠️  Could not load research params: {e}")
+        return {}
+
     def get_available_capital(self):
         """Calculate available capital for options (10-15% of portfolio)."""
         try:
@@ -173,7 +192,7 @@ class OptionsAgent:
             logging.error(f"❌ Analysis failed for {symbol}: {e}")
             return None
     
-    def get_ai_options_decision(self, analysis):
+    def get_ai_options_decision(self, analysis, market_bias: str = 'neutral', symbol_bias: str = 'neutral'):
         """Get AI decision for options trading."""
         prompt = f"""Analyze {analysis['symbol']} for OPTIONS trading:
 
@@ -181,6 +200,10 @@ Current Price: ${analysis['current_price']:.2f}
 RSI (14): {analysis['rsi']:.1f}
 Volatility (20d): {analysis['volatility']:.1%}
 Momentum (20d): {analysis['momentum']:.1%}
+
+Market Context (from overnight research):
+- Overall market bias: {market_bias}
+- Symbol-specific bias: {symbol_bias}
 
 Based on this data, should we:
 - BUY_CALL (bullish, expect price to rise)
@@ -249,19 +272,19 @@ Provide your decision, confidence (0-1), and reasoning."""
             logging.error(f"❌ Failed to find option contract: {e}")
             return None
     
-    def calculate_position_size(self, option_price, available_capital):
-        """Calculate position size (number of contracts)."""
-        max_position_value = available_capital * self.params['max_position_size']
-        
+    def calculate_position_size(self, option_price, available_capital, size_multiplier: float = 1.0):
+        """Calculate position size (number of contracts), scaled by research multiplier."""
+        max_position_value = available_capital * self.params['max_position_size'] * size_multiplier
+
         # Each contract controls 100 shares
         contract_cost = option_price * 100
-        
+
         # Calculate max contracts
         max_contracts = int(max_position_value / contract_cost)
-        
+
         # Limit to reasonable size
         max_contracts = min(max_contracts, 10)
-        
+
         return max(1, max_contracts)
     
     def get_option_price(self, contract_symbol):
@@ -283,7 +306,7 @@ Provide your decision, confidence (0-1), and reasoning."""
             logging.warning(f"⚠️ Could not fetch option price for {contract_symbol}: {e}")
         return None
 
-    def execute_options_trade(self, symbol, decision, analysis, available_capital):
+    def execute_options_trade(self, symbol, decision, analysis, available_capital, size_multiplier: float = 1.0):
         """Execute options trade."""
         try:
             # Determine contract type
@@ -309,8 +332,8 @@ Provide your decision, confidence (0-1), and reasoning."""
                 logging.warning(f"⚠️ No market price for {contract.symbol}, skipping trade")
                 return False
 
-            # Calculate position size
-            quantity = self.calculate_position_size(option_price, available_capital)
+            # Calculate position size (scaled by research multiplier)
+            quantity = self.calculate_position_size(option_price, available_capital, size_multiplier)
             
             if quantity == 0:
                 logging.warning(f"⚠️  Position size too small for {symbol}")
@@ -445,6 +468,14 @@ Provide your decision, confidence (0-1), and reasoning."""
         except Exception as e:
             logging.error(f"❌ Failed to check circuit breaker: {e}")
 
+        # Load overnight research params (graceful — defaults used if file absent)
+        research       = self.load_research_params()
+        min_conf       = research.get('min_confidence_override', self.params['min_confidence'])
+        size_mult      = research.get('position_size_multiplier', 1.0)
+        market_bias    = research.get('market_bias', 'neutral')
+        avoid_earnings = set(research.get('avoid_earnings_risk', []))
+        symbol_bias    = research.get('symbol_bias', {})
+
         logging.info(f"📊 Daily options trades: {self.daily_trades}/{self.params['max_daily_trades']}")
 
         # Step 1: Manage existing positions
@@ -454,52 +485,62 @@ Provide your decision, confidence (0-1), and reasoning."""
         if self.daily_trades >= self.params['max_daily_trades']:
             logging.info(f"⛔ Daily options trade limit reached ({self.params['max_daily_trades']})")
             return
-        
+
         # Step 3: Get available capital
         available_capital = self.get_available_capital()
-        
+
         if available_capital < 100:
             logging.info("⚠️  Insufficient capital for options trading")
             return
-        
+
         # Step 4: Scan watchlist
         trades_executed = 0
-        
+
         for symbol in self.watchlist:
             if self.daily_trades >= self.params['max_daily_trades']:
                 break
-            
+
+            # Skip tickers flagged for earnings risk (IV crush danger)
+            if symbol in avoid_earnings:
+                logging.info(f"⏭️  {symbol}: skipping — earnings within 2 days (IV crush risk)")
+                continue
+
             # Check cooldown
             if symbol in self.trade_cooldown:
                 time_since_trade = (datetime.now() - self.trade_cooldown[symbol]).total_seconds()
                 if time_since_trade < 3600:  # 1 hour cooldown
                     continue
-            
+
             logging.info(f"🤔 Analyzing {symbol} for options...")
-            
+
             # Analyze
             analysis = self.analyze_stock_for_options(symbol)
             if not analysis:
                 continue
-            
-            # Get AI decision
-            decision = self.get_ai_options_decision(analysis)
-            
-            logging.info(f"📊 {symbol}: {decision['decision'].upper()} (confidence: {decision['confidence']:.0%})")
-            
-            # Execute if high confidence
-            if decision['decision'] in ['buy_call', 'buy_put'] and decision['confidence'] >= self.params['min_confidence']:
-                if self.execute_options_trade(symbol, decision, analysis, available_capital):
+
+            # Get AI decision — pass research context into the prompt
+            sym_bias = symbol_bias.get(symbol, 'neutral')
+            decision = self.get_ai_options_decision(analysis, market_bias=market_bias, symbol_bias=sym_bias)
+
+            logging.info(f"📊 {symbol}: {decision['decision'].upper()} "
+                         f"(confidence: {decision['confidence']:.0%}, "
+                         f"bias: {sym_bias}, min_conf: {min_conf:.0%})")
+
+            # Execute if confidence meets (possibly research-adjusted) threshold
+            if decision['decision'] in ['buy_call', 'buy_put'] and decision['confidence'] >= min_conf:
+                if self.execute_options_trade(symbol, decision, analysis, available_capital,
+                                              size_multiplier=size_mult):
                     self.daily_trades += 1
                     trades_executed += 1
                     self.trade_cooldown[symbol] = datetime.now()
-                    
+
                     # Recalculate available capital
                     available_capital = self.get_available_capital()
                     if available_capital < 100:
                         break
             else:
-                logging.info(f"⏭️  Skipping {symbol}: {decision['decision']} (confidence: {decision['confidence']:.0%})")
+                logging.info(f"⏭️  Skipping {symbol}: {decision['decision']} "
+                             f"(confidence: {decision['confidence']:.0%})")
         
         logging.info(f"✅ Options session complete: {trades_executed} trades executed")
 
