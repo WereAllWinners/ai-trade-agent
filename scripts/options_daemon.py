@@ -233,7 +233,7 @@ class OptionsDaemon:
                 hours = sleep_seconds / 3600
                 minutes = (sleep_seconds % 3600) / 60
                 logging.info(f"💤 Next event: {event_name} in {hours:.1f} hours" if hours >= 1 else f"💤 Next event: {event_name} in {minutes:.1f} minutes")
-                time.sleep(max(sleep_seconds - 60, 0))  # Wake up 1 min early
+                time.sleep(max(sleep_seconds, 60))  # Always sleep at least 60s to avoid tight spin
         else:
             # Sleep until tomorrow
             tomorrow = now + timedelta(days=1)

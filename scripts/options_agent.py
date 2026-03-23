@@ -20,7 +20,7 @@ import numpy as np
 
 import ollama
 sys.path.append(str(Path(__file__).resolve().parent))
-from model_inference_lora import parse_decision
+from decision_parser import parse_decision
 from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
 import news_fetcher
 import unusual_flow_scanner
