@@ -482,7 +482,11 @@ class AutonomousAgent:
             Discovery Signals: {', '.join(self.discovery.opportunities.get(symbol, []))}{news_snippet}
 
             Based on this data, should we BUY, SELL, or HOLD?
-            Provide your decision, confidence (0-1), and reasoning."""
+
+            Respond in this exact format:
+            Decision: <BUY|SELL|HOLD>
+            Confidence: <0.00-1.00>
+            Reasoning: <one sentence>"""
 
             # Get AI decision
             logging.info(f"🤔 Analyzing {symbol}...")

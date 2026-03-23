@@ -299,7 +299,10 @@ Based on this data, should we:
 - BUY_PUT (bearish, expect price to fall)
 - HOLD (wait for better opportunity)
 
-Provide your decision, confidence (0-1), and reasoning."""
+Respond in this exact format:
+Decision: <BUY_CALL|BUY_PUT|HOLD>
+Confidence: <0.00-1.00>
+Reasoning: <one sentence>"""
 
         response = get_trading_decision(prompt, max_new_tokens=150)
         decision = parse_decision(response)
