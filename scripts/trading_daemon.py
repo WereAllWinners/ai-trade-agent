@@ -191,9 +191,25 @@ class TradingDaemon:
         except Exception as e:
             logging.error(f"❌ Weekend analysis failed: {e}")
 
+    def run_training_data_builder(self):
+        """Convert today's decisions + outcomes into labelled training examples."""
+        try:
+            logging.info("🏗️  Building training examples from live decisions...")
+            result = subprocess.run(
+                [sys.executable, str(_SCRIPTS_DIR / 'training_data_builder.py'), '--bot', 'stock'],
+                timeout=300
+            )
+            if result.returncode == 0:
+                logging.info("✅ Training data builder complete")
+            else:
+                logging.warning(f"⚠️  Training data builder exited with code: {result.returncode}")
+        except Exception as e:
+            logging.warning(f"⚠️  Training data builder failed (continuing to fine-tune): {e}")
+
     def run_finetuning(self):
-        """Run market research then model fine-tuning."""
+        """Run market research, build training data, then fine-tune."""
         self.run_market_research()
+        self.run_training_data_builder()
         try:
             logging.info("🔔 Time for daily model fine-tuning!")
             logging.info("======================================================================")

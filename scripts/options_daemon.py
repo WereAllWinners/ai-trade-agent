@@ -160,9 +160,25 @@ class OptionsDaemon:
         except Exception as e:
             logging.error(f"❌ Options weekend analysis failed: {e}")
 
+    def run_training_data_builder(self):
+        """Convert today's options decisions + outcomes into labelled training examples."""
+        try:
+            logging.info("🏗️  Building options training examples from live decisions...")
+            result = subprocess.run(
+                [sys.executable, str(_SCRIPTS_DIR / 'training_data_builder.py'), '--bot', 'options'],
+                timeout=300
+            )
+            if result.returncode == 0:
+                logging.info("✅ Options training data builder complete")
+            else:
+                logging.warning(f"⚠️  Options training data builder exited with code: {result.returncode}")
+        except Exception as e:
+            logging.warning(f"⚠️  Options training data builder failed (continuing to fine-tune): {e}")
+
     def run_finetuning(self):
-        """Run market research then options model fine-tuning."""
+        """Run market research, build training data, then fine-tune options model."""
         self.run_market_research()
+        self.run_training_data_builder()
         try:
             training_data_path = str(_SCRIPTS_DIR.parent / 'finetune' / 'data' / 'options_training_data.json')
 
