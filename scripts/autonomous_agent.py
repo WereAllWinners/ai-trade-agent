@@ -29,6 +29,17 @@ import news_fetcher
 OLLAMA_MODEL = "qwen3:8b"
 _DEBATE_CONFIDENCE_THRESHOLD = 0.75   # Only debate high-conviction trades
 
+def _json_default(obj):
+    """JSON serializer for numpy scalar types that the stdlib encoder can't handle."""
+    import numpy as np
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
 def get_trading_decision(prompt):
     """Get trading decision via Ollama (model stays resident in memory)."""
     response = ollama.generate(
@@ -178,7 +189,7 @@ class AutonomousAgent:
         }
         try:
             with open(self._decision_log, 'a') as f:
-                f.write(json.dumps(record) + '\n')
+                f.write(json.dumps(record, default=_json_default) + '\n')
         except Exception as e:
             logging.warning(f"⚠️  Could not write decision log: {e}")
 

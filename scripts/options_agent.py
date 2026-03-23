@@ -28,6 +28,16 @@ import unusual_flow_scanner
 OLLAMA_MODEL = "qwen3:8b"
 _DEBATE_CONFIDENCE_THRESHOLD = 0.85   # Options trades require higher bar for debate
 
+def _json_default(obj):
+    """JSON serializer for numpy scalar types that the stdlib encoder can't handle."""
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
 def get_trading_decision(prompt, max_new_tokens=200):
     """Get trading decision via Ollama (model stays resident in memory)."""
     response = ollama.generate(
@@ -154,7 +164,7 @@ class OptionsAgent:
         }
         try:
             with open(self._decision_log, 'a') as f:
-                f.write(json.dumps(record) + '\n')
+                f.write(json.dumps(record, default=_json_default) + '\n')
         except Exception as e:
             logging.warning(f"⚠️  Could not write options decision log: {e}")
 
