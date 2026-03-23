@@ -24,6 +24,7 @@ from decision_parser import parse_decision
 from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
 import news_fetcher
 import unusual_flow_scanner
+import db as _db
 
 OLLAMA_MODEL = "qwen3:8b"
 _DEBATE_CONFIDENCE_THRESHOLD = 0.85   # Options trades require higher bar for debate
@@ -167,6 +168,10 @@ class OptionsAgent:
                 f.write(json.dumps(record, default=_json_default) + '\n')
         except Exception as e:
             logging.warning(f"⚠️  Could not write options decision log: {e}")
+        try:
+            _db.insert_decision(record)
+        except Exception as e:
+            logging.warning(f"⚠️  Could not write options decision to DB: {e}")
 
     def load_research_params(self) -> dict:
         """Load latest research params from market_researcher or options_weekend_strategist."""
@@ -460,6 +465,10 @@ Reasoning: <one sentence>"""
             
             with open('logs/options_trade_log.jsonl', 'a') as f:
                 f.write(json.dumps(trade_log) + '\n')
+            try:
+                _db.insert_trade(trade_log, bot='options')
+            except Exception as e:
+                logging.warning(f"⚠️  Could not write options trade to DB: {e}")
             
             logging.info(f"✅ Executed OPTIONS trade: {quantity} contracts of {symbol} {contract_type.value}")
             alert_trade_executed(

@@ -14,6 +14,7 @@ from pathlib import Path
 from collections import defaultdict
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
+import db as _db
 
 load_dotenv()
 
@@ -196,6 +197,11 @@ class OutcomeTracker:
         with open(self.outcomes_path, 'a') as f:
             for outcome in new_outcomes:
                 f.write(json.dumps(outcome) + '\n')
+        for outcome in new_outcomes:
+            try:
+                _db.insert_outcome(outcome)
+            except Exception as e:
+                logging.warning("Could not write outcome to DB: %s", e)
 
         wins = [o for o in new_outcomes if o['won']]
         losses = [o for o in new_outcomes if not o['won']]
