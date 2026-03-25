@@ -28,7 +28,7 @@ import news_fetcher
 import db as _db
 
 OLLAMA_MODEL = "qwen3:8b"
-_DEBATE_CONFIDENCE_THRESHOLD = 0.75   # Only debate high-conviction trades
+_DEBATE_CONFIDENCE_THRESHOLD = 0.90   # Only debate very high-conviction trades
 
 def _json_default(obj):
     """JSON serializer for numpy scalar types that the stdlib encoder can't handle."""
@@ -59,21 +59,22 @@ def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) ->
     On failure defaults to PROCEED (safe fallback: don't block the trade).
     """
     debate_prompt = (
-        f"You are a skeptical risk analyst reviewing a proposed trade.\n"
+        f"You are a balanced risk/reward analyst reviewing a proposed trade.\n"
         f"Proposal: {action.upper()} {symbol}  (confidence: {confidence:.0%})\n"
-        f"Bull argument: {reasoning}\n\n"
-        f"List 2 specific risks or counter-arguments for this trade. "
+        f"Argument: {reasoning}\n\n"
+        f"Briefly state ONE supporting factor and ONE risk for this trade.\n"
         f"Then state your verdict on a NEW LINE as exactly one of:\n"
         f"VERDICT: PROCEED\n"
         f"VERDICT: ABORT\n"
-        f"Abort only if the risks clearly outweigh the opportunity."
+        f"Choose ABORT only if the risk clearly and specifically outweighs the opportunity. "
+        f"When in doubt, PROCEED."
     )
     try:
         resp = ollama.generate(
             model=OLLAMA_MODEL,
             prompt=debate_prompt,
             think=False,
-            options={"temperature": 0.5, "top_p": 0.9, "num_predict": 150}
+            options={"temperature": 0.7, "top_p": 0.9, "num_predict": 150}
         )
         text = resp['response']
         verdict = 'PROCEED'
@@ -121,6 +122,7 @@ class AutonomousAgent:
         self.daily_trades = 0
         self.last_reset_date = datetime.now().date()
         self.daily_start_equity = None  # Set at start of each trading day
+        self.pdt_blocked = False        # Set True if PDT restriction detected
 
         # Decision logging — unique ID per process run for replay correlation
         self.session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -316,7 +318,7 @@ class AutonomousAgent:
         except Exception:
             return None
 
-    def execute_trade(self, symbol, decision, equity):
+    def execute_trade(self, symbol, decision, equity, available_cash):
         """Execute a trade based on AI decision."""
         try:
             side = OrderSide.BUY if decision['decision'] == 'buy' else OrderSide.SELL
@@ -335,6 +337,11 @@ class AutonomousAgent:
                 shares = int(float(position.qty))
             else:
                 position_value = equity * self.params['max_position_size']
+                # Hard cap: never exceed actual cash on hand (no margin)
+                position_value = min(position_value, available_cash)
+                if available_cash < current_price:
+                    logging.warning(f"⚠️  Skipping BUY {symbol}: available cash ${available_cash:,.2f} < price ${current_price:.2f}")
+                    return False
                 shares = int(position_value / current_price)
 
             if shares == 0:
@@ -342,6 +349,7 @@ class AutonomousAgent:
                 return False
 
             # Build order — bracket for buys, plain market for sells
+            # GTC avoids PDT (Pattern Day Trader) restrictions vs DAY orders
             if side == OrderSide.BUY:
                 stop_price = round(current_price * (1 + self.params['stop_loss']), 2)
                 take_profit_price = round(current_price * (1 + self.params['take_profit']), 2)
@@ -349,7 +357,7 @@ class AutonomousAgent:
                     symbol=symbol,
                     qty=shares,
                     side=side,
-                    time_in_force=TimeInForce.DAY,
+                    time_in_force=TimeInForce.GTC,
                     order_class='bracket',
                     take_profit=TakeProfitRequest(limit_price=take_profit_price),
                     stop_loss=StopLossRequest(stop_price=stop_price),
@@ -360,7 +368,7 @@ class AutonomousAgent:
                     symbol=symbol,
                     qty=shares,
                     side=side,
-                    time_in_force=TimeInForce.DAY,
+                    time_in_force=TimeInForce.GTC,
                 )
 
             # Submit order
@@ -397,8 +405,12 @@ class AutonomousAgent:
             return True
 
         except Exception as e:
+            err = str(e)
+            if '40310000' in err or 'daytrading_buying_power' in err or 'insufficient day trading' in err.lower():
+                logging.warning(f"🚫 PDT restriction active — halting buy orders for today. Will resume tomorrow.")
+                self.pdt_blocked = True
             logging.error(f"❌ Trade execution failed for {symbol}: {e}")
-            alert_trade_failed('StockAgent', symbol, str(e))
+            alert_trade_failed('StockAgent', symbol, err)
             return False
     
     def run_trading_session(self):
@@ -409,12 +421,21 @@ class AutonomousAgent:
             self.daily_trades = 0
             self.last_reset_date = today
             self.daily_start_equity = None
+            self.pdt_blocked = False
             logging.info("🔄 Daily trade counter reset")
 
         # Get account info
         account = self.trading_client.get_account()
         equity = float(account.equity)
-        logging.info(f"💰 Account Equity: ${equity:,.2f}")
+        # Use cash only — never margin. non_marginable_buying_power is the
+        # stricter of the two; fall back to cash if unavailable.
+        cash = float(account.cash)
+        non_marginable_bp = float(account.non_marginable_buying_power or cash)
+        available_cash = min(cash, non_marginable_bp)
+        day_bp = float(account.daytrading_buying_power or 0)
+        logging.info(f"💰 Account Equity: ${equity:,.2f} | Cash: ${cash:,.2f} | Non-Marginable BP: ${non_marginable_bp:,.2f}")
+        if day_bp == 0 and available_cash > 0:
+            logging.warning("⚠️  Day trading buying power is $0 (PDT restriction) — using GTC orders to bypass")
 
         # Record starting equity for circuit breaker
         if self.daily_start_equity is None:
@@ -480,22 +501,23 @@ class AutonomousAgent:
             news_snippet = news_fetcher.format_for_prompt(symbol)
 
             # Create AI prompt
-            prompt = f"""Analyze {symbol} for trading:
+            prompt = f"""You are a decisive short-term stock trader. Analyze {symbol} and give a clear trading decision.
 
             Current Price: ${indicators['current_price']:.2f}
-            RSI (14): {indicators['rsi']:.1f}
-            MACD: {indicators['macd']:.2f}
-            Volume Ratio: {indicators['volume_ratio']:.1f}x average
+            RSI (14): {indicators['rsi']:.1f}  (>70 overbought, <30 oversold)
+            MACD: {indicators['macd']:.2f}  (positive = bullish momentum)
+            Volume Ratio: {indicators['volume_ratio']:.1f}x average  (>1.5 = elevated activity)
             Price Change (100 bars): {indicators['price_change_pct']:+.1f}%
 
             Discovery Signals: {', '.join(self.discovery.opportunities.get(symbol, []))}{news_snippet}
 
-            Based on this data, should we BUY, SELL, or HOLD?
+            Make a decisive call. Only use HOLD if the indicators are genuinely mixed with no clear edge.
+            Use confidence above 0.70 when signals align, below 0.60 when signals conflict.
 
             Respond in this exact format:
             Decision: <BUY|SELL|HOLD>
             Confidence: <0.00-1.00>
-            Reasoning: <one sentence>"""
+            Reasoning: <one sentence explaining the key signal>"""
 
             # Get AI decision
             logging.info(f"🤔 Analyzing {symbol}...")
@@ -524,12 +546,18 @@ class AutonomousAgent:
                     logging.info(f"✅ Debate confirmed {symbol}: PROCEED")
 
             executed = False
-            if will_execute:
-                executed = self.execute_trade(symbol, decision, equity)
+            if will_execute and self.pdt_blocked and decision['decision'] == 'buy':
+                logging.info(f"⏭️  Skipping {symbol}: PDT restriction active for today")
+                will_execute = False
+            elif will_execute:
+                executed = self.execute_trade(symbol, decision, equity, available_cash)
                 if executed:
                     trades_executed += 1
             elif not will_execute and decision['decision'] in ['buy', 'sell']:
-                logging.info(f"⏭️  Skipping {symbol}: confidence {decision['confidence']:.2f} < {self.params['min_confidence']:.2f}")
+                if debate_result and debate_result['verdict'] == 'ABORT':
+                    logging.info(f"⏭️  Skipping {symbol}: debate aborted (confidence was {decision['confidence']:.2f})")
+                else:
+                    logging.info(f"⏭️  Skipping {symbol}: confidence {decision['confidence']:.2f} below threshold {self.params['min_confidence']:.2f}")
 
             # Log every decision (including HOLDs) for replay and validation
             log_indicators = {**indicators,

@@ -57,22 +57,23 @@ def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) ->
     Defaults to PROCEED on failure so the trade isn't silently blocked.
     """
     debate_prompt = (
-        f"You are a skeptical options risk analyst reviewing a proposed trade.\n"
+        f"You are a balanced options risk/reward analyst reviewing a proposed trade.\n"
         f"Proposal: {action.upper()} on {symbol}  (confidence: {confidence:.0%})\n"
-        f"Bull/Bear argument: {reasoning}\n\n"
-        f"List 2 specific risks (IV crush, event risk, liquidity, wrong direction) "
-        f"that could make this trade lose money. "
+        f"Argument: {reasoning}\n\n"
+        f"Briefly state ONE supporting factor and ONE risk (IV crush, event risk, liquidity, wrong direction) "
+        f"for this trade.\n"
         f"Then state your verdict on a NEW LINE as exactly one of:\n"
         f"VERDICT: PROCEED\n"
         f"VERDICT: ABORT\n"
-        f"Abort only if the risks clearly outweigh the opportunity."
+        f"Choose ABORT only if the risk clearly and specifically outweighs the opportunity. "
+        f"When in doubt, PROCEED."
     )
     try:
         resp = ollama.generate(
             model=OLLAMA_MODEL,
             prompt=debate_prompt,
             think=False,
-            options={"temperature": 0.5, "top_p": 0.9, "num_predict": 150}
+            options={"temperature": 0.7, "top_p": 0.9, "num_predict": 150}
         )
         text = resp['response']
         verdict = 'PROCEED'
@@ -190,36 +191,42 @@ class OptionsAgent:
         return {}
 
     def get_available_capital(self):
-        """Calculate available capital for options (10-15% of portfolio)."""
+        """Calculate available capital for options (10-15% of portfolio, cash only)."""
         try:
             account = self.trading_client.get_account()
             total_equity = float(account.equity)
-            
+            # Use cash only — never margin
+            cash = float(account.cash)
+            non_marginable_bp = float(account.non_marginable_buying_power or cash)
+            available_cash = min(cash, non_marginable_bp)
+
             # Get current options positions value
             positions = self.trading_client.get_all_positions()
             options_value = sum(
-                float(p.market_value) 
-                for p in positions 
+                float(p.market_value)
+                for p in positions
                 if hasattr(p, 'symbol') and len(p.symbol) > 10  # Options symbols are long
             )
-            
+
             # Calculate target allocation (12.5% midpoint)
             target_allocation = total_equity * 0.125
             available = target_allocation - options_value
-            
+
             # Ensure we stay within 10-15% bounds
             max_allocation = total_equity * self.params['max_portfolio_allocation']
-            min_allocation = total_equity * self.params['min_portfolio_allocation']
-            
+
             if options_value >= max_allocation:
                 available = 0
             elif available < 0:
                 available = 0
-            
-            logging.info(f"💰 Total Equity: ${total_equity:,.2f}")
+
+            # Hard cap: never exceed actual cash on hand (no margin)
+            available = min(available, available_cash)
+
+            logging.info(f"💰 Total Equity: ${total_equity:,.2f} | Cash: ${cash:,.2f} | Non-Marginable BP: ${non_marginable_bp:,.2f}")
             logging.info(f"💰 Options Value: ${options_value:,.2f} ({options_value/total_equity:.1%})")
             logging.info(f"💰 Available for Options: ${available:,.2f}")
-            
+
             return available
             
         except Exception as e:
@@ -288,26 +295,28 @@ class OptionsAgent:
         extra_context = (news_snippet + flow_snippet).strip()
         context_block = f"\n{extra_context}" if extra_context else ''
 
-        prompt = f"""Analyze {analysis['symbol']} for OPTIONS trading:
+        prompt = f"""You are a decisive options trader. Analyze {analysis['symbol']} and give a clear options decision.
 
 Current Price: ${analysis['current_price']:.2f}
-RSI (14): {analysis['rsi']:.1f}
-Volatility (20d): {analysis['volatility']:.1%}
-Momentum (20d): {analysis['momentum']:.1%}
+RSI (14): {analysis['rsi']:.1f}  (>70 overbought, <30 oversold)
+Volatility (20d): {analysis['volatility']:.1%}  (higher = more expensive options)
+Momentum (20d): {analysis['momentum']:.1%}  (positive = bullish trend)
 
 Market Context (from overnight research):
 - Overall market bias: {market_bias}
 - Symbol-specific bias: {symbol_bias}{context_block}
 
-Based on this data, should we:
-- BUY_CALL (bullish, expect price to rise)
-- BUY_PUT (bearish, expect price to fall)
-- HOLD (wait for better opportunity)
+Make a decisive call based on the signals above:
+- BUY_CALL if momentum and bias are bullish
+- BUY_PUT if momentum and bias are bearish
+- HOLD only if signals are genuinely conflicting with no clear edge
+
+Use confidence above 0.75 when signals align clearly, below 0.75 when signals are mixed.
 
 Respond in this exact format:
 Decision: <BUY_CALL|BUY_PUT|HOLD>
 Confidence: <0.00-1.00>
-Reasoning: <one sentence>"""
+Reasoning: <one sentence explaining the key signal>"""
 
         response = get_trading_decision(prompt, max_new_tokens=150)
         decision = parse_decision(response)
@@ -351,7 +360,10 @@ Reasoning: <one sentence>"""
 
             for contract in contracts:
                 strike = float(contract.strike_price)
-                dte = (datetime.strptime(contract.expiration_date, '%Y-%m-%d') - datetime.now()).days
+                exp = contract.expiration_date
+                if isinstance(exp, str):
+                    exp = datetime.strptime(exp, '%Y-%m-%d').date()
+                dte = (exp - datetime.now().date()).days
                 
                 # Score based on proximity to target delta and DTE
                 strike_diff = abs(strike - strike_price) / strike_price
@@ -665,8 +677,11 @@ Reasoning: <one sentence>"""
                                            market_ctx, executed, debate=debate_result)
                         break
             else:
-                logging.info(f"⏭️  Skipping {symbol}: {decision['decision']} "
-                             f"(confidence: {decision['confidence']:.0%})")
+                if debate_result and debate_result['verdict'] == 'ABORT':
+                    logging.info(f"⏭️  Skipping {symbol}: debate aborted (confidence was {decision['confidence']:.0%})")
+                else:
+                    logging.info(f"⏭️  Skipping {symbol}: {decision['decision']} "
+                                 f"(confidence: {decision['confidence']:.0%} below threshold {min_conf:.0%})")
 
             # Log every decision (including HOLDs) for replay and validation
             self._log_decision(symbol, prompt, raw_response, decision, analysis,
