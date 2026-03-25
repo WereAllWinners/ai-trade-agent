@@ -336,11 +336,10 @@ class AutonomousAgent:
                     return False
                 shares = int(float(position.qty))
             else:
-                position_value = equity * self.params['max_position_size']
-                # Hard cap: never exceed actual cash on hand (no margin)
-                position_value = min(position_value, available_cash)
-                if available_cash < current_price:
-                    logging.warning(f"⚠️  Skipping BUY {symbol}: available cash ${available_cash:,.2f} < price ${current_price:.2f}")
+                # Size from cash only — never equity or buying_power
+                position_value = cash * self.params['max_position_size']
+                if cash < current_price:
+                    logging.warning(f"⚠️  Skipping BUY {symbol}: cash ${cash:,.2f} < price ${current_price:.2f}")
                     return False
                 shares = int(position_value / current_price)
 
@@ -348,28 +347,14 @@ class AutonomousAgent:
                 logging.warning(f"⚠️  Position too small for {symbol}")
                 return False
 
-            # Build order — bracket for buys, plain market for sells
-            # GTC avoids PDT (Pattern Day Trader) restrictions vs DAY orders
-            if side == OrderSide.BUY:
-                stop_price = round(current_price * (1 + self.params['stop_loss']), 2)
-                take_profit_price = round(current_price * (1 + self.params['take_profit']), 2)
-                order = MarketOrderRequest(
-                    symbol=symbol,
-                    qty=shares,
-                    side=side,
-                    time_in_force=TimeInForce.GTC,
-                    order_class='bracket',
-                    take_profit=TakeProfitRequest(limit_price=take_profit_price),
-                    stop_loss=StopLossRequest(stop_price=stop_price),
-                )
-                logging.info(f"  Bracket: SL=${stop_price:.2f} / TP=${take_profit_price:.2f}")
-            else:
-                order = MarketOrderRequest(
-                    symbol=symbol,
-                    qty=shares,
-                    side=side,
-                    time_in_force=TimeInForce.GTC,
-                )
+            # Simple market orders only — no bracket orders.
+            # Bracket child orders lock up shares and cause "insufficient qty" errors.
+            order = MarketOrderRequest(
+                symbol=symbol,
+                qty=shares,
+                side=side,
+                time_in_force=TimeInForce.GTC,
+            )
 
             # Submit order
             submitted_order = self.trading_client.submit_order(order)
@@ -427,15 +412,13 @@ class AutonomousAgent:
         # Get account info
         account = self.trading_client.get_account()
         equity = float(account.equity)
-        # Use cash only — never margin. non_marginable_buying_power is the
-        # stricter of the two; fall back to cash if unavailable.
-        cash = float(account.cash)
-        non_marginable_bp = float(account.non_marginable_buying_power or cash)
-        available_cash = min(cash, non_marginable_bp)
-        day_bp = float(account.daytrading_buying_power or 0)
-        logging.info(f"💰 Account Equity: ${equity:,.2f} | Cash: ${cash:,.2f} | Non-Marginable BP: ${non_marginable_bp:,.2f}")
-        if day_bp == 0 and available_cash > 0:
-            logging.warning("⚠️  Day trading buying power is $0 (PDT restriction) — using GTC orders to bypass")
+        cash = float(account.cash)   # actual settled cash — never use buying_power (margin)
+        logging.info(f"💰 Account Equity: ${equity:,.2f} | Cash: ${cash:,.2f}")
+
+        # Hard gate: refuse all buys if cash is at or below zero
+        if cash <= 0:
+            logging.warning(f"🛑 Cash is ${cash:,.2f} — no buys allowed until cash is positive.")
+            return
 
         # Record starting equity for circuit breaker
         if self.daily_start_equity is None:
@@ -550,7 +533,7 @@ class AutonomousAgent:
                 logging.info(f"⏭️  Skipping {symbol}: PDT restriction active for today")
                 will_execute = False
             elif will_execute:
-                executed = self.execute_trade(symbol, decision, equity, available_cash)
+                executed = self.execute_trade(symbol, decision, equity, cash)
                 if executed:
                     trades_executed += 1
             elif not will_execute and decision['decision'] in ['buy', 'sell']:

@@ -195,10 +195,6 @@ class OptionsAgent:
         try:
             account = self.trading_client.get_account()
             total_equity = float(account.equity)
-            # Use cash only — never margin
-            cash = float(account.cash)
-            non_marginable_bp = float(account.non_marginable_buying_power or cash)
-            available_cash = min(cash, non_marginable_bp)
 
             # Get current options positions value
             positions = self.trading_client.get_all_positions()
@@ -208,7 +204,14 @@ class OptionsAgent:
                 if hasattr(p, 'symbol') and len(p.symbol) > 10  # Options symbols are long
             )
 
-            # Calculate target allocation (12.5% midpoint)
+            cash = float(account.cash)
+
+            # Hard gate: no buys if cash is at or below zero
+            if cash <= 0:
+                logging.warning(f"🛑 Cash is ${cash:,.2f} — no options buys until cash is positive.")
+                return 0
+
+            # Calculate target allocation (12.5% midpoint), capped strictly to cash
             target_allocation = total_equity * 0.125
             available = target_allocation - options_value
 
@@ -221,9 +224,9 @@ class OptionsAgent:
                 available = 0
 
             # Hard cap: never exceed actual cash on hand (no margin)
-            available = min(available, available_cash)
+            available = min(available, cash)
 
-            logging.info(f"💰 Total Equity: ${total_equity:,.2f} | Cash: ${cash:,.2f} | Non-Marginable BP: ${non_marginable_bp:,.2f}")
+            logging.info(f"💰 Total Equity: ${total_equity:,.2f} | Cash: ${cash:,.2f}")
             logging.info(f"💰 Options Value: ${options_value:,.2f} ({options_value/total_equity:.1%})")
             logging.info(f"💰 Available for Options: ${available:,.2f}")
 
