@@ -14,6 +14,20 @@ from datetime import datetime
 from pathlib import Path
 from contextlib import contextmanager
 
+try:
+    import numpy as np
+    def _json_default(obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+except ImportError:
+    def _json_default(obj):
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = _PROJECT_ROOT / 'logs' / 'trading.db'
 
@@ -165,9 +179,9 @@ def insert_decision(rec: dict, db_path: Path = DB_PATH) -> None:
         'confidence':     rec.get('confidence'),
         'reasoning':      rec.get('reasoning'),
         'executed':       1 if rec.get('executed') else 0,
-        'indicators':     json.dumps(rec['indicators']) if rec.get('indicators') else None,
-        'market_context': json.dumps(rec['market_context']) if rec.get('market_context') else None,
-        'debate':         json.dumps(rec['debate']) if rec.get('debate') else None,
+        'indicators':     json.dumps(rec['indicators'], default=_json_default) if rec.get('indicators') else None,
+        'market_context': json.dumps(rec['market_context'], default=_json_default) if rec.get('market_context') else None,
+        'debate':         json.dumps(rec['debate'], default=_json_default) if rec.get('debate') else None,
     }
     with get_conn(db_path) as conn:
         conn.execute(sql, row)

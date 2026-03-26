@@ -26,6 +26,7 @@ from decision_parser import parse_decision
 from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
 import news_fetcher
 import db as _db
+from fee_simulator import FeeSimulator
 
 OLLAMA_MODEL = "qwen3:8b"
 _DEBATE_CONFIDENCE_THRESHOLD = 0.90   # Only debate very high-conviction trades
@@ -123,6 +124,7 @@ class AutonomousAgent:
         self.last_reset_date = datetime.now().date()
         self.daily_start_equity = None  # Set at start of each trading day
         self.pdt_blocked = False        # Set True if PDT restriction detected
+        self.fee_simulator = FeeSimulator(paper=_paper)
 
         # Decision logging — unique ID per process run for replay correlation
         self.session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -336,11 +338,17 @@ class AutonomousAgent:
                     return False
                 shares = int(float(position.qty))
             else:
-                # Size from cash only — never equity or buying_power
-                position_value = cash * self.params['max_position_size']
-                if cash < current_price:
-                    logging.warning(f"⚠️  Skipping BUY {symbol}: cash ${cash:,.2f} < price ${current_price:.2f}")
+                # Always re-fetch cash from Alpaca immediately before a buy.
+                # This is the single source of truth — local tracking variables
+                # can drift if the options bot spends cash concurrently.
+                live_cash = float(self.trading_client.get_account().cash)
+                if live_cash <= 0:
+                    logging.warning(f"🛑 BUY {symbol} blocked: live cash is ${live_cash:,.2f} (zero or negative)")
                     return False
+                if live_cash < current_price:
+                    logging.warning(f"⚠️  Skipping BUY {symbol}: live cash ${live_cash:,.2f} < price ${current_price:.2f}")
+                    return False
+                position_value = live_cash * self.params['max_position_size']
                 shares = int(position_value / current_price)
 
             if shares == 0:
@@ -385,7 +393,8 @@ class AutonomousAgent:
 
             # Update cooldown
             self.cooldowns[symbol] = datetime.now()
-            self.daily_trades += 1
+            if side == OrderSide.BUY:
+                self.daily_trades += 1
 
             return True
 
@@ -398,6 +407,198 @@ class AutonomousAgent:
             alert_trade_failed('StockAgent', symbol, err)
             return False
     
+    # ── Position rotation helpers ──────────────────────────────────────────────
+
+    def _score_position(self, symbol: str, position) -> dict | None:
+        """Re-analyse an existing holding with current indicators and AI.
+
+        Returns a dict merging the AI decision with live position metrics,
+        or None if data is unavailable.
+        """
+        try:
+            df = self.get_market_data(symbol)
+            if df is None:
+                return None
+            indicators = self.calculate_indicators(df)
+            if indicators is None:
+                return None
+
+            news_snippet = news_fetcher.format_for_prompt(symbol)
+            prompt = f"""You are a decisive short-term stock trader. Analyze {symbol} and give a clear trading decision.
+
+            Current Price: ${indicators['current_price']:.2f}
+            RSI (14): {indicators['rsi']:.1f}  (>70 overbought, <30 oversold)
+            MACD: {indicators['macd']:.2f}  (positive = bullish momentum)
+            Volume Ratio: {indicators['volume_ratio']:.1f}x average  (>1.5 = elevated activity)
+            Price Change (100 bars): {indicators['price_change_pct']:+.1f}%
+
+            Discovery Signals: {', '.join(self.discovery.opportunities.get(symbol, []))}{news_snippet}
+
+            Make a decisive call. Only use HOLD if the indicators are genuinely mixed with no clear edge.
+            Use confidence above 0.70 when signals align, below 0.60 when signals conflict.
+
+            Respond in this exact format:
+            Decision: <BUY|SELL|HOLD>
+            Confidence: <0.00-1.00>
+            Reasoning: <one sentence explaining the key signal>"""
+
+            response = get_trading_decision(prompt)
+            decision = parse_decision(response)
+
+            unrealized_pl  = float(position.unrealized_pl)
+            market_value   = float(position.market_value)
+            unrealized_pct = unrealized_pl / (market_value - unrealized_pl) if (market_value - unrealized_pl) else 0
+
+            return {
+                'symbol':         symbol,
+                'decision':       decision['decision'],
+                'confidence':     decision['confidence'],
+                'reasoning':      decision.get('reasoning', ''),
+                'current_price':  indicators['current_price'],
+                'indicators':     indicators,
+                'market_value':   market_value,
+                'unrealized_pl':  unrealized_pl,
+                'unrealized_pct': unrealized_pct,
+                'qty':            int(float(position.qty)),
+            }
+        except Exception as e:
+            logging.warning(f"⚠️  Could not score position {symbol}: {e}")
+            return None
+
+    def _find_weakest_position(self, scored_positions: list) -> dict | None:
+        """Return the weakest holding from a list of scored position dicts.
+
+        Weakness index (higher = weaker = better candidate to exit):
+          sell_signal_weight    — 1.0 if AI says SELL, 0.5 if HOLD, 0.0 if BUY
+          low_confidence_weight — (1.0 - AI confidence)
+          unrealized_loss_weight — capped 0-1, where -10% loss → 1.0
+        """
+        if not scored_positions:
+            return None
+
+        for p in scored_positions:
+            sell_w  = 1.0 if p['decision'] == 'sell' else (0.5 if p['decision'] == 'hold' else 0.0)
+            conf_w  = 1.0 - p['confidence']
+            loss_w  = min(max(-p['unrealized_pct'] / 0.10, 0.0), 1.0)
+            p['weakness_score'] = sell_w + conf_w + loss_w
+
+        return max(scored_positions, key=lambda p: p['weakness_score'])
+
+    def _attempt_rotation(
+        self,
+        new_symbol:   str,
+        new_decision: dict,
+        remaining_cash: float,
+        equity: float,
+    ) -> bool:
+        """Sell the weakest existing holding to fund a new opportunity.
+
+        Only executes if the net expected value of the swap exceeds a minimum
+        threshold after accounting for simulated round-trip trading fees.
+
+        Returns True if both the sell and buy completed successfully.
+        """
+        # Minimum net EV required to justify a rotation (1%)
+        MIN_NET_EV        = 0.01
+        # Assumed gain if the new trade goes right / loss if the held one goes wrong
+        ASSUMED_RETURN    = 0.05
+
+        try:
+            positions = self.trading_client.get_all_positions()
+        except Exception as e:
+            logging.warning(f"⚠️  Could not fetch positions for rotation: {e}")
+            return False
+
+        if not positions:
+            return False
+
+        # Score all holdings that are not on cooldown
+        scored = []
+        for p in positions:
+            if self.check_cooldown(p.symbol):
+                continue
+            if p.symbol == new_symbol:
+                continue
+            score = self._score_position(p.symbol, p)
+            if score:
+                scored.append(score)
+
+        if not scored:
+            logging.info("⚙️  Rotation: no scoreable positions available")
+            return False
+
+        weakest = self._find_weakest_position(scored)
+        if weakest is None:
+            return False
+
+        # Estimate full round-trip fee cost
+        exit_price   = weakest['current_price']
+        exit_shares  = weakest['qty']
+        entry_price  = new_decision['current_price']
+        entry_shares = max(int((exit_price * exit_shares) / entry_price), 1)
+
+        fee_breakdown    = self.fee_simulator.estimate_round_trip_cost(
+            exit_price, exit_shares, entry_price, entry_shares
+        )
+        total_fee_pct    = fee_breakdown['total_cost_pct']
+
+        # Net expected value calculation
+        new_ev           = new_decision['confidence'] * ASSUMED_RETURN
+        weakest_hold_cost = (weakest['confidence'] * ASSUMED_RETURN
+                             if weakest['decision'] == 'sell' else 0.0)
+        net_ev           = new_ev + weakest_hold_cost - total_fee_pct
+
+        logging.info(
+            f"⚙️  Rotation eval: SELL {weakest['symbol']} "
+            f"(weakness={weakest['weakness_score']:.2f}, "
+            f"unrealized={weakest['unrealized_pct']:+.1%}) "
+            f"→ BUY {new_symbol} | "
+            f"new_ev={new_ev:.3f}, avoided_loss={weakest_hold_cost:.3f}, "
+            f"fees={total_fee_pct:.4%}, net_ev={net_ev:.3f}"
+        )
+
+        if net_ev < MIN_NET_EV:
+            logging.info(
+                f"⚙️  Rotation rejected: net_ev {net_ev:.3f} < "
+                f"threshold {MIN_NET_EV:.3f}"
+            )
+            return False
+
+        if new_decision['confidence'] <= weakest['confidence']:
+            logging.info(
+                f"⚙️  Rotation rejected: new confidence "
+                f"{new_decision['confidence']:.2f} ≤ weakest "
+                f"{weakest['confidence']:.2f}"
+            )
+            return False
+
+        # Execute — sell first, then buy with the freed cash
+        logging.info(
+            f"🔄 Rotating: SELL {weakest['symbol']} → BUY {new_symbol} "
+            f"(est. fees ${fee_breakdown['total_cost']:.2f})"
+        )
+        sell_decision = {
+            'decision':      'sell',
+            'confidence':    weakest['confidence'],
+            'reasoning':     f"rotation out — weakest holding vs {new_symbol}",
+            'current_price': exit_price,
+        }
+        sold = self.execute_trade(weakest['symbol'], sell_decision, equity, 0)
+        if not sold:
+            logging.warning(f"⚙️  Rotation abandoned: could not sell {weakest['symbol']}")
+            return False
+
+        post_sell_cash = remaining_cash + (exit_price * exit_shares)
+        bought = self.execute_trade(new_symbol, new_decision, equity, post_sell_cash)
+        if not bought:
+            logging.warning(
+                f"⚙️  Rotation incomplete: sold {weakest['symbol']} "
+                f"but failed to buy {new_symbol}"
+            )
+        return bought
+
+    # ── Main session loop ──────────────────────────────────────────────────────
+
     def run_trading_session(self):
         """Run a single trading session - analyze and potentially trade."""
         # Reset daily counter if new day
@@ -449,8 +650,8 @@ class AutonomousAgent:
         
         # Analyze each opportunity
         trades_executed = 0
-        
-        # Correct version (inside a loop)
+        remaining_cash = cash  # track spend within this session — decremented after each buy
+
         for opp in opportunities:
             try:
                 if isinstance(opp, str):
@@ -533,9 +734,29 @@ class AutonomousAgent:
                 logging.info(f"⏭️  Skipping {symbol}: PDT restriction active for today")
                 will_execute = False
             elif will_execute:
-                executed = self.execute_trade(symbol, decision, equity, cash)
-                if executed:
-                    trades_executed += 1
+                is_buy = decision['decision'] == 'buy'
+                needs_rotation = is_buy and remaining_cash < decision.get('current_price', 0)
+
+                if needs_rotation:
+                    logging.info(
+                        f"💡 Cash ${remaining_cash:,.2f} insufficient for {symbol} "
+                        f"@ ${decision.get('current_price', 0):.2f} — attempting rotation..."
+                    )
+                    executed = self._attempt_rotation(symbol, decision, remaining_cash, equity)
+                    if executed:
+                        trades_executed += 1
+                        remaining_cash = max(
+                            remaining_cash - equity * self.params['max_position_size'], 0
+                        )
+                        logging.info(f"💵 Remaining cash this session: ${remaining_cash:,.2f}")
+                else:
+                    executed = self.execute_trade(symbol, decision, equity, remaining_cash)
+                    if executed:
+                        trades_executed += 1
+                        if is_buy:
+                            cost = remaining_cash * self.params['max_position_size']
+                            remaining_cash = max(remaining_cash - cost, 0)
+                            logging.info(f"💵 Remaining cash this session: ${remaining_cash:,.2f}")
             elif not will_execute and decision['decision'] in ['buy', 'sell']:
                 if debate_result and debate_result['verdict'] == 'ABORT':
                     logging.info(f"⏭️  Skipping {symbol}: debate aborted (confidence was {decision['confidence']:.2f})")

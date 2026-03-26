@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import logging
 import numpy as np
 from collections import defaultdict
+from pathlib import Path
 import json
 import time
 import warnings
@@ -12,11 +13,63 @@ warnings.filterwarnings('ignore', message='Failed to fetch')
 
 logging.basicConfig(level=logging.INFO)
 
+_DELISTED_CACHE_PATH = Path(__file__).resolve().parent.parent / 'logs' / 'delisted_cache.json'
+
+
+def _load_delisted_cache() -> set:
+    """Load persisted denylist of delisted/unfound tickers."""
+    try:
+        if _DELISTED_CACHE_PATH.exists():
+            data = json.loads(_DELISTED_CACHE_PATH.read_text())
+            return set(data.get('delisted', []))
+    except Exception:
+        pass
+    return set()
+
+
+def _save_delisted_cache(delisted: set) -> None:
+    """Persist denylist to disk."""
+    try:
+        _DELISTED_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _DELISTED_CACHE_PATH.write_text(
+            json.dumps({'delisted': sorted(delisted), 'updated': datetime.now().isoformat()}, indent=2)
+        )
+    except Exception as e:
+        logging.warning(f"Could not save delisted cache: {e}")
+
+
 class StockDiscovery:
     def __init__(self):
         self.discovered_stocks = []
         self.opportunities = defaultdict(list)
         self.full_universe = []
+        self._delisted: set = _load_delisted_cache()
+        if self._delisted:
+            logging.info(f"🚫 Loaded {len(self._delisted)} known delisted/unfound tickers from cache")
+
+    def _mark_delisted(self, symbol: str) -> None:
+        """Add a ticker to the denylist and persist it."""
+        if symbol not in self._delisted:
+            self._delisted.add(symbol)
+            logging.info(f"🗑️  Marking {symbol} as delisted/unfound — added to denylist")
+            _save_delisted_cache(self._delisted)
+
+    def _is_active(self, symbol: str, period: str = '5d') -> bool:
+        """
+        Return True if yfinance returns price data for this symbol.
+        Marks the symbol as delisted if no data is found.
+        """
+        if symbol in self._delisted:
+            return False
+        try:
+            hist = yf.Ticker(symbol).history(period=period)
+            if hist.empty:
+                self._mark_delisted(symbol)
+                return False
+            return True
+        except Exception:
+            self._mark_delisted(symbol)
+            return False
     
     def get_full_market_universe(self):
         """Get complete list of all tradeable US stocks."""
@@ -66,30 +119,38 @@ class StockDiscovery:
         
         constituents = []
         
+        headers = {'User-Agent': 'Mozilla/5.0 (compatible; research-bot/1.0)'}
+
         # S&P 500
         try:
-            sp500_table = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
-            sp500_symbols = sp500_table[0]['Symbol'].str.replace('.', '-').tolist()
+            html = requests.get('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', headers=headers, timeout=10).text
+            sp500_symbols = pd.read_html(html)[0]['Symbol'].str.replace('.', '-').tolist()
             constituents.extend(sp500_symbols)
             logging.info(f"  ✅ S&P 500: {len(sp500_symbols)} stocks")
         except Exception as e:
             logging.warning(f"Failed to fetch S&P 500: {e}")
-        
+
         # NASDAQ 100
         try:
-            nasdaq100_table = pd.read_html('https://en.wikipedia.org/wiki/Nasdaq-100')
-            nasdaq100_symbols = nasdaq100_table[4]['Ticker'].tolist()
-            constituents.extend(nasdaq100_symbols)
-            logging.info(f"  ✅ NASDAQ 100: {len(nasdaq100_symbols)} stocks")
+            html = requests.get('https://en.wikipedia.org/wiki/Nasdaq-100', headers=headers, timeout=10).text
+            tables = pd.read_html(html)
+            nasdaq100_df = next((t for t in tables if 'Ticker' in t.columns), None)
+            if nasdaq100_df is not None:
+                nasdaq100_symbols = nasdaq100_df['Ticker'].dropna().tolist()
+                constituents.extend(nasdaq100_symbols)
+                logging.info(f"  ✅ NASDAQ 100: {len(nasdaq100_symbols)} stocks")
         except Exception as e:
             logging.warning(f"Failed to fetch NASDAQ 100: {e}")
-        
+
         # Dow Jones 30
         try:
-            dow_table = pd.read_html('https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average')
-            dow_symbols = dow_table[1]['Symbol'].tolist()
-            constituents.extend(dow_symbols)
-            logging.info(f"  ✅ Dow 30: {len(dow_symbols)} stocks")
+            html = requests.get('https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average', headers=headers, timeout=10).text
+            tables = pd.read_html(html)
+            dow_df = next((t for t in tables if 'Symbol' in t.columns), None)
+            if dow_df is not None:
+                dow_symbols = dow_df['Symbol'].dropna().tolist()
+                constituents.extend(dow_symbols)
+                logging.info(f"  ✅ Dow 30: {len(dow_symbols)} stocks")
         except Exception as e:
             logging.warning(f"Failed to fetch Dow 30: {e}")
         
@@ -125,19 +186,25 @@ class StockDiscovery:
         
         for i in range(0, total_to_scan, batch_size):
             batch = self.full_universe[i:i+batch_size]
-            
+
             for symbol in batch:
+                if symbol in self._delisted:
+                    continue
                 try:
                     stock = yf.Ticker(symbol)
                     hist = stock.history(period='5d')
-                    
-                    if not hist.empty and len(hist) >= 3:
+
+                    if hist.empty:
+                        self._mark_delisted(symbol)
+                        continue
+
+                    if len(hist) >= 3:
                         avg_volume = hist['Volume'].mean()
                         current_price = hist['Close'].iloc[-1]
-                        
+
                         if (avg_volume >= min_volume and
-                            current_price >= 5.0 and
-                            current_price <= 2000.0):
+                                current_price >= 5.0 and
+                                current_price <= 2000.0):
                             liquid_stocks.append(symbol)
 
                 except Exception as e:
@@ -357,41 +424,54 @@ class StockDiscovery:
         try:
             url = "https://finviz.com/screener.ashx?v=111&s=ta_topgainers"
             headers = {'User-Agent': 'Mozilla/5.0'}
-            
+
             response = requests.get(url, headers=headers, timeout=10)
-            df = pd.read_html(response.text)[6]
-            
-            tickers = df['Ticker'].head(top_n).tolist()
-            
+            response.raise_for_status()
+
+            # Find the table that contains a 'Ticker' column — FinViz layout changes over time
+            tables = pd.read_html(response.text)
+            df = next((t for t in tables if 'Ticker' in t.columns), None)
+            if df is None:
+                logging.warning("Failed to get pre-market movers: no Ticker table found in FinViz response")
+                return []
+
+            tickers = df['Ticker'].dropna().head(top_n).tolist()
+
             for ticker in tickers:
                 self.opportunities[ticker].append("Pre-market mover")
-            
+
             logging.info(f"  🔥 Found {len(tickers)} pre-market movers")
             return tickers
-        
+
         except Exception as e:
-            logging.warning(f"Failed to get pre-market movers: {e}")
+            # Truncate error to avoid logging full HTML responses
+            logging.warning(f"Failed to get pre-market movers: {str(e)[:200]}")
             return []
     
     def filter_by_liquidity(self, symbols, min_volume=500000, min_price=5.0):
         """Final liquidity filter."""
         liquid_stocks = []
-        
+
         for symbol in symbols:
+            if symbol in self._delisted:
+                continue
             try:
                 stock = yf.Ticker(symbol)
                 hist = stock.history(period='5d')
-                
-                if not hist.empty:
-                    avg_volume = hist['Volume'].mean()
-                    current_price = hist['Close'].iloc[-1]
 
-                    if avg_volume >= min_volume and current_price >= min_price:
-                        liquid_stocks.append(symbol)
+                if hist.empty:
+                    self._mark_delisted(symbol)
+                    continue
+
+                avg_volume = hist['Volume'].mean()
+                current_price = hist['Close'].iloc[-1]
+
+                if avg_volume >= min_volume and current_price >= min_price:
+                    liquid_stocks.append(symbol)
             except Exception as e:
                 logging.debug(f"Skipping {symbol} in final liquidity filter: {e}")
                 continue
-        
+
         return liquid_stocks
     
     def rank_opportunities(self, stocks):
