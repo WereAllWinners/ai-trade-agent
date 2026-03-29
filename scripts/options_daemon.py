@@ -16,6 +16,39 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 _HEARTBEAT_FILE = _SCRIPTS_DIR.parent / 'logs' / 'heartbeat_options.json'
 sys.path.append(str(_SCRIPTS_DIR))
 
+_OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'qwen3:8b')
+
+
+def _warmup_ollama() -> None:
+    """Pre-load the Ollama model into GPU memory at daemon start."""
+    try:
+        import ollama
+        ollama.generate(
+            model=_OLLAMA_MODEL,
+            prompt="warmup",
+            options={"num_predict": 1},
+        )
+        logging.info(f"🔥 Ollama model '{_OLLAMA_MODEL}' warmed up")
+    except Exception as e:
+        logging.warning(f"⚠️  Ollama warm-up skipped (will cold-start on first session): {e}")
+
+
+def _stop_ollama_model() -> None:
+    """Unload the Ollama model from GPU memory before fine-tuning starts."""
+    try:
+        result = subprocess.run(
+            ['ollama', 'stop', _OLLAMA_MODEL],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            logging.info(f"🛑 Ollama model '{_OLLAMA_MODEL}' unloaded from GPU (pre-finetune)")
+        else:
+            logging.warning(f"⚠️  ollama stop returned {result.returncode}: {result.stderr.strip()}")
+    except FileNotFoundError:
+        logging.debug("ollama CLI not found — skipping model unload")
+    except Exception as e:
+        logging.warning(f"⚠️  Could not unload Ollama model: {e}")
+
 
 def _write_heartbeat(status: str, market_open: bool) -> None:
     """Update heartbeat file so health_server.py can report daemon liveness."""
@@ -50,6 +83,7 @@ class OptionsDaemon:
         logging.info("📊 Performance analysis scheduled for 5:30 PM EST daily")
         logging.info("🔍 Market research + 🎓 Fine-tuning scheduled for 2:00 AM EST daily")
         logging.info("🏖️  Weekend deep analysis scheduled for Saturday 10:00 AM EST")
+        _warmup_ollama()
     
     def is_market_open(self):
         """Check if market is currently open."""
@@ -179,6 +213,8 @@ class OptionsDaemon:
         """Run market research, build training data, then fine-tune options model."""
         self.run_market_research()
         self.run_training_data_builder()
+        # Free GPU VRAM before training job loads the 32B base model
+        _stop_ollama_model()
         try:
             training_data_path = str(_SCRIPTS_DIR.parent / 'finetune' / 'data' / 'options_training_data.json')
 

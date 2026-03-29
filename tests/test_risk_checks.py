@@ -41,6 +41,7 @@ class TestAutonomousAgentRisk:
             agent.daily_trades = 0
             agent.daily_start_equity = None
             agent.cooldowns = {}
+            agent.pdt_blocked = False
             from datetime import datetime
             agent.last_reset_date = datetime.now().date()
             # Mock trading client
@@ -84,58 +85,86 @@ class TestAutonomousAgentRisk:
         agent.trading_client.get_open_position.side_effect = Exception("position not found")
 
         decision = {'decision': 'sell', 'confidence': 0.80, 'reasoning': 'test', 'current_price': 100.0}
-        result = agent.execute_trade('AAPL', decision, 100_000.0)
+        result = agent.execute_trade('AAPL', decision, 100_000.0, 100_000.0)
 
         assert result is False
         agent.trading_client.submit_order.assert_not_called()
 
-    def test_bracket_order_submitted_for_buy(self):
-        """execute_trade should submit an order with take_profit/stop_loss for BUY."""
+    def test_market_order_submitted_for_buy(self):
+        """execute_trade should submit a market order for BUY (no bracket orders)."""
         agent = self._make_agent()
         mock_order = MagicMock()
         mock_order.id = 'order-123'
         agent.trading_client.submit_order.return_value = mock_order
+
+        # Provide enough cash for the buy
+        mock_account = MagicMock()
+        mock_account.cash = '10000'
+        agent.trading_client.get_account.return_value = mock_account
 
         decision = {'decision': 'buy', 'confidence': 0.80, 'reasoning': 'test', 'current_price': 100.0}
 
-        import tempfile, os
-        # Patch the log file write
-        with patch('builtins.open', create=True) as mock_open:
-            mock_open.return_value.__enter__ = lambda s: s
-            mock_open.return_value.__exit__ = MagicMock(return_value=False)
-            mock_open.return_value.write = MagicMock()
-            result = agent.execute_trade('AAPL', decision, 100_000.0)
+        with patch('builtins.open', MagicMock()), \
+             patch('autonomous_agent.alert_trade_executed'), \
+             patch('autonomous_agent._db') as mock_db:
+            mock_db.cleanup_stale_reservations = MagicMock()
+            mock_db.get_total_reserved = MagicMock(return_value=0.0)
+            mock_db.reserve_cash = MagicMock(return_value=1)
+            mock_db.release_cash = MagicMock()
+            mock_db.insert_trade = MagicMock()
+            result = agent.execute_trade('AAPL', decision, 100_000.0, 9_500.0)
 
         assert result is True
+        # Simple market order — no bracket orders (they cause "insufficient qty" errors)
         call_args = agent.trading_client.submit_order.call_args[0][0]
-        # Bracket order must have take_profit and stop_loss
-        assert call_args.take_profit is not None
-        assert call_args.stop_loss is not None
+        from alpaca.trading.requests import MarketOrderRequest
+        assert isinstance(call_args, MarketOrderRequest)
 
-    def test_stop_loss_price_correct(self):
-        """SL price should be entry_price * (1 + stop_loss)."""
+    def test_buy_uses_spendable_cash_for_sizing(self):
+        """Shares must be sized from (live_cash - _MIN_CASH_RESERVE), not full cash."""
         agent = self._make_agent()
         mock_order = MagicMock()
         mock_order.id = 'order-123'
         agent.trading_client.submit_order.return_value = mock_order
 
-        decision = {'decision': 'buy', 'confidence': 0.80, 'reasoning': 'test', 'current_price': 200.0}
-        expected_sl = round(200.0 * (1 + agent.params['stop_loss']), 2)  # 200 * 0.93 = 186.00
+        # live_cash=$5500, reserve=$500 → spendable=$5000
+        # position_size=5% → $250 → at $1/share → 250 shares
+        mock_account = MagicMock()
+        mock_account.cash = '5500'
+        agent.trading_client.get_account.return_value = mock_account
 
-        with patch('builtins.open', create=True) as mock_open:
-            mock_open.return_value.__enter__ = lambda s: s
-            mock_open.return_value.__exit__ = MagicMock(return_value=False)
-            mock_open.return_value.write = MagicMock()
-            agent.execute_trade('NVDA', decision, 100_000.0)
+        decision = {'decision': 'buy', 'confidence': 0.80, 'reasoning': 'test', 'current_price': 1.0}
+
+        with patch('builtins.open', MagicMock()), \
+             patch('autonomous_agent.alert_trade_executed'), \
+             patch('autonomous_agent._db') as mock_db:
+            mock_db.cleanup_stale_reservations = MagicMock()
+            mock_db.get_total_reserved = MagicMock(return_value=0.0)
+            mock_db.reserve_cash = MagicMock(return_value=1)
+            mock_db.release_cash = MagicMock()
+            mock_db.insert_trade = MagicMock()
+            agent.execute_trade('TSLA', decision, 100_000.0, 5_000.0)
 
         call_args = agent.trading_client.submit_order.call_args[0][0]
-        assert call_args.stop_loss.stop_price == expected_sl
+        # spendable=$5000; 5% of $5000=$250; 250/$1=250 shares
+        assert call_args.qty == 250
 
     def test_zero_shares_skipped(self):
-        """Very small equity should produce 0 shares and skip order submission."""
+        """When cash - reserve < share price, the trade is skipped (0 shares)."""
         agent = self._make_agent()
+        # live_cash=$600, reserve=$500 → spendable=$100 < price $500 → skip
+        mock_account = MagicMock()
+        mock_account.cash = '600'
+        agent.trading_client.get_account.return_value = mock_account
+
         decision = {'decision': 'buy', 'confidence': 0.80, 'reasoning': 'test', 'current_price': 500.0}
-        result = agent.execute_trade('TSLA', decision, 100.0)  # $100 equity * 5% = $5, < 1 share
+
+        import autonomous_agent as aa
+        with patch.object(aa, '_db') as mock_db, \
+             patch.object(aa, '_DRY_RUN', False):
+            mock_db.cleanup_stale_reservations = MagicMock()
+            mock_db.get_total_reserved = MagicMock(return_value=0.0)
+            result = agent.execute_trade('TSLA', decision, 100_000.0, 100.0)
 
         assert result is False
         agent.trading_client.submit_order.assert_not_called()

@@ -6,17 +6,23 @@ import os
 import sys
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetOptionContractsRequest, MarketOrderRequest
+from alpaca.trading.requests import GetOptionContractsRequest, GetOrdersRequest, MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, ContractType
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.requests import OptionLatestQuoteRequest
 import yfinance as yf
 import pandas as pd
 import numpy as np
+
+try:
+    from zoneinfo import ZoneInfo
+    _EST = ZoneInfo('America/New_York')
+except Exception:
+    _EST = None  # fallback: use local system time
 
 import ollama
 sys.path.append(str(Path(__file__).resolve().parent))
@@ -26,18 +32,39 @@ import news_fetcher
 import unusual_flow_scanner
 import db as _db
 
-OLLAMA_MODEL = "qwen3:8b"
+OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'qwen3:8b')
 _DEBATE_CONFIDENCE_THRESHOLD = 0.85   # Options trades require higher bar for debate
+_MIN_CASH_RESERVE = 500.0             # Never spend the account's last $500 of cash
+_DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'  # log orders but never submit
+# Near-zero option exit: skip closing if total contract value is below this threshold
+# (the broker's minimum notional to avoid a pointless trade + commission)
+_MIN_EXIT_VALUE_USD = 10.0
 
 def _json_default(obj):
-    """JSON serializer for numpy scalar types that the stdlib encoder can't handle."""
+    """JSON serializer for types that the stdlib encoder can't handle."""
     if isinstance(obj, (np.integer,)):
         return int(obj)
     if isinstance(obj, (np.floating,)):
         return float(obj)
     if isinstance(obj, np.ndarray):
         return obj.tolist()
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+def warmup_ollama() -> None:
+    """Pre-load the model into GPU memory to avoid cold-start latency."""
+    try:
+        ollama.generate(
+            model=OLLAMA_MODEL,
+            prompt="warmup",
+            think=False,
+            options={"num_predict": 1},
+        )
+        logging.info(f"🔥 Ollama model '{OLLAMA_MODEL}' warmed up")
+    except Exception as e:
+        logging.warning(f"⚠️  Ollama warm-up failed (will cold-start on first decision): {e}")
+
 
 def get_trading_decision(prompt, max_new_tokens=200):
     """Get trading decision via Ollama (model stays resident in memory)."""
@@ -122,6 +149,7 @@ class OptionsAgent:
             'max_loss_per_trade': 0.02,         # Max 2% loss per trade
             'take_profit': 0.50,                # Take profit at 50%
             'stop_loss': -0.50,                 # Stop loss at -50%
+            'exit_dte_threshold': 2,            # Close positions within N calendar days of expiry
             'max_daily_loss_pct': 0.05,         # Circuit breaker: halt after -5% day
         }
 
@@ -141,7 +169,16 @@ class OptionsAgent:
         self.last_reset_date = datetime.now().date()
         self.trade_cooldown = {}  # Symbol -> last trade time
         self.daily_start_equity = None  # Set at start of each trading day
-        
+
+        if _DRY_RUN:
+            logging.warning("🧪 DRY RUN MODE: orders will be logged but NOT submitted to Alpaca")
+
+        # Warm up model so first decision isn't delayed by cold start
+        warmup_ollama()
+
+        # Init DB (creates tables including cash_reservations if needed)
+        _db.init_db()
+
         logging.info("🎯 Options Agent Initialized")
     
     def _log_decision(self, symbol: str, prompt: str, raw_response: str,
@@ -206,12 +243,15 @@ class OptionsAgent:
 
             cash = float(account.cash)
 
-            # Hard gate: no buys if cash is at or below zero
-            if cash <= 0:
-                logging.warning(f"🛑 Cash is ${cash:,.2f} — no options buys until cash is positive.")
+            # Hard gate: no buys if cash is at or below the minimum reserve
+            if cash <= _MIN_CASH_RESERVE:
+                logging.warning(
+                    f"🛑 Cash is ${cash:,.2f} ≤ reserve ${_MIN_CASH_RESERVE:,.2f} "
+                    f"— no options buys until cash recovers."
+                )
                 return 0
 
-            # Calculate target allocation (12.5% midpoint), capped strictly to cash
+            # Calculate target allocation (12.5% midpoint), capped strictly to spendable cash
             target_allocation = total_equity * 0.125
             available = target_allocation - options_value
 
@@ -223,8 +263,10 @@ class OptionsAgent:
             elif available < 0:
                 available = 0
 
-            # Hard cap: never exceed actual cash on hand (no margin)
-            available = min(available, cash)
+            # Hard cap: never exceed spendable cash (actual cash minus the reserve buffer)
+            spendable_cash = cash - _MIN_CASH_RESERVE
+            available = min(available, spendable_cash)
+            available = max(available, 0)  # floor at zero
 
             logging.info(f"💰 Total Equity: ${total_equity:,.2f} | Cash: ${cash:,.2f}")
             logging.info(f"💰 Options Value: ${options_value:,.2f} ({options_value/total_equity:.1%})")
@@ -237,20 +279,48 @@ class OptionsAgent:
             return 0
     
     def get_market_data(self, symbol):
-        """Get market data for underlying stock."""
+        """Get market data for underlying stock.
+
+        Primary: Alpaca historical bars (same API key already configured).
+        Fallback: yfinance (kept for resilience but rate-limited at scale).
+        """
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+
+        # --- Alpaca primary ---
+        try:
+            data_client = StockHistoricalDataClient(
+                os.getenv('ALPACA_API_KEY'),
+                os.getenv('ALPACA_SECRET_KEY')
+            )
+            end = datetime.now()
+            start = end - timedelta(days=90)
+            bars = data_client.get_stock_bars(StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=TimeFrame.Day,
+                start=start,
+                end=end,
+            ))
+            df = bars.df
+            if not df.empty and len(df) >= 14:
+                df.index = df.index.get_level_values('timestamp') if isinstance(df.index, pd.MultiIndex) else df.index
+                logging.debug(f"✅ Got {len(df)} daily bars for {symbol} (Alpaca)")
+                return df
+        except Exception as e:
+            logging.debug(f"Alpaca data failed for {symbol}: {e}")
+
+        # --- yfinance fallback ---
         try:
             ticker = yf.Ticker(symbol)
             df = ticker.history(period='3mo', interval='1d')
-            
-            if df.empty:
-                return None
-            
-            df.columns = df.columns.str.lower()
-            return df
-            
+            if not df.empty:
+                df.columns = df.columns.str.lower()
+                return df
         except Exception as e:
-            logging.error(f"❌ Failed to get data for {symbol}: {e}")
-            return None
+            logging.error(f"❌ Failed to get data for {symbol} (yfinance fallback): {e}")
+
+        return None
     
     def analyze_stock_for_options(self, symbol):
         """Analyze stock for options trading opportunity."""
@@ -384,6 +454,29 @@ Reasoning: <one sentence explaining the key signal>"""
             logging.error(f"❌ Failed to find option contract: {e}")
             return None
     
+    def parse_dte_from_symbol(self, symbol: str, _today=None) -> int | None:
+        """
+        Extract days-to-expiration from an OCC option symbol.
+
+        OCC format: <TICKER><YYMMDD><C|P><8-digit-strike>
+        The expiry date is always at symbol[-15:-9] (6 chars, YYMMDD).
+
+        Examples:
+            SPY250328P00560000  -> symbol[-15:-9] = '250328' -> 2025-03-28
+            AAPL260319C00207000 -> symbol[-15:-9] = '260319' -> 2026-03-19
+
+        _today: date override for unit tests; defaults to current EST date.
+        """
+        try:
+            date_str = symbol[-15:-9]
+            expiry = datetime.strptime(date_str, '%y%m%d').date()
+            if _today is None:
+                _today = datetime.now(_EST).date() if _EST else datetime.now().date()
+            return (expiry - _today).days
+        except (ValueError, IndexError):
+            logging.warning(f"Could not parse DTE from symbol: {symbol}")
+            return None
+
     def calculate_position_size(self, option_price, available_capital, size_multiplier: float = 1.0):
         """Calculate position size (number of contracts), scaled by research multiplier."""
         max_position_value = available_capital * self.params['max_position_size'] * size_multiplier
@@ -420,24 +513,25 @@ Reasoning: <one sentence explaining the key signal>"""
 
     def execute_options_trade(self, symbol, decision, analysis, available_capital, size_multiplier: float = 1.0):
         """Execute options trade."""
+        reservation_id = None
         try:
             # Determine contract type
             contract_type = ContractType.CALL if decision['decision'] == 'buy_call' else ContractType.PUT
-            
+
             # Find optimal strike
             current_price = analysis['current_price']
             if contract_type == ContractType.CALL:
                 strike_price = current_price * 1.02  # 2% OTM call
             else:
                 strike_price = current_price * 0.98  # 2% OTM put
-            
+
             # Find contract
             contract = self.find_optimal_option(symbol, contract_type, strike_price)
-            
+
             if not contract:
                 logging.warning(f"⚠️  No suitable option contract found for {symbol}")
                 return False
-            
+
             # Get real option price from market data (bid/ask midpoint)
             option_price = self.get_option_price(contract.symbol)
             if option_price is None:
@@ -446,11 +540,35 @@ Reasoning: <one sentence explaining the key signal>"""
 
             # Calculate position size (scaled by research multiplier)
             quantity = self.calculate_position_size(option_price, available_capital, size_multiplier)
-            
+
             if quantity == 0:
                 logging.warning(f"⚠️  Position size too small for {symbol}")
                 return False
-            
+
+            # Each contract = 100 shares, so estimated cost = price × 100 × qty
+            estimated_cost = option_price * 100 * quantity
+
+            # Clean up stale cross-bot reservations before re-checking cash
+            _db.cleanup_stale_reservations(max_age_seconds=120)
+
+            # Re-fetch live cash + subtract any active cross-bot reservations.
+            # available_capital was computed earlier and can be stale if the stock
+            # bot spent cash concurrently.
+            live_cash = float(self.trading_client.get_account().cash)
+            already_reserved = _db.get_total_reserved()
+            effective_cash = live_cash - already_reserved
+            if effective_cash - estimated_cost <= _MIN_CASH_RESERVE:
+                logging.warning(
+                    f"🛑 Aborting options buy for {symbol}: effective cash "
+                    f"${effective_cash:,.2f} (live=${live_cash:,.2f} "
+                    f"− reserved=${already_reserved:,.2f}) − cost ${estimated_cost:,.2f} "
+                    f"would breach ${_MIN_CASH_RESERVE:,.2f} reserve. Skipping."
+                )
+                return False
+
+            # Atomically reserve this cash so the stock bot can't double-spend it
+            reservation_id = _db.reserve_cash('options', estimated_cost)
+
             # Create order
             order = MarketOrderRequest(
                 symbol=contract.symbol,
@@ -458,9 +576,19 @@ Reasoning: <one sentence explaining the key signal>"""
                 side=OrderSide.BUY,
                 time_in_force=TimeInForce.DAY
             )
-            
-            # Submit order
-            submitted_order = self.trading_client.submit_order(order)
+
+            # DRY RUN: log the order without submitting it
+            if _DRY_RUN:
+                dry_id = f"dry-run-{datetime.now().strftime('%H%M%S%f')}"
+                logging.info(
+                    f"[DRY RUN] Would submit BUY {quantity} contracts of "
+                    f"{contract.symbol} @ ${option_price:.2f}/share "
+                    f"(est. cost=${estimated_cost:.2f}, order_id={dry_id})"
+                )
+                submitted_order = type('_DryOrder', (), {'id': dry_id})()
+            else:
+                # Submit order
+                submitted_order = self.trading_client.submit_order(order)
             
             # Log trade
             trade_log = {
@@ -479,7 +607,7 @@ Reasoning: <one sentence explaining the key signal>"""
             }
             
             with open('logs/options_trade_log.jsonl', 'a') as f:
-                f.write(json.dumps(trade_log) + '\n')
+                f.write(json.dumps(trade_log, default=_json_default) + '\n')
             try:
                 _db.insert_trade(trade_log, bot='options')
             except Exception as e:
@@ -496,62 +624,145 @@ Reasoning: <one sentence explaining the key signal>"""
             logging.error(f"❌ Options trade execution failed: {e}")
             alert_trade_failed('OptionsAgent', symbol, str(e))
             return False
-    
+        finally:
+            # Always release the cash reservation, whether the order succeeded or failed
+            if reservation_id is not None:
+                try:
+                    _db.release_cash(reservation_id)
+                except Exception as rel_err:
+                    logging.warning(f"⚠️  Could not release options cash reservation {reservation_id}: {rel_err}")
+
+    def _has_open_exit_order(self, symbol: str) -> bool:
+        """
+        Return True if a live SELL order already exists for this option symbol.
+        Prevents duplicate exit submissions when a GTC order is still pending
+        from a prior session.  Defaults to False on API error so the exit is
+        never silently blocked.
+        """
+        try:
+            open_orders = self.trading_client.get_orders(
+                GetOrdersRequest(status='open')
+            )
+            return any(
+                order.symbol == symbol and order.side == OrderSide.SELL
+                for order in open_orders
+            )
+        except Exception as e:
+            logging.warning(f"Could not check open orders for {symbol}: {e}")
+            return False
+
     def manage_existing_positions(self):
         """Monitor and manage existing options positions."""
         try:
             positions = self.trading_client.get_all_positions()
-            
+
             for position in positions:
-                # Check if it's an option (options have long symbols)
+                # Options have long OCC symbols (e.g. SPY250328P00560000); stocks are short
                 if len(position.symbol) <= 10:
                     continue
-                
+
                 qty = float(position.qty)
                 unrealized_plpc = float(position.unrealized_plpc)
-                
+
                 logging.info(f"📊 Option: {position.symbol[:20]}... P&L: {unrealized_plpc:+.1%}")
-                
-                # Exit criteria
+
                 should_exit = False
                 exit_reason = None
-                
-                # Take profit at 50%
+                time_in_force = TimeInForce.DAY  # default for P&L exits
+
+                # Take profit at +50%
                 if unrealized_plpc >= self.params['take_profit']:
                     should_exit = True
                     exit_reason = "take_profit_50%"
-                
+
                 # Stop loss at -50%
                 elif unrealized_plpc <= self.params['stop_loss']:
                     should_exit = True
                     exit_reason = "stop_loss_50%"
-                
-                if should_exit:
-                    # Create sell order
-                    order = MarketOrderRequest(
-                        symbol=position.symbol,
-                        qty=int(qty),
-                        side=OrderSide.SELL,
-                        time_in_force=TimeInForce.DAY
+
+                # DTE exit — only evaluated when P&L thresholds are not triggered
+                if not should_exit:
+                    dte = self.parse_dte_from_symbol(position.symbol)
+                    threshold = self.params['exit_dte_threshold']
+                    if dte is not None and dte <= threshold:
+                        should_exit = True
+                        exit_reason = f"dte_exit_{dte}d_remaining"
+                        # GTC so the order persists if the intraday fill fails —
+                        # we must exit before the contract expires worthless
+                        time_in_force = TimeInForce.GTC
+
+                if not should_exit:
+                    continue
+
+                # Gap 1: skip if an open sell order for this position already exists
+                # (prevents duplicate submissions when a prior GTC order is still live)
+                if self._has_open_exit_order(position.symbol):
+                    logging.info(
+                        f"⏭️  Skipping exit for {position.symbol[:20]}... — "
+                        f"open sell order already exists ({exit_reason})"
                     )
-                    
+                    continue
+
+                # Near-zero contract check: if the total recovery value is below the
+                # minimum exit threshold, skip the close order to avoid a wasted
+                # commission (the contract will expire worthless, which is the same
+                # financial outcome but without the order rejection risk on illiquid
+                # near-zero options).
+                current_price = self.get_option_price(position.symbol)
+                if current_price is not None:
+                    total_value = current_price * 100 * int(qty)  # 100 shares per contract
+                    if total_value < _MIN_EXIT_VALUE_USD:
+                        logging.warning(
+                            f"⚠️  Skipping exit for {position.symbol[:20]}... — "
+                            f"total value ${total_value:.2f} < min ${_MIN_EXIT_VALUE_USD:.2f}. "
+                            f"Will expire worthless (same outcome, no commission)."
+                        )
+                        continue
+                    if current_price < 0.05:
+                        logging.warning(
+                            f"⚠️  Near-zero contract: {position.symbol[:20]}... "
+                            f"(${current_price:.2f}/share, total=${total_value:.2f}). "
+                            f"Exiting to recover remaining value."
+                        )
+
+                order = MarketOrderRequest(
+                    symbol=position.symbol,
+                    qty=int(qty),
+                    side=OrderSide.SELL,
+                    time_in_force=time_in_force
+                )
+
+                if _DRY_RUN:
+                    dry_id = f"dry-run-{datetime.now().strftime('%H%M%S%f')}"
+                    logging.info(
+                        f"[DRY RUN] Would submit SELL {int(qty)} contracts of "
+                        f"{position.symbol[:20]}... ({exit_reason}, order_id={dry_id})"
+                    )
+                    submitted_order = type('_DryOrder', (), {'id': dry_id})()
+                else:
                     submitted_order = self.trading_client.submit_order(order)
-                    
-                    trade_log = {
-                        'timestamp': datetime.now().isoformat(),
-                        'contract': position.symbol,
-                        'action': 'sell',
-                        'quantity': int(qty),
-                        'reason': exit_reason,
-                        'exit_pl_pct': unrealized_plpc,
-                        'order_id': str(submitted_order.id)
-                    }
-                    
-                    with open('logs/options_trade_log.jsonl', 'a') as f:
-                        f.write(json.dumps(trade_log) + '\n')
-                    
-                    logging.info(f"✅ Closed option position: {exit_reason} ({unrealized_plpc:+.1%})")
-                    
+
+                trade_log = {
+                    'timestamp': datetime.now().isoformat(),
+                    'contract': position.symbol,
+                    'action': 'sell',
+                    'quantity': int(qty),
+                    'reason': exit_reason,
+                    'exit_pl_pct': unrealized_plpc,
+                    'order_id': str(submitted_order.id)
+                }
+
+                with open('logs/options_trade_log.jsonl', 'a') as f:
+                    f.write(json.dumps(trade_log, default=_json_default) + '\n')
+
+                logging.info(f"✅ Closed option position: {exit_reason} ({unrealized_plpc:+.1%})")
+
+                # Gap 4: alert on every exit type including DTE exits
+                alert_trade_executed(
+                    'OptionsAgent', position.symbol, 'sell',
+                    int(qty), unrealized_plpc, str(submitted_order.id)
+                )
+
         except Exception as e:
             logging.error(f"❌ Position management failed: {e}")
     
@@ -565,7 +776,25 @@ Reasoning: <one sentence explaining the key signal>"""
             self.daily_start_equity = None
             logging.info("🔄 Daily options trade counter reset")
 
-        # Circuit breaker: check daily P&L before doing anything
+        # Load overnight research params first so exit_dte_threshold override is applied
+        # before manage_existing_positions() runs.
+        research       = self.load_research_params()
+        min_conf       = research.get('min_confidence_override', self.params['min_confidence'])
+        size_mult      = research.get('position_size_multiplier', 1.0)
+        market_bias    = research.get('market_bias', 'neutral')
+        avoid_earnings = set(research.get('avoid_earnings_risk', []))
+        symbol_bias    = research.get('symbol_bias', {})
+        # Gap 3 (research override): allow monday_params_options.json to tighten the
+        # DTE exit window during high-volatility weeks
+        self.params['exit_dte_threshold'] = research.get(
+            'exit_dte_threshold', self.params['exit_dte_threshold']
+        )
+
+        # Step 1: Manage existing positions — runs BEFORE the circuit breaker so
+        # DTE exits still fire on bad P&L days (defensive, not speculative).
+        self.manage_existing_positions()
+
+        # Circuit breaker: check daily P&L before opening any new positions
         try:
             account = self.trading_client.get_account()
             equity = float(account.equity)
@@ -584,18 +813,7 @@ Reasoning: <one sentence explaining the key signal>"""
         except Exception as e:
             logging.error(f"❌ Failed to check circuit breaker: {e}")
 
-        # Load overnight research params (graceful — defaults used if file absent)
-        research       = self.load_research_params()
-        min_conf       = research.get('min_confidence_override', self.params['min_confidence'])
-        size_mult      = research.get('position_size_multiplier', 1.0)
-        market_bias    = research.get('market_bias', 'neutral')
-        avoid_earnings = set(research.get('avoid_earnings_risk', []))
-        symbol_bias    = research.get('symbol_bias', {})
-
         logging.info(f"📊 Daily options trades: {self.daily_trades}/{self.params['max_daily_trades']}")
-
-        # Step 1: Manage existing positions
-        self.manage_existing_positions()
 
         # Step 2: Check if we can trade more
         if self.daily_trades >= self.params['max_daily_trades']:

@@ -17,6 +17,46 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 _HEARTBEAT_FILE = _SCRIPTS_DIR.parent / 'logs' / 'heartbeat_stock.json'
 sys.path.append(str(_SCRIPTS_DIR))
 
+_OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'qwen3:8b')
+
+
+def _warmup_ollama() -> None:
+    """
+    Pre-load the Ollama model into GPU/CPU memory at daemon start.
+    Eliminates 8-15 s cold-start latency on the first trading session.
+    """
+    try:
+        import ollama
+        ollama.generate(
+            model=_OLLAMA_MODEL,
+            prompt="warmup",
+            options={"num_predict": 1},
+        )
+        logging.info(f"🔥 Ollama model '{_OLLAMA_MODEL}' warmed up")
+    except Exception as e:
+        logging.warning(f"⚠️  Ollama warm-up skipped (will cold-start on first session): {e}")
+
+
+def _stop_ollama_model() -> None:
+    """
+    Unload the Ollama model from GPU memory before fine-tuning starts.
+    Prevents VRAM contention between the resident inference model and the
+    fine-tuning process that needs to load a 32B base model.
+    """
+    try:
+        result = subprocess.run(
+            ['ollama', 'stop', _OLLAMA_MODEL],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            logging.info(f"🛑 Ollama model '{_OLLAMA_MODEL}' unloaded from GPU (pre-finetune)")
+        else:
+            logging.warning(f"⚠️  ollama stop returned {result.returncode}: {result.stderr.strip()}")
+    except FileNotFoundError:
+        logging.debug("ollama CLI not found — skipping model unload")
+    except Exception as e:
+        logging.warning(f"⚠️  Could not unload Ollama model: {e}")
+
 
 def _write_heartbeat(status: str, market_open: bool) -> None:
     """Update heartbeat file so health_server.py can report daemon liveness."""
@@ -52,6 +92,7 @@ class TradingDaemon:
         logging.info("📊 Performance analysis scheduled for 5:00 PM EST daily")
         logging.info("🔍 Market research + 🎓 Fine-tuning scheduled for 8:00 PM EST daily")
         logging.info("🏖️  Weekend deep analysis scheduled for Saturday 11:00 AM EST")
+        _warmup_ollama()
     
     def is_market_open(self):
         """Check if market is currently open."""
@@ -210,6 +251,9 @@ class TradingDaemon:
         """Run market research, build training data, then fine-tune."""
         self.run_market_research()
         self.run_training_data_builder()
+        # Free GPU VRAM by unloading the inference model before the training job
+        # loads a 32B base model.  Ollama will auto-reload on the next inference call.
+        _stop_ollama_model()
         try:
             logging.info("🔔 Time for daily model fine-tuning!")
             logging.info("======================================================================")

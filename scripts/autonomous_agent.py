@@ -28,8 +28,11 @@ import news_fetcher
 import db as _db
 from fee_simulator import FeeSimulator
 
-OLLAMA_MODEL = "qwen3:8b"
+OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'qwen3:8b')
 _DEBATE_CONFIDENCE_THRESHOLD = 0.90   # Only debate very high-conviction trades
+_MIN_CASH_RESERVE = 500.0             # Never spend the account's last $500 of cash
+_DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'  # log orders but never submit
+_PDT_DAY_TRADE_LIMIT = 3              # Max same-day round trips before PDT block kicks in
 
 def _json_default(obj):
     """JSON serializer for numpy scalar types that the stdlib encoder can't handle."""
@@ -41,6 +44,24 @@ def _json_default(obj):
     if isinstance(obj, np.ndarray):
         return obj.tolist()
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+def warmup_ollama() -> None:
+    """
+    Send a minimal generation to pre-load the model into GPU memory.
+    Call once at agent startup so the first real trade decision isn't delayed
+    by an 8-15 second cold-start.
+    """
+    try:
+        ollama.generate(
+            model=OLLAMA_MODEL,
+            prompt="warmup",
+            think=False,
+            options={"num_predict": 1},
+        )
+        logging.info(f"🔥 Ollama model '{OLLAMA_MODEL}' warmed up")
+    except Exception as e:
+        logging.warning(f"⚠️  Ollama warm-up failed (will cold-start on first decision): {e}")
+
 
 def get_trading_decision(prompt):
     """Get trading decision via Ollama (model stays resident in memory)."""
@@ -131,6 +152,15 @@ class AutonomousAgent:
         self._decision_log = Path('logs/decision_log.jsonl')
         self._decision_log.parent.mkdir(exist_ok=True)
 
+        if _DRY_RUN:
+            logging.warning("🧪 DRY RUN MODE: orders will be logged but NOT submitted to Alpaca")
+
+        # Warm up model so first decision isn't delayed by cold start
+        warmup_ollama()
+
+        # Init DB (creates tables including cash_reservations if needed)
+        _db.init_db()
+
         logging.info("🤖 Autonomous Agent Initialized")
     
     def load_parameters(self):
@@ -201,6 +231,24 @@ class AutonomousAgent:
             _db.insert_decision(record)
         except Exception as e:
             logging.warning(f"⚠️  Could not write decision to DB: {e}")
+
+    def _count_todays_roundtrips(self) -> int:
+        """
+        Count completed same-day SELL orders in the DB (proxy for round trips).
+        Used for proactive PDT enforcement: if we've already done 3 day-trades
+        today, block new buys before the broker rejects them.
+        """
+        today = datetime.now().date().isoformat()
+        try:
+            with _db.get_conn() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM trades WHERE bot='stock' AND action='sell' "
+                    "AND timestamp LIKE ?",
+                    [f"{today}%"]
+                ).fetchone()
+            return int(row[0]) if row else 0
+        except Exception:
+            return 0
 
     def check_cooldown(self, symbol):
         """Check if symbol is on cooldown."""
@@ -322,6 +370,7 @@ class AutonomousAgent:
 
     def execute_trade(self, symbol, decision, equity, available_cash):
         """Execute a trade based on AI decision."""
+        reservation_id = None
         try:
             side = OrderSide.BUY if decision['decision'] == 'buy' else OrderSide.SELL
             current_price = decision.get('current_price', 0)
@@ -338,18 +387,45 @@ class AutonomousAgent:
                     return False
                 shares = int(float(position.qty))
             else:
-                # Always re-fetch cash from Alpaca immediately before a buy.
-                # This is the single source of truth — local tracking variables
-                # can drift if the options bot spends cash concurrently.
+                # Proactive PDT check — count today's round trips before another buy
+                if not self.pdt_blocked:
+                    todays_roundtrips = self._count_todays_roundtrips()
+                    if todays_roundtrips >= _PDT_DAY_TRADE_LIMIT:
+                        logging.warning(
+                            f"🚫 PDT pre-check: {todays_roundtrips} day-trades today "
+                            f"(limit {_PDT_DAY_TRADE_LIMIT}) — blocking buy {symbol}"
+                        )
+                        self.pdt_blocked = True
+                        return False
+
+                # Clean up any stale cross-bot reservations (crash survivors)
+                _db.cleanup_stale_reservations(max_age_seconds=120)
+
+                # Re-fetch live cash + subtract any active cross-bot reservations.
+                # This is the single source of truth for available cash.
                 live_cash = float(self.trading_client.get_account().cash)
-                if live_cash <= 0:
-                    logging.warning(f"🛑 BUY {symbol} blocked: live cash is ${live_cash:,.2f} (zero or negative)")
+                already_reserved = _db.get_total_reserved()
+                effective_cash = live_cash - already_reserved
+                if effective_cash <= _MIN_CASH_RESERVE:
+                    logging.warning(
+                        f"🛑 BUY {symbol} blocked: effective cash ${effective_cash:,.2f} "
+                        f"(live=${live_cash:,.2f} − reserved=${already_reserved:,.2f}) "
+                        f"≤ reserve ${_MIN_CASH_RESERVE:,.2f}"
+                    )
                     return False
-                if live_cash < current_price:
-                    logging.warning(f"⚠️  Skipping BUY {symbol}: live cash ${live_cash:,.2f} < price ${current_price:.2f}")
+                # Size against spendable effective cash only — never touch the reserve
+                spendable = effective_cash - _MIN_CASH_RESERVE
+                if spendable < current_price:
+                    logging.warning(
+                        f"⚠️  Skipping BUY {symbol}: spendable cash ${spendable:,.2f} "
+                        f"< share price ${current_price:.2f}"
+                    )
                     return False
-                position_value = live_cash * self.params['max_position_size']
+                position_value = spendable * self.params['max_position_size']
                 shares = int(position_value / current_price)
+
+                # Atomically reserve this cash so the options bot can't double-spend it
+                reservation_id = _db.reserve_cash('stock', position_value)
 
             if shares == 0:
                 logging.warning(f"⚠️  Position too small for {symbol}")
@@ -364,8 +440,17 @@ class AutonomousAgent:
                 time_in_force=TimeInForce.GTC,
             )
 
-            # Submit order
-            submitted_order = self.trading_client.submit_order(order)
+            # DRY RUN: log the order without submitting it
+            if _DRY_RUN:
+                dry_id = f"dry-run-{datetime.now().strftime('%H%M%S%f')}"
+                logging.info(
+                    f"[DRY RUN] Would submit {side.value.upper()} {shares} {symbol} "
+                    f"@ ${current_price:.2f} (order_id={dry_id})"
+                )
+                submitted_order = type('_DryOrder', (), {'id': dry_id})()
+            else:
+                # Submit order
+                submitted_order = self.trading_client.submit_order(order)
 
             # Log trade
             trade_log = {
@@ -406,6 +491,13 @@ class AutonomousAgent:
             logging.error(f"❌ Trade execution failed for {symbol}: {e}")
             alert_trade_failed('StockAgent', symbol, err)
             return False
+        finally:
+            # Always release the cash reservation, whether the order succeeded or failed
+            if reservation_id is not None:
+                try:
+                    _db.release_cash(reservation_id)
+                except Exception as rel_err:
+                    logging.warning(f"⚠️  Could not release cash reservation {reservation_id}: {rel_err}")
     
     # ── Position rotation helpers ──────────────────────────────────────────────
 
@@ -512,9 +604,13 @@ class AutonomousAgent:
         if not positions:
             return False
 
-        # Score all holdings that are not on cooldown
+        # Score all holdings that are not on cooldown.
+        # Skip options positions (long OCC symbols e.g. SPY250328P00560000) —
+        # those belong to the options bot and cannot be rotated as stocks.
         scored = []
         for p in positions:
+            if len(p.symbol) > 10:  # OCC option symbol — not a stock
+                continue
             if self.check_cooldown(p.symbol):
                 continue
             if p.symbol == new_symbol:
@@ -616,9 +712,12 @@ class AutonomousAgent:
         cash = float(account.cash)   # actual settled cash — never use buying_power (margin)
         logging.info(f"💰 Account Equity: ${equity:,.2f} | Cash: ${cash:,.2f}")
 
-        # Hard gate: refuse all buys if cash is at or below zero
-        if cash <= 0:
-            logging.warning(f"🛑 Cash is ${cash:,.2f} — no buys allowed until cash is positive.")
+        # Hard gate: refuse all buys if cash is at or below the minimum reserve
+        if cash <= _MIN_CASH_RESERVE:
+            logging.warning(
+                f"🛑 Cash is ${cash:,.2f} ≤ reserve ${_MIN_CASH_RESERVE:,.2f} "
+                f"— no buys allowed until cash recovers."
+            )
             return
 
         # Record starting equity for circuit breaker
@@ -650,7 +749,7 @@ class AutonomousAgent:
         
         # Analyze each opportunity
         trades_executed = 0
-        remaining_cash = cash  # track spend within this session — decremented after each buy
+        remaining_cash = cash - _MIN_CASH_RESERVE  # track spendable cash — reserve is never touched
 
         for opp in opportunities:
             try:
@@ -661,7 +760,13 @@ class AutonomousAgent:
             except Exception as e:
                 logging.error(f"Error processing opportunity: {opp}. Error: {str(e)}")
                 continue
-            
+
+            # Skip any OCC option symbols that leaked into the opportunity list
+            # (options bot's positions have long symbols e.g. SPY250328P00560000)
+            if len(symbol) > 10:
+                logging.debug(f"⏭️  Skipping {symbol} — OCC option symbol, not a stock")
+                continue
+
             # Check limits
             if self.daily_trades >= self.params['max_daily_trades']:
                 logging.info(f"⛔ Daily trade limit reached ({self.params['max_daily_trades']})")

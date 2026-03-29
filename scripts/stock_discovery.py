@@ -14,6 +14,8 @@ warnings.filterwarnings('ignore', message='Failed to fetch')
 logging.basicConfig(level=logging.INFO)
 
 _DELISTED_CACHE_PATH = Path(__file__).resolve().parent.parent / 'logs' / 'delisted_cache.json'
+_DISCOVERY_CACHE_PATH = Path(__file__).resolve().parent.parent / 'logs' / 'discovery_cache.json'
+_DISCOVERY_CACHE_TTL_HOURS = 4  # Reuse discovery results for up to 4 hours
 
 
 def _load_delisted_cache() -> set:
@@ -36,6 +38,37 @@ def _save_delisted_cache(delisted: set) -> None:
         )
     except Exception as e:
         logging.warning(f"Could not save delisted cache: {e}")
+
+
+def _load_discovery_cache() -> dict | None:
+    """
+    Return cached discovery results if they are younger than the TTL, else None.
+    The cache stores the full opportunities dict so signals survive across sessions.
+    """
+    try:
+        if _DISCOVERY_CACHE_PATH.exists():
+            data = json.loads(_DISCOVERY_CACHE_PATH.read_text())
+            cached_at = datetime.fromisoformat(data.get('timestamp', '2000-01-01'))
+            age_hours = (datetime.now() - cached_at).total_seconds() / 3600
+            if age_hours <= _DISCOVERY_CACHE_TTL_HOURS:
+                logging.info(
+                    f"♻️  Using cached discovery results ({age_hours:.1f}h old, "
+                    f"TTL={_DISCOVERY_CACHE_TTL_HOURS}h): "
+                    f"{data.get('total_discovered', 0)} stocks"
+                )
+                return data
+    except Exception as e:
+        logging.debug(f"Could not load discovery cache: {e}")
+    return None
+
+
+def _save_discovery_cache(data: dict) -> None:
+    """Persist discovery results to disk so the next session can reuse them."""
+    try:
+        _DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _DISCOVERY_CACHE_PATH.write_text(json.dumps(data, indent=2))
+    except Exception as e:
+        logging.warning(f"Could not save discovery cache: {e}")
 
 
 class StockDiscovery:
@@ -485,11 +518,29 @@ class StockDiscovery:
         ranked.sort(key=lambda x: x[1], reverse=True)
         return [symbol for symbol, _ in ranked]
     
-    def discover_opportunities(self, max_stocks=30, deep_scan=False):
-        """Main discovery function."""
+    def discover_opportunities(self, max_stocks=30, deep_scan=False, use_cache=True):
+        """Main discovery function.
+
+        Args:
+            max_stocks:  Maximum number of opportunities to return.
+            deep_scan:   If True, scan the full 2000-stock universe (slow).
+            use_cache:   If True (default), return cached results when they are
+                         younger than _DISCOVERY_CACHE_TTL_HOURS.  Pass False to
+                         force a fresh scan regardless of cache age.
+        """
+        # --- Cache check ---
+        if use_cache and not deep_scan:
+            cached = _load_discovery_cache()
+            if cached is not None:
+                self.discovered_stocks = cached.get('stocks', [])[:max_stocks]
+                # Restore opportunities dict so callers can read signals
+                raw_ops = cached.get('opportunities', {})
+                self.opportunities = defaultdict(list, {k: list(v) for k, v in raw_ops.items()})
+                return self.discovered_stocks
+
         logging.info("🚀 Starting FULL MARKET SCAN...")
         logging.info("="*70)
-        
+
         all_candidates = []
         self.opportunities.clear()
         
@@ -530,7 +581,7 @@ class StockDiscovery:
         return self.discovered_stocks
     
     def save_opportunities(self):
-        """Save opportunities."""
+        """Save opportunities to both the human-readable log and the TTL cache."""
         output = {
             'timestamp': datetime.now().isoformat(),
             'total_discovered': len(self.discovered_stocks),
@@ -538,11 +589,14 @@ class StockDiscovery:
             'stocks': self.discovered_stocks,
             'opportunities': dict(self.opportunities)
         }
-        
+
         with open('logs/discovered_opportunities.json', 'w') as f:
             json.dump(output, f, indent=2)
-        
-        logging.info(f"\n💾 Saved to logs/discovered_opportunities.json")
+
+        # Also persist as the discovery cache so the next session can reuse results
+        _save_discovery_cache(output)
+
+        logging.info(f"\n💾 Saved to logs/discovered_opportunities.json (cache TTL={_DISCOVERY_CACHE_TTL_HOURS}h)")
 
 if __name__ == "__main__":
     import argparse

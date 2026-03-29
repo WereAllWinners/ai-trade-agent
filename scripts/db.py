@@ -58,6 +58,18 @@ def get_conn(db_path: Path = DB_PATH):
 # ---------------------------------------------------------------------------
 
 SCHEMA = """
+-- Cross-bot cash reservation lock.
+-- Both bots write a row here atomically before sizing a buy,
+-- ensuring neither can double-count the same cash.
+CREATE TABLE IF NOT EXISTS cash_reservations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    bot         TEXT    NOT NULL,   -- 'stock' | 'options'
+    amount      REAL    NOT NULL,
+    reserved_at TEXT    NOT NULL,
+    released    INTEGER NOT NULL DEFAULT 0,
+    released_at TEXT
+);
+
 -- Every LLM call made by either agent
 CREATE TABLE IF NOT EXISTS decisions (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -310,6 +322,76 @@ def get_training_examples(bot: str = None, label: str = None,
     with get_conn(db_path) as conn:
         rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Cash reservation helpers (cross-bot race-condition guard)
+# ---------------------------------------------------------------------------
+
+def reserve_cash(bot: str, amount: float, db_path: Path = DB_PATH) -> int:
+    """
+    Atomically insert a cash reservation for *bot* and return the reservation id.
+
+    Callers must call release_cash(reservation_id) after the order is submitted
+    (or abandoned).  This creates a short advisory lock window so two bots
+    cannot both size their trades against the same un-committed cash.
+
+    The reservation is written inside an EXCLUSIVE transaction so concurrent
+    SQLite writers see a consistent view even under WAL mode.
+    """
+    sql = """
+        INSERT INTO cash_reservations (bot, amount, reserved_at)
+        VALUES (?, ?, ?)
+    """
+    now = datetime.now().isoformat()
+    conn = sqlite3.connect(str(db_path), timeout=10)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("BEGIN EXCLUSIVE")
+        cursor = conn.execute(sql, [bot, amount, now])
+        reservation_id = cursor.lastrowid
+        conn.commit()
+        return reservation_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def release_cash(reservation_id: int, db_path: Path = DB_PATH) -> None:
+    """Mark a cash reservation as released so other bots can use that cash."""
+    sql = """
+        UPDATE cash_reservations
+        SET released = 1, released_at = ?
+        WHERE id = ?
+    """
+    with get_conn(db_path) as conn:
+        conn.execute(sql, [datetime.now().isoformat(), reservation_id])
+
+
+def get_total_reserved(db_path: Path = DB_PATH) -> float:
+    """Return the sum of all currently active (unreleased) cash reservations."""
+    sql = "SELECT COALESCE(SUM(amount), 0) FROM cash_reservations WHERE released = 0"
+    with get_conn(db_path) as conn:
+        row = conn.execute(sql).fetchone()
+    return float(row[0]) if row else 0.0
+
+
+def cleanup_stale_reservations(max_age_seconds: int = 120, db_path: Path = DB_PATH) -> int:
+    """
+    Release reservations that were never explicitly released — e.g. after a crash.
+    Returns the number of rows cleaned up.
+    """
+    cutoff = (datetime.now() - __import__('datetime').timedelta(seconds=max_age_seconds)).isoformat()
+    sql = """
+        UPDATE cash_reservations
+        SET released = 1, released_at = ?
+        WHERE released = 0 AND reserved_at < ?
+    """
+    with get_conn(db_path) as conn:
+        cursor = conn.execute(sql, [datetime.now().isoformat(), cutoff])
+        return cursor.rowcount
 
 
 def get_existing_prompt_hashes(db_path: Path = DB_PATH) -> set[str]:
