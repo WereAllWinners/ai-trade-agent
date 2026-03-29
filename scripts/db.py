@@ -394,6 +394,44 @@ def cleanup_stale_reservations(max_age_seconds: int = 120, db_path: Path = DB_PA
         return cursor.rowcount
 
 
+def get_recent_trades(limit: int = 100, bot: str = None,
+                      db_path: Path = DB_PATH) -> list[dict]:
+    """
+    Return the *limit* most-recent closed-trade outcomes (from the outcomes
+    table) suitable for Sharpe / draw-down calculations.
+
+    Falls back to the trades table if the outcomes table is empty, returning
+    rows with only the fields AllocationController needs (pnl_pct may be None).
+    """
+    sql_outcomes = """
+        SELECT symbol, pnl_pct, realized_pnl, entry_timestamp AS timestamp
+        FROM outcomes
+        ORDER BY entry_timestamp DESC
+        LIMIT ?
+    """
+    with get_conn(db_path) as conn:
+        rows = conn.execute(sql_outcomes, [limit]).fetchall()
+
+    if rows:
+        return [dict(r) for r in rows]
+
+    # Fallback: trades table (no pnl data, but lets AllocationController
+    # at least count trades without crashing on an empty outcomes table)
+    sql_trades = """
+        SELECT symbol, exit_pl_pct AS pnl_pct, timestamp
+        FROM trades
+        ORDER BY timestamp DESC
+        LIMIT ?
+    """
+    params: list = [limit]
+    if bot:
+        sql_trades = sql_trades.replace("ORDER BY", "WHERE bot = ? ORDER BY")
+        params.insert(0, bot)
+    with get_conn(db_path) as conn:
+        rows = conn.execute(sql_trades, params).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_existing_prompt_hashes(db_path: Path = DB_PATH) -> set[str]:
     """Return all prompt hashes already in the training_examples table."""
     with get_conn(db_path) as conn:

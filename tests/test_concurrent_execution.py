@@ -41,7 +41,9 @@ def _make_options_agent(tmp_db=None):
     with patch('options_agent.TradingClient'), \
          patch('options_agent.OptionHistoricalDataClient'), \
          patch('options_agent.load_dotenv'), \
-         patch('options_agent.warmup_ollama'), \
+         patch('options_agent.inference_client'), \
+         patch('options_agent.PortfolioOverseer'), \
+         patch('options_agent.AllocationController'), \
          patch('options_agent._db') as mock_db:
         mock_db.init_db = MagicMock()
         mock_db.cleanup_stale_reservations = MagicMock()
@@ -69,6 +71,13 @@ def _make_options_agent(tmp_db=None):
     agent.session_id         = 'test'
     agent._decision_log      = Path('/tmp/test_options_concurrent.jsonl')
     agent._params_file       = Path('/tmp/non_existent_options.json')
+    # Mock new round-2 components
+    alloc_ctrl = MagicMock()
+    alloc_ctrl.get_position_size_pct.return_value = 0.03
+    agent.alloc_controller = alloc_ctrl
+    overseer = MagicMock()
+    overseer.is_buy_allowed.return_value = (True, '')
+    agent.overseer = overseer
     return agent
 
 
@@ -78,7 +87,9 @@ def _make_stock_agent():
          patch('autonomous_agent.StockHistoricalDataClient'), \
          patch('autonomous_agent.StockDiscovery'), \
          patch('autonomous_agent.load_dotenv'), \
-         patch('autonomous_agent.warmup_ollama'), \
+         patch('autonomous_agent.inference_client'), \
+         patch('autonomous_agent.PortfolioOverseer'), \
+         patch('autonomous_agent.AllocationController'), \
          patch('autonomous_agent._db') as mock_db:
         mock_db.init_db = MagicMock()
         mock_db.cleanup_stale_reservations = MagicMock()
@@ -102,6 +113,13 @@ def _make_stock_agent():
     agent.pdt_blocked        = False
     agent.discovery          = MagicMock()
     agent.fee_simulator      = MagicMock()
+    # Mock new round-2 components
+    alloc_ctrl = MagicMock()
+    alloc_ctrl.get_position_size_pct.return_value = 0.05
+    agent.alloc_controller = alloc_ctrl
+    overseer = MagicMock()
+    overseer.is_buy_allowed.return_value = (True, '')
+    agent.overseer = overseer
     return agent
 
 

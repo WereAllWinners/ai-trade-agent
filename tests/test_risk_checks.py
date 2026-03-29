@@ -24,7 +24,10 @@ class TestAutonomousAgentRisk:
         with patch('autonomous_agent.TradingClient'), \
              patch('autonomous_agent.StockHistoricalDataClient'), \
              patch('autonomous_agent.StockDiscovery'), \
-             patch('autonomous_agent.load_dotenv'):
+             patch('autonomous_agent.load_dotenv'), \
+             patch('autonomous_agent.inference_client'), \
+             patch('autonomous_agent.PortfolioOverseer'), \
+             patch('autonomous_agent.AllocationController'):
             from autonomous_agent import AutonomousAgent
             agent = AutonomousAgent.__new__(AutonomousAgent)
             # Set up minimal state without calling __init__
@@ -46,6 +49,13 @@ class TestAutonomousAgentRisk:
             agent.last_reset_date = datetime.now().date()
             # Mock trading client
             agent.trading_client = MagicMock()
+            # Mock new components (added in round-2)
+            alloc_ctrl = MagicMock()
+            alloc_ctrl.get_position_size_pct.return_value = 0.05
+            agent.alloc_controller = alloc_ctrl
+            overseer = MagicMock()
+            overseer.is_buy_allowed.return_value = (True, '')
+            agent.overseer = overseer
             return agent
 
     def test_circuit_breaker_triggers_on_5pct_loss(self):

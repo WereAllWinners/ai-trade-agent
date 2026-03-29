@@ -20,13 +20,15 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 # Add project root to path
 sys.path.append(str(Path(__file__).resolve().parent))
 
-import ollama
+import inference_client
 from stock_discovery import StockDiscovery
 from decision_parser import parse_decision
 from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
 import news_fetcher
 import db as _db
 from fee_simulator import FeeSimulator
+from portfolio_overseer import PortfolioOverseer
+from allocation_controller import AllocationController
 
 OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'qwen3:8b')
 _DEBATE_CONFIDENCE_THRESHOLD = 0.90   # Only debate very high-conviction trades
@@ -45,33 +47,9 @@ def _json_default(obj):
         return obj.tolist()
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
-def warmup_ollama() -> None:
-    """
-    Send a minimal generation to pre-load the model into GPU memory.
-    Call once at agent startup so the first real trade decision isn't delayed
-    by an 8-15 second cold-start.
-    """
-    try:
-        ollama.generate(
-            model=OLLAMA_MODEL,
-            prompt="warmup",
-            think=False,
-            options={"num_predict": 1},
-        )
-        logging.info(f"🔥 Ollama model '{OLLAMA_MODEL}' warmed up")
-    except Exception as e:
-        logging.warning(f"⚠️  Ollama warm-up failed (will cold-start on first decision): {e}")
-
-
 def get_trading_decision(prompt):
-    """Get trading decision via Ollama (model stays resident in memory)."""
-    response = ollama.generate(
-        model=OLLAMA_MODEL,
-        prompt=prompt,
-        think=False,
-        options={"temperature": 0.7, "top_p": 0.9, "num_predict": 200}
-    )
-    return response['response']
+    """Get trading decision via the configured inference backend."""
+    return inference_client.generate(prompt, max_tokens=200, temperature=0.7)
 
 
 def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) -> dict:
@@ -92,13 +70,7 @@ def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) ->
         f"When in doubt, PROCEED."
     )
     try:
-        resp = ollama.generate(
-            model=OLLAMA_MODEL,
-            prompt=debate_prompt,
-            think=False,
-            options={"temperature": 0.7, "top_p": 0.9, "num_predict": 150}
-        )
-        text = resp['response']
+        text = inference_client.generate(debate_prompt, max_tokens=150, temperature=0.7)
         verdict = 'PROCEED'
         for line in text.splitlines():
             if 'VERDICT:' in line.upper():
@@ -155,8 +127,19 @@ class AutonomousAgent:
         if _DRY_RUN:
             logging.warning("🧪 DRY RUN MODE: orders will be logged but NOT submitted to Alpaca")
 
-        # Warm up model so first decision isn't delayed by cold start
-        warmup_ollama()
+        # Warm up inference backend so first decision isn't delayed by cold start
+        inference_client.warmup()
+
+        # Portfolio-level guards (sector cap + correlation limit)
+        self.overseer = PortfolioOverseer(self.trading_client)
+
+        # Gradual allocation ramp (Tier 1→3 based on live Sharpe/DD)
+        self.alloc_controller = AllocationController(_db)
+        self.alloc_controller.refresh()
+        logging.info(
+            f"📊 Allocation tier: {self.alloc_controller.current_tier()} "
+            f"({self.alloc_controller.get_position_size_pct():.0%} per position)"
+        )
 
         # Init DB (creates tables including cash_reservations if needed)
         _db.init_db()
@@ -421,8 +404,17 @@ class AutonomousAgent:
                         f"< share price ${current_price:.2f}"
                     )
                     return False
-                position_value = spendable * self.params['max_position_size']
+
+                # Use allocation-controller tier to determine position size
+                alloc_pct = self.alloc_controller.get_position_size_pct()
+                position_value = spendable * alloc_pct
                 shares = int(position_value / current_price)
+
+                # Portfolio concentration guard
+                allowed, veto_reason = self.overseer.is_buy_allowed(symbol, position_value, equity)
+                if not allowed:
+                    logging.warning(f"🚫 Portfolio overseer vetoed BUY {symbol}: {veto_reason}")
+                    return False
 
                 # Atomically reserve this cash so the options bot can't double-spend it
                 reservation_id = _db.reserve_cash('stock', position_value)

@@ -27,7 +27,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
 def _make_options_agent():
     with patch('options_agent.TradingClient'), \
          patch('options_agent.OptionHistoricalDataClient'), \
-         patch('options_agent.load_dotenv'):
+         patch('options_agent.load_dotenv'), \
+         patch('options_agent.inference_client'), \
+         patch('options_agent.PortfolioOverseer'), \
+         patch('options_agent.AllocationController'):
         from options_agent import OptionsAgent
         agent = OptionsAgent.__new__(OptionsAgent)
 
@@ -49,6 +52,12 @@ def _make_options_agent():
     agent.session_id         = 'test'
     agent._decision_log      = Path('/tmp/test_options_dec.jsonl')
     agent._params_file       = Path('/tmp/non_existent.json')
+    alloc_ctrl = MagicMock()
+    alloc_ctrl.get_position_size_pct.return_value = 0.03
+    agent.alloc_controller = alloc_ctrl
+    overseer = MagicMock()
+    overseer.is_buy_allowed.return_value = (True, '')
+    agent.overseer = overseer
     return agent
 
 
@@ -56,7 +65,10 @@ def _make_stock_agent():
     with patch('autonomous_agent.TradingClient'), \
          patch('autonomous_agent.StockHistoricalDataClient'), \
          patch('autonomous_agent.StockDiscovery'), \
-         patch('autonomous_agent.load_dotenv'):
+         patch('autonomous_agent.load_dotenv'), \
+         patch('autonomous_agent.inference_client'), \
+         patch('autonomous_agent.PortfolioOverseer'), \
+         patch('autonomous_agent.AllocationController'):
         from autonomous_agent import AutonomousAgent
         agent = AutonomousAgent.__new__(AutonomousAgent)
 
@@ -73,6 +85,12 @@ def _make_stock_agent():
     agent.cooldowns          = {}
     agent.pdt_blocked        = False
     agent.discovery          = MagicMock()
+    alloc_ctrl = MagicMock()
+    alloc_ctrl.get_position_size_pct.return_value = 0.05
+    agent.alloc_controller = alloc_ctrl
+    overseer = MagicMock()
+    overseer.is_buy_allowed.return_value = (True, '')
+    agent.overseer = overseer
     return agent
 
 

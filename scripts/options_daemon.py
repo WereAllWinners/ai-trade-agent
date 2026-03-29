@@ -16,38 +16,8 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 _HEARTBEAT_FILE = _SCRIPTS_DIR.parent / 'logs' / 'heartbeat_options.json'
 sys.path.append(str(_SCRIPTS_DIR))
 
-_OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'qwen3:8b')
-
-
-def _warmup_ollama() -> None:
-    """Pre-load the Ollama model into GPU memory at daemon start."""
-    try:
-        import ollama
-        ollama.generate(
-            model=_OLLAMA_MODEL,
-            prompt="warmup",
-            options={"num_predict": 1},
-        )
-        logging.info(f"🔥 Ollama model '{_OLLAMA_MODEL}' warmed up")
-    except Exception as e:
-        logging.warning(f"⚠️  Ollama warm-up skipped (will cold-start on first session): {e}")
-
-
-def _stop_ollama_model() -> None:
-    """Unload the Ollama model from GPU memory before fine-tuning starts."""
-    try:
-        result = subprocess.run(
-            ['ollama', 'stop', _OLLAMA_MODEL],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode == 0:
-            logging.info(f"🛑 Ollama model '{_OLLAMA_MODEL}' unloaded from GPU (pre-finetune)")
-        else:
-            logging.warning(f"⚠️  ollama stop returned {result.returncode}: {result.stderr.strip()}")
-    except FileNotFoundError:
-        logging.debug("ollama CLI not found — skipping model unload")
-    except Exception as e:
-        logging.warning(f"⚠️  Could not unload Ollama model: {e}")
+import inference_client
+from preflight_check import run_preflight
 
 
 def _write_heartbeat(status: str, market_open: bool) -> None:
@@ -83,8 +53,35 @@ class OptionsDaemon:
         logging.info("📊 Performance analysis scheduled for 5:30 PM EST daily")
         logging.info("🔍 Market research + 🎓 Fine-tuning scheduled for 2:00 AM EST daily")
         logging.info("🏖️  Weekend deep analysis scheduled for Saturday 10:00 AM EST")
-        _warmup_ollama()
+
+        # Preflight: validate Alpaca account + options approval level
+        self._run_preflight()
+
+        # Warm up inference backend so first session has no cold-start latency
+        inference_client.warmup()
     
+    def _run_preflight(self) -> None:
+        """Validate the Alpaca account including options approval level."""
+        try:
+            from dotenv import load_dotenv
+            from alpaca.trading.client import TradingClient
+            load_dotenv()
+            client = TradingClient(
+                os.getenv('ALPACA_API_KEY'),
+                os.getenv('ALPACA_SECRET_KEY'),
+                paper=os.getenv('PAPER_TRADING', 'true').lower() != 'false',
+            )
+            result = run_preflight(client, require_options=True)
+            if not result.ok:
+                for issue in result.issues:
+                    logging.critical(f"⛔ PREFLIGHT FAILED: {issue}")
+                logging.critical(
+                    "Daemon will continue but options trading may be blocked. "
+                    "Fix the issues above and restart."
+                )
+        except Exception as e:
+            logging.warning(f"⚠️  Preflight check failed to run: {e}")
+
     def is_market_open(self):
         """Check if market is currently open."""
         now = datetime.now(self.est)
@@ -214,7 +211,7 @@ class OptionsDaemon:
         self.run_market_research()
         self.run_training_data_builder()
         # Free GPU VRAM before training job loads the 32B base model
-        _stop_ollama_model()
+        inference_client.stop_for_finetuning()
         try:
             training_data_path = str(_SCRIPTS_DIR.parent / 'finetune' / 'data' / 'options_training_data.json')
 

@@ -24,13 +24,15 @@ try:
 except Exception:
     _EST = None  # fallback: use local system time
 
-import ollama
 sys.path.append(str(Path(__file__).resolve().parent))
+import inference_client
 from decision_parser import parse_decision
 from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
 import news_fetcher
 import unusual_flow_scanner
 import db as _db
+from portfolio_overseer import PortfolioOverseer
+from allocation_controller import AllocationController
 
 OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'qwen3:8b')
 _DEBATE_CONFIDENCE_THRESHOLD = 0.85   # Options trades require higher bar for debate
@@ -52,29 +54,9 @@ def _json_default(obj):
         return obj.isoformat()
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
-def warmup_ollama() -> None:
-    """Pre-load the model into GPU memory to avoid cold-start latency."""
-    try:
-        ollama.generate(
-            model=OLLAMA_MODEL,
-            prompt="warmup",
-            think=False,
-            options={"num_predict": 1},
-        )
-        logging.info(f"🔥 Ollama model '{OLLAMA_MODEL}' warmed up")
-    except Exception as e:
-        logging.warning(f"⚠️  Ollama warm-up failed (will cold-start on first decision): {e}")
-
-
 def get_trading_decision(prompt, max_new_tokens=200):
-    """Get trading decision via Ollama (model stays resident in memory)."""
-    response = ollama.generate(
-        model=OLLAMA_MODEL,
-        prompt=prompt,
-        think=False,
-        options={"temperature": 0.7, "top_p": 0.9, "num_predict": max_new_tokens}
-    )
-    return response['response']
+    """Get trading decision via the configured inference backend."""
+    return inference_client.generate(prompt, max_tokens=max_new_tokens, temperature=0.7)
 
 
 def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) -> dict:
@@ -96,13 +78,7 @@ def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) ->
         f"When in doubt, PROCEED."
     )
     try:
-        resp = ollama.generate(
-            model=OLLAMA_MODEL,
-            prompt=debate_prompt,
-            think=False,
-            options={"temperature": 0.7, "top_p": 0.9, "num_predict": 150}
-        )
-        text = resp['response']
+        text = inference_client.generate(debate_prompt, max_tokens=150, temperature=0.7)
         verdict = 'PROCEED'
         for line in text.splitlines():
             if 'VERDICT:' in line.upper():
@@ -173,8 +149,19 @@ class OptionsAgent:
         if _DRY_RUN:
             logging.warning("🧪 DRY RUN MODE: orders will be logged but NOT submitted to Alpaca")
 
-        # Warm up model so first decision isn't delayed by cold start
-        warmup_ollama()
+        # Warm up inference backend so first decision isn't delayed by cold start
+        inference_client.warmup()
+
+        # Portfolio-level guards (sector cap + correlation limit)
+        self.overseer = PortfolioOverseer(self.trading_client)
+
+        # Gradual allocation ramp (Tier 1→3 based on live Sharpe/DD)
+        self.alloc_controller = AllocationController(_db)
+        self.alloc_controller.refresh()
+        logging.info(
+            f"📊 Allocation tier: {self.alloc_controller.current_tier()} "
+            f"({self.alloc_controller.get_position_size_pct():.0%} per position)"
+        )
 
         # Init DB (creates tables including cash_reservations if needed)
         _db.init_db()
@@ -359,29 +346,49 @@ class OptionsAgent:
     
     def get_ai_options_decision(self, analysis, market_bias: str = 'neutral',
                                symbol_bias: str = 'neutral',
-                               news_snippet: str = '', flow_snippet: str = ''):
+                               news_snippet: str = '', flow_snippet: str = '',
+                               greeks: dict | None = None):
         """Get AI decision for options trading.
 
         Returns (decision, prompt, raw_response) so callers can log all three
         without making a second LLM call.
+
+        greeks (optional): dict with delta, theta, gamma, vega, iv keys from
+            get_atm_option_greeks().  When provided they are included in the
+            prompt so the model can factor in IV crush risk and time decay.
         """
         extra_context = (news_snippet + flow_snippet).strip()
         context_block = f"\n{extra_context}" if extra_context else ''
+
+        # Greeks block — only appended when data is available
+        greeks_block = ''
+        if greeks:
+            parts = []
+            if greeks.get('delta') is not None:
+                parts.append(f"Delta: {greeks['delta']:+.3f}  (directional exposure per $1 move)")
+            if greeks.get('theta') is not None:
+                parts.append(f"Theta: {greeks['theta']:+.4f}/day  (time decay cost)")
+            if greeks.get('gamma') is not None:
+                parts.append(f"Gamma: {greeks['gamma']:.4f}  (delta acceleration)")
+            if greeks.get('iv') is not None:
+                parts.append(f"IV: {greeks['iv']:.1%}  (implied vol — high IV = expensive premium, IV crush risk)")
+            if parts:
+                greeks_block = '\n\nLive Option Greeks (ATM contract):\n' + '\n'.join(f'- {p}' for p in parts)
 
         prompt = f"""You are a decisive options trader. Analyze {analysis['symbol']} and give a clear options decision.
 
 Current Price: ${analysis['current_price']:.2f}
 RSI (14): {analysis['rsi']:.1f}  (>70 overbought, <30 oversold)
-Volatility (20d): {analysis['volatility']:.1%}  (higher = more expensive options)
-Momentum (20d): {analysis['momentum']:.1%}  (positive = bullish trend)
+Volatility (20d): {analysis['volatility']:.1%}  (historical vol)
+Momentum (20d): {analysis['momentum']:.1%}  (positive = bullish trend){greeks_block}
 
 Market Context (from overnight research):
 - Overall market bias: {market_bias}
 - Symbol-specific bias: {symbol_bias}{context_block}
 
 Make a decisive call based on the signals above:
-- BUY_CALL if momentum and bias are bullish
-- BUY_PUT if momentum and bias are bearish
+- BUY_CALL if momentum and bias are bullish (avoid if IV is extremely high — IV crush risk)
+- BUY_PUT if momentum and bias are bearish (avoid if IV is extremely high — IV crush risk)
 - HOLD only if signals are genuinely conflicting with no clear edge
 
 Use confidence above 0.75 when signals align clearly, below 0.75 when signals are mixed.
@@ -511,6 +518,55 @@ Reasoning: <one sentence explaining the key signal>"""
             logging.warning(f"⚠️ Could not fetch option price for {contract_symbol}: {e}")
         return None
 
+    def get_atm_option_greeks(self, symbol: str, contract_type) -> dict | None:
+        """
+        Fetch live Greeks (delta, theta, gamma, IV) for the nearest ATM contract.
+
+        Uses Alpaca OptionSnapshotRequest.  Returns a dict on success, None on
+        any failure (so callers can silently skip Greeks enrichment).
+        """
+        try:
+            from alpaca.data.requests import OptionSnapshotRequest
+
+            # Find ATM contract (reuse find_optimal_option with current price)
+            analysis_price = None
+            try:
+                mdata = self.get_market_data(symbol)
+                if mdata is not None and not mdata.empty:
+                    analysis_price = float(mdata['close'].iloc[-1])
+            except Exception:
+                pass
+            if analysis_price is None:
+                return None
+
+            contract = self.find_optimal_option(symbol, contract_type, analysis_price)
+            if not contract:
+                return None
+
+            snapshots = self.option_data_client.get_option_snapshot(
+                OptionSnapshotRequest(symbol_or_symbols=contract.symbol)
+            )
+            snap = snapshots.get(contract.symbol) if snapshots else None
+            if not snap:
+                return None
+
+            greeks = getattr(snap, 'greeks', None)
+            iv     = getattr(snap, 'implied_volatility', None)
+            if not greeks and iv is None:
+                return None
+
+            return {
+                'contract':  contract.symbol,
+                'delta':     round(float(greeks.delta), 3)  if greeks and greeks.delta  is not None else None,
+                'gamma':     round(float(greeks.gamma), 4)  if greeks and greeks.gamma  is not None else None,
+                'theta':     round(float(greeks.theta), 4)  if greeks and greeks.theta  is not None else None,
+                'vega':      round(float(greeks.vega),  4)  if greeks and greeks.vega   is not None else None,
+                'iv':        round(float(iv), 4)            if iv is not None else None,
+            }
+        except Exception as e:
+            logging.debug(f"get_atm_option_greeks({symbol}): {e}")
+            return None
+
     def execute_options_trade(self, symbol, decision, analysis, available_capital, size_multiplier: float = 1.0):
         """Execute options trade."""
         reservation_id = None
@@ -538,8 +594,17 @@ Reasoning: <one sentence explaining the key signal>"""
                 logging.warning(f"⚠️ No market price for {contract.symbol}, skipping trade")
                 return False
 
+            # Override max_position_size with allocation-controller tier
+            alloc_pct = self.alloc_controller.get_position_size_pct()
+            effective_max_position = alloc_pct * size_multiplier
+            original_max = self.params['max_position_size']
+            self.params['max_position_size'] = effective_max_position
+
             # Calculate position size (scaled by research multiplier)
             quantity = self.calculate_position_size(option_price, available_capital, size_multiplier)
+
+            # Restore original param so other code paths are unaffected
+            self.params['max_position_size'] = original_max
 
             if quantity == 0:
                 logging.warning(f"⚠️  Position size too small for {symbol}")
@@ -857,11 +922,19 @@ Reasoning: <one sentence explaining the key signal>"""
             flow_result  = unusual_flow_scanner.scan_symbol(symbol)
             flow_snippet = unusual_flow_scanner.format_for_prompt(symbol, flow_result)
 
+            # Fetch live Greeks for ATM contract (best-effort; None if unavailable)
+            # Used to enrich the AI prompt with IV crush / theta context.
+            preliminary_ctype = (
+                __import__('alpaca.trading.enums', fromlist=['ContractType']).ContractType.CALL
+            )
+            greeks = self.get_atm_option_greeks(symbol, preliminary_ctype)
+
             # Get AI decision — returns (decision, prompt, raw_response) in one LLM call
             sym_bias = symbol_bias.get(symbol, 'neutral')
             decision, prompt, raw_response = self.get_ai_options_decision(
                 analysis, market_bias=market_bias, symbol_bias=sym_bias,
-                news_snippet=news_snippet, flow_snippet=flow_snippet
+                news_snippet=news_snippet, flow_snippet=flow_snippet,
+                greeks=greeks,
             )
 
             logging.info(f"📊 {symbol}: {decision['decision'].upper()} "
@@ -885,6 +958,17 @@ Reasoning: <one sentence explaining the key signal>"""
 
             executed = False
             market_ctx = {'market_bias': market_bias, 'symbol_bias': sym_bias}
+            if will_execute:
+                # Portfolio concentration guard before executing
+                try:
+                    position_pct = self.alloc_controller.get_position_size_pct()
+                    spend_usd = available_capital * position_pct
+                    allowed, veto_reason = self.overseer.is_buy_allowed(symbol, spend_usd, equity)
+                    if not allowed:
+                        logging.warning(f"🚫 Portfolio overseer vetoed {symbol}: {veto_reason}")
+                        will_execute = False
+                except Exception as ov_err:
+                    logging.warning(f"overseer check failed for {symbol}: {ov_err}")
             if will_execute:
                 executed = self.execute_options_trade(symbol, decision, analysis, available_capital,
                                                       size_multiplier=size_mult)
