@@ -21,7 +21,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import _pathfix  # noqa: F401
 
-from model_inference_lora import get_trading_decision, load_model_once
+from model_inference_lora import get_trading_decision, parse_decision, load_model_once
 from stock_discovery import StockDiscovery
 from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
 import news_fetcher
