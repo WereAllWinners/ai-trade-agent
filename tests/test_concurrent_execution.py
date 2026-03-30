@@ -24,6 +24,7 @@ import pytest
 
 # Make scripts importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts' / 'agents'))
 
 # Stub out heavy optional deps that may not be installed in the test environment.
 # Must be done before any script module is imported so module-level imports succeed.

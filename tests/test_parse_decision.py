@@ -9,6 +9,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
 
+# Remove any test stub registered by other test modules before importing the real module
+sys.modules.pop('model_inference_lora', None)
 from model_inference_lora import parse_decision
 
 

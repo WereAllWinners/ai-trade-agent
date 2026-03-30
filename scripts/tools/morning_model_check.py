@@ -31,7 +31,10 @@ from pathlib import Path
 
 logging.basicConfig(level=logging.WARNING)   # suppress INFO during check runs
 
-_SCRIPTS_DIR  = Path(__file__).resolve().parent
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import _pathfix  # noqa: F401
+
+_SCRIPTS_DIR  = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _SCRIPTS_DIR.parent
 _ADAPTER_LATEST = _PROJECT_ROOT / 'finetune' / 'finance_qwen_32b_lora_latest'
 

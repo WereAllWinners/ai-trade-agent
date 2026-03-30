@@ -7,11 +7,16 @@ pairs (FIFO), and writes realized P&L to logs/trade_outcomes.jsonl.
 Run this before the nightly performance analysis so analyzers have full data.
 """
 import os
+import sys
 import json
 import logging
 from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import _pathfix  # noqa: F401
+
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 import db as _db

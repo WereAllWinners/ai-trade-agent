@@ -17,12 +17,16 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import _pathfix  # noqa: F401
+
 import yfinance as yf
 import db as _db
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-_PROJECT_ROOT           = Path(__file__).resolve().parent.parent
+_PROJECT_ROOT           = Path(__file__).resolve().parent.parent.parent
 _DATA_DIR               = _PROJECT_ROOT / 'finetune' / 'data'
 _PORTFOLIO_CONSTRAINTS  = _PROJECT_ROOT / 'logs' / 'portfolio_constraints.json'
 

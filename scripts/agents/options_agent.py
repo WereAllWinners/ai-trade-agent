@@ -24,7 +24,8 @@ try:
 except Exception:
     _EST = None  # fallback: use local system time
 
-sys.path.append(str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import _pathfix  # noqa: F401
 from model_inference_lora import get_trading_decision, parse_decision, load_model_once
 from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
 import news_fetcher

@@ -17,8 +17,9 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
-# Add project root to path
-sys.path.append(str(Path(__file__).resolve().parent))
+# Add scripts/ root and all subdirs to path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import _pathfix  # noqa: F401
 
 from model_inference_lora import get_trading_decision, load_model_once
 from stock_discovery import StockDiscovery

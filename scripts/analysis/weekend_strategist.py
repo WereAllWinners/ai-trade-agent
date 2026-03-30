@@ -11,7 +11,8 @@ from collections import defaultdict
 import yfinance as yf
 import sys
 
-sys.path.append(str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import _pathfix  # noqa: F401
 from performance_analyzer import PerformanceAnalyzer
 from stock_discovery import StockDiscovery
 from model_inference_lora import get_trading_decision, parse_decision

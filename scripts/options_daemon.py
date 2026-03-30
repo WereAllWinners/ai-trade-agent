@@ -124,7 +124,7 @@ class OptionsDaemon:
             logging.info("======================================================================")
             
             result = subprocess.run(
-                [sys.executable, str(_SCRIPTS_DIR / 'options_agent.py')],
+                [sys.executable, str(_SCRIPTS_DIR / 'agents' / 'options_agent.py')],
                 timeout=1200
             )
             
@@ -147,7 +147,7 @@ class OptionsDaemon:
             logging.info("======================================================================")
             
             result = subprocess.run(
-                [sys.executable, str(_SCRIPTS_DIR / 'options_performance_analyzer.py')],
+                [sys.executable, str(_SCRIPTS_DIR / 'analysis' / 'options_performance_analyzer.py')],
                 timeout=1200
             )
             
@@ -164,7 +164,7 @@ class OptionsDaemon:
         try:
             logging.info("🔍 Running nightly options market research...")
             result = subprocess.run(
-                [sys.executable, str(_SCRIPTS_DIR / 'market_researcher.py'), '--bot', 'options'],
+                [sys.executable, str(_SCRIPTS_DIR / 'data' / 'market_researcher.py'), '--bot', 'options'],
                 timeout=600
             )
             if result.returncode == 0:
@@ -181,7 +181,7 @@ class OptionsDaemon:
             logging.info("🏖️  RUNNING OPTIONS WEEKEND ANALYSIS")
             logging.info("======================================================================")
             result = subprocess.run(
-                [sys.executable, str(_SCRIPTS_DIR / 'options_weekend_strategist.py')],
+                [sys.executable, str(_SCRIPTS_DIR / 'analysis' / 'options_weekend_strategist.py')],
                 timeout=1800  # 30 min max
             )
             if result.returncode == 0:
@@ -196,7 +196,7 @@ class OptionsDaemon:
         try:
             logging.info("🏗️  Building options training examples from live decisions...")
             result = subprocess.run(
-                [sys.executable, str(_SCRIPTS_DIR / 'training_data_builder.py'), '--bot', 'options'],
+                [sys.executable, str(_SCRIPTS_DIR / 'training' / 'training_data_builder.py'), '--bot', 'options'],
                 timeout=300
             )
             if result.returncode == 0:
@@ -227,7 +227,7 @@ class OptionsDaemon:
             result = subprocess.run(
                 [
                     sys.executable,
-                    str(_SCRIPTS_DIR / 'finetune_model.py'),
+                    str(_SCRIPTS_DIR / 'training' / 'finetune_model.py'),
                     '--data', training_data_path,
                 ],
                 timeout=3600  # 1 hour max

@@ -30,11 +30,12 @@ from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-_SCRIPTS_DIR  = Path(__file__).resolve().parent
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import _pathfix  # noqa: F401
+
+_SCRIPTS_DIR  = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _SCRIPTS_DIR.parent
 _EVAL_DIR     = _PROJECT_ROOT / 'logs' / 'eval'
-
-sys.path.insert(0, str(_SCRIPTS_DIR))
 
 # ---------------------------------------------------------------------------
 # Benchmark scenarios — clear ground-truth direction for each

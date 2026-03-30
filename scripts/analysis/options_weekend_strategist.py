@@ -22,10 +22,11 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-_SCRIPTS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import _pathfix  # noqa: F401
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 _LOGS_DIR = _SCRIPTS_DIR.parent / 'logs'
 _LOGS_DIR.mkdir(exist_ok=True)
-sys.path.append(str(_SCRIPTS_DIR))
 
 from market_researcher import (
     fetch_macro_pulse,

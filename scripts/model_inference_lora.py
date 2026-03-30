@@ -28,7 +28,7 @@ def load_model_once():
     base_model_path = os.getenv('BASE_MODEL', 'Qwen/Qwen2.5-32B-Instruct')
     lora_adapter_path = os.getenv(
         'LORA_ADAPTER_PATH',
-        str(_SCRIPTS_DIR.parent / 'finetune' / 'finance_qwen_32b_lora')
+        str(_SCRIPTS_DIR.parent / 'finetune' / 'finance_qwen_32b_lora_latest')
     )
     
     # Configure 4-bit quantization

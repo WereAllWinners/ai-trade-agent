@@ -14,7 +14,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 
-load_dotenv(Path(__file__).resolve().parent.parent / '.env')
+load_dotenv(Path(__file__).resolve().parent.parent.parent / '.env')
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 

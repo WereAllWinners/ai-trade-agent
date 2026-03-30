@@ -13,6 +13,8 @@ import pandas as pd
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts' / 'agents'))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts' / 'analysis'))
 
 # ---------------------------------------------------------------------------
 # AutonomousAgent risk checks (patched to avoid real API / Ollama calls)
@@ -187,6 +189,7 @@ class TestAutonomousAgentRisk:
 class TestBacktesterMetrics:
     def _make_backtester(self):
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts' / 'analysis'))
         from backtester import Backtester
         return Backtester(
             stop_loss=-0.07,

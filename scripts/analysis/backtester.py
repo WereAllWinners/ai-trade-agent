@@ -378,7 +378,7 @@ def _rerun_prompt(prompt: str, model: str = 'qwen3:8b') -> dict:
     """Re-run a saved prompt through Ollama and return a parsed decision."""
     try:
         import sys, os
-        sys.path.insert(0, os.path.dirname(__file__))
+        sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parent.parent))
         import ollama
         from model_inference_lora import parse_decision
         response = ollama.generate(model=model, prompt=prompt, think=False,

@@ -27,12 +27,14 @@ from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-_SCRIPTS_DIR  = Path(__file__).resolve().parent
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import _pathfix  # noqa: F401
+
+_SCRIPTS_DIR  = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _SCRIPTS_DIR.parent
 _DATA_DIR     = _PROJECT_ROOT / 'finetune' / 'data'
 _ONLINE_STATE = _PROJECT_ROOT / 'logs' / 'online_trainer_state.json'
 
-sys.path.insert(0, str(_SCRIPTS_DIR))
 import db as _db
 
 # Default thresholds — can be overridden via CLI

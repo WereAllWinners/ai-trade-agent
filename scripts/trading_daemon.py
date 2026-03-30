@@ -127,7 +127,7 @@ class TradingDaemon:
             logging.info("🔄 Initializing trading agent...")
             
             result = subprocess.run(
-                [sys.executable, str(_SCRIPTS_DIR / 'autonomous_agent.py')],
+                [sys.executable, str(_SCRIPTS_DIR / 'agents' / 'autonomous_agent.py')],
                 timeout=900
             )
             
@@ -147,7 +147,7 @@ class TradingDaemon:
         try:
             logging.info("📥 Fetching trade fill prices and computing P&L...")
             result = subprocess.run(
-                [sys.executable, str(_SCRIPTS_DIR / 'outcome_tracker.py')],
+                [sys.executable, str(_SCRIPTS_DIR / 'analysis' / 'outcome_tracker.py')],
                 timeout=120
             )
             if result.returncode != 0:
@@ -163,7 +163,7 @@ class TradingDaemon:
             logging.info("======================================================================")
 
             result = subprocess.run(
-                [sys.executable, str(_SCRIPTS_DIR / 'performance_analyzer.py')],
+                [sys.executable, str(_SCRIPTS_DIR / 'analysis' / 'performance_analyzer.py')],
                 timeout=300
             )
 
@@ -180,7 +180,7 @@ class TradingDaemon:
         try:
             logging.info("📊 Running weekly performance report...")
             result = subprocess.run(
-                [sys.executable, str(_SCRIPTS_DIR / 'weekly_report.py'), '--days', '7'],
+                [sys.executable, str(_SCRIPTS_DIR / 'analysis' / 'weekly_report.py'), '--days', '7'],
                 timeout=300
             )
             if result.returncode == 0:
@@ -195,7 +195,7 @@ class TradingDaemon:
         try:
             logging.info("🔍 Running nightly market research...")
             result = subprocess.run(
-                [sys.executable, str(_SCRIPTS_DIR / 'market_researcher.py'), '--bot', 'trading'],
+                [sys.executable, str(_SCRIPTS_DIR / 'data' / 'market_researcher.py'), '--bot', 'trading'],
                 timeout=600
             )
             if result.returncode == 0:
@@ -212,7 +212,7 @@ class TradingDaemon:
             logging.info("🏖️  RUNNING WEEKEND DEEP ANALYSIS")
             logging.info("======================================================================")
             result = subprocess.run(
-                [sys.executable, str(_SCRIPTS_DIR / 'weekend_strategist.py')],
+                [sys.executable, str(_SCRIPTS_DIR / 'analysis' / 'weekend_strategist.py')],
                 timeout=1800  # 30 min max
             )
             if result.returncode == 0:
@@ -227,7 +227,7 @@ class TradingDaemon:
         try:
             logging.info("🏗️  Building training examples from live decisions...")
             result = subprocess.run(
-                [sys.executable, str(_SCRIPTS_DIR / 'training_data_builder.py'), '--bot', 'stock'],
+                [sys.executable, str(_SCRIPTS_DIR / 'training' / 'training_data_builder.py'), '--bot', 'stock'],
                 timeout=300
             )
             if result.returncode == 0:
@@ -242,7 +242,7 @@ class TradingDaemon:
         try:
             logging.info("🔬 Checking online training threshold...")
             result = subprocess.run(
-                [sys.executable, str(_SCRIPTS_DIR / 'online_trainer.py')],
+                [sys.executable, str(_SCRIPTS_DIR / 'training' / 'online_trainer.py')],
                 timeout=1800,
             )
             if result.returncode == 0:
@@ -268,7 +268,7 @@ class TradingDaemon:
             logging.info("======================================================================")
 
             result = subprocess.run(
-                [sys.executable, str(_SCRIPTS_DIR / 'finetune_model.py')],
+                [sys.executable, str(_SCRIPTS_DIR / 'training' / 'finetune_model.py')],
                 timeout=600
             )
 
