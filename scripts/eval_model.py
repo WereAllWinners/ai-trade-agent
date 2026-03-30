@@ -265,7 +265,7 @@ def run_eval(adapter_path: str | None = None) -> dict:
 
         logging.info(
             f"    Got: {actual.upper():4s} | Expected: {expected.upper():4s} | "
-            f"Conf: {conf:.2f if conf else 'N/A':5s} | "
+            f"Conf: {(f'{conf:.2f}' if conf is not None else 'N/A'):5s} | "
             f"Format: {fmt['score']:.0%} | {'✅' if passed else '❌'} | "
             f"{latency:.1f}s"
         )
