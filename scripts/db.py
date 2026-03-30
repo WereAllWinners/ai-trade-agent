@@ -432,6 +432,14 @@ def get_recent_trades(limit: int = 100, bot: str = None,
     return [dict(r) for r in rows]
 
 
+def get_outcome_count_since(cutoff_timestamp: str, db_path: Path = DB_PATH) -> int:
+    """Return number of outcomes recorded after cutoff_timestamp (ISO string)."""
+    sql = "SELECT COUNT(*) FROM outcomes WHERE exit_timestamp > ?"
+    with get_conn(db_path) as conn:
+        row = conn.execute(sql, [cutoff_timestamp]).fetchone()
+    return int(row[0]) if row else 0
+
+
 def get_existing_prompt_hashes(db_path: Path = DB_PATH) -> set[str]:
     """Return all prompt hashes already in the training_examples table."""
     with get_conn(db_path) as conn:

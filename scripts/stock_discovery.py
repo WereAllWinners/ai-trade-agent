@@ -598,6 +598,20 @@ class StockDiscovery:
 
         logging.info(f"\n💾 Saved to logs/discovered_opportunities.json (cache TTL={_DISCOVERY_CACHE_TTL_HOURS}h)")
 
+    def get_exploration_symbols(self, n: int = 2, exclude: set = None) -> list:
+        """
+        Return n random symbols from full_universe not in exclude or _delisted.
+        Used to inject novel symbols into sessions when Sharpe is below target.
+        """
+        import random
+        if not self.full_universe:
+            return []
+        exclude_set = (exclude or set()) | self._delisted
+        candidates = [s for s in self.full_universe if s not in exclude_set]
+        if not candidates:
+            return []
+        return random.sample(candidates, min(n, len(candidates)))
+
 if __name__ == "__main__":
     import argparse
     

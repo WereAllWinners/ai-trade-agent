@@ -237,8 +237,25 @@ class TradingDaemon:
         except Exception as e:
             logging.warning(f"⚠️  Training data builder failed (continuing to fine-tune): {e}")
 
+    def run_online_training(self) -> None:
+        """Trigger lightweight LoRA update if enough new outcomes have closed."""
+        try:
+            logging.info("🔬 Checking online training threshold...")
+            result = subprocess.run(
+                [sys.executable, str(_SCRIPTS_DIR / 'online_trainer.py')],
+                timeout=1800,
+            )
+            if result.returncode == 0:
+                logging.info("✅ Online training check complete")
+            else:
+                logging.warning(f"⚠️  Online trainer exited with code: {result.returncode}")
+        except subprocess.TimeoutExpired:
+            logging.error("❌ Online training timed out")
+        except Exception as e:
+            logging.warning(f"⚠️  Online training failed: {e}")
+
     def run_finetuning(self):
-        """Run market research, build training data, then fine-tune."""
+        """Run market research, build training data, then full fine-tune."""
         self.run_market_research()
         self.run_training_data_builder()
         # Free GPU VRAM by unloading the inference model before the training job
@@ -354,9 +371,10 @@ class TradingDaemon:
                     self.run_weekend_strategist()
                     weekend_strategist_done_this_week = True
 
-                # Performance analysis at 5:00 PM
+                # Performance analysis at 5:00 PM, followed by online training check
                 if not analysis_done_today and current_time >= self.analysis_time:
                     self.run_performance_analysis()
+                    self.run_online_training()
                     analysis_done_today = True
                 
                 # Fine-tuning at 8:00 PM

@@ -26,7 +26,7 @@ except Exception:
 
 sys.path.append(str(Path(__file__).resolve().parent))
 import inference_client
-from decision_parser import parse_decision
+from model_inference_lora import get_trading_decision, parse_decision
 from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
 import news_fetcher
 import unusual_flow_scanner
@@ -54,9 +54,6 @@ def _json_default(obj):
         return obj.isoformat()
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
-def get_trading_decision(prompt, max_new_tokens=200):
-    """Get trading decision via the configured inference backend."""
-    return inference_client.generate(prompt, max_tokens=max_new_tokens, temperature=0.7)
 
 
 def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) -> dict:
@@ -78,7 +75,7 @@ def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) ->
         f"When in doubt, PROCEED."
     )
     try:
-        text = inference_client.generate(debate_prompt, max_tokens=150, temperature=0.7)
+        text = get_trading_decision(debate_prompt)   # Uses new LoRA + DPO model
         verdict = 'PROCEED'
         for line in text.splitlines():
             if 'VERDICT:' in line.upper():

@@ -21,8 +21,8 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 sys.path.append(str(Path(__file__).resolve().parent))
 
 import inference_client
+from model_inference_lora import get_trading_decision
 from stock_discovery import StockDiscovery
-from decision_parser import parse_decision
 from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
 import news_fetcher
 import db as _db
@@ -35,6 +35,9 @@ _DEBATE_CONFIDENCE_THRESHOLD = 0.90   # Only debate very high-conviction trades
 _MIN_CASH_RESERVE = 500.0             # Never spend the account's last $500 of cash
 _DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'  # log orders but never submit
 _PDT_DAY_TRADE_LIMIT = 3              # Max same-day round trips before PDT block kicks in
+_EXPLORATION_SHARPE_THRESHOLD = 1.0   # Inject novel symbols when recent Sharpe is below this
+_EXPLORATION_COUNT = 2                # Number of random symbols to inject per session
+_ALLOC_CONFIG = Path(__file__).resolve().parent.parent / 'logs' / 'allocation_config.json'
 
 def _json_default(obj):
     """JSON serializer for numpy scalar types that the stdlib encoder can't handle."""
@@ -47,9 +50,6 @@ def _json_default(obj):
         return obj.tolist()
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
-def get_trading_decision(prompt):
-    """Get trading decision via the configured inference backend."""
-    return inference_client.generate(prompt, max_tokens=200, temperature=0.7)
 
 
 def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) -> dict:
@@ -70,7 +70,7 @@ def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) ->
         f"When in doubt, PROCEED."
     )
     try:
-        text = inference_client.generate(debate_prompt, max_tokens=150, temperature=0.7)
+        text = get_trading_decision(debate_prompt)   # Now uses new LoRA + DPO model
         verdict = 'PROCEED'
         for line in text.splitlines():
             if 'VERDICT:' in line.upper():
@@ -734,7 +734,30 @@ class AutonomousAgent:
         
         opportunities = self.discovery.discover_opportunities(max_stocks=max_stocks)
         logging.info(f"✅ Found {len(opportunities)} opportunities")
-        
+
+        # Exploration: inject random symbols when recent Sharpe is below target
+        try:
+            alloc_data = json.loads(_ALLOC_CONFIG.read_text())
+            current_sharpe = alloc_data.get('sharpe')
+            if current_sharpe is not None and current_sharpe < _EXPLORATION_SHARPE_THRESHOLD:
+                current_symbols = {
+                    (opp['symbol'] if isinstance(opp, dict) else opp)
+                    for opp in opportunities
+                }
+                explore = self.discovery.get_exploration_symbols(
+                    n=_EXPLORATION_COUNT, exclude=current_symbols
+                )
+                if explore:
+                    logging.info(
+                        f"🔭 Sharpe={current_sharpe:.2f} < {_EXPLORATION_SHARPE_THRESHOLD} "
+                        f"— injecting exploration symbols: {explore}"
+                    )
+                    opportunities = list(opportunities) + [
+                        {'symbol': s, 'signals': ['[EXPLORATION]']} for s in explore
+                    ]
+        except Exception as e:
+            logging.debug(f"Exploration check skipped: {e}")
+
         if not opportunities:
             logging.warning("⚠️  No opportunities found")
             return
