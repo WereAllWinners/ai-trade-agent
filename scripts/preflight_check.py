@@ -93,7 +93,8 @@ def run_preflight(
     buying_power     = _float(getattr(account, 'buying_power', 0))
     equity           = _float(getattr(account, 'equity',        0))
     cash             = _float(getattr(account, 'cash',          0))
-    account_status   = str(getattr(account, 'status', 'unknown'))
+    _raw_status      = getattr(account, 'status', 'unknown')
+    account_status   = getattr(_raw_status, 'value', str(_raw_status))
 
     # Options level: Alpaca returns this as options_approved_level (int 0-4)
     options_level = int(getattr(account, 'options_approved_level', 0) or 0)
