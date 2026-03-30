@@ -25,8 +25,7 @@ except Exception:
     _EST = None  # fallback: use local system time
 
 sys.path.append(str(Path(__file__).resolve().parent))
-import inference_client
-from model_inference_lora import get_trading_decision, parse_decision
+from model_inference_lora import get_trading_decision, parse_decision, load_model_once
 from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
 import news_fetcher
 import unusual_flow_scanner
@@ -146,8 +145,8 @@ class OptionsAgent:
         if _DRY_RUN:
             logging.warning("🧪 DRY RUN MODE: orders will be logged but NOT submitted to Alpaca")
 
-        # Warm up inference backend so first decision isn't delayed by cold start
-        inference_client.warmup()
+        # Pre-load the LoRA model so the first trading decision has no cold-start delay
+        load_model_once()
 
         # Portfolio-level guards (sector cap + correlation limit)
         self.overseer = PortfolioOverseer(self.trading_client)

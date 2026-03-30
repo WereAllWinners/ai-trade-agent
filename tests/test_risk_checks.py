@@ -25,7 +25,7 @@ class TestAutonomousAgentRisk:
              patch('autonomous_agent.StockHistoricalDataClient'), \
              patch('autonomous_agent.StockDiscovery'), \
              patch('autonomous_agent.load_dotenv'), \
-             patch('autonomous_agent.inference_client'), \
+             patch('autonomous_agent.load_model_once'), \
              patch('autonomous_agent.PortfolioOverseer'), \
              patch('autonomous_agent.AllocationController'):
             from autonomous_agent import AutonomousAgent

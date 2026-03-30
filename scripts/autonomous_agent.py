@@ -20,8 +20,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 # Add project root to path
 sys.path.append(str(Path(__file__).resolve().parent))
 
-import inference_client
-from model_inference_lora import get_trading_decision
+from model_inference_lora import get_trading_decision, load_model_once
 from stock_discovery import StockDiscovery
 from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
 import news_fetcher
@@ -127,8 +126,8 @@ class AutonomousAgent:
         if _DRY_RUN:
             logging.warning("🧪 DRY RUN MODE: orders will be logged but NOT submitted to Alpaca")
 
-        # Warm up inference backend so first decision isn't delayed by cold start
-        inference_client.warmup()
+        # Pre-load the LoRA model so the first trading decision has no cold-start delay
+        load_model_once()
 
         # Portfolio-level guards (sector cap + correlation limit)
         self.overseer = PortfolioOverseer(self.trading_client)

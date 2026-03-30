@@ -41,7 +41,7 @@ def _make_options_agent(tmp_db=None):
     with patch('options_agent.TradingClient'), \
          patch('options_agent.OptionHistoricalDataClient'), \
          patch('options_agent.load_dotenv'), \
-         patch('options_agent.inference_client'), \
+         patch('options_agent.load_model_once'), \
          patch('options_agent.PortfolioOverseer'), \
          patch('options_agent.AllocationController'), \
          patch('options_agent._db') as mock_db:
@@ -87,7 +87,7 @@ def _make_stock_agent():
          patch('autonomous_agent.StockHistoricalDataClient'), \
          patch('autonomous_agent.StockDiscovery'), \
          patch('autonomous_agent.load_dotenv'), \
-         patch('autonomous_agent.inference_client'), \
+         patch('autonomous_agent.load_model_once'), \
          patch('autonomous_agent.PortfolioOverseer'), \
          patch('autonomous_agent.AllocationController'), \
          patch('autonomous_agent._db') as mock_db:

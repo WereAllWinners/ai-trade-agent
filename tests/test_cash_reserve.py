@@ -28,7 +28,7 @@ def _make_options_agent():
     with patch('options_agent.TradingClient'), \
          patch('options_agent.OptionHistoricalDataClient'), \
          patch('options_agent.load_dotenv'), \
-         patch('options_agent.inference_client'), \
+         patch('options_agent.load_model_once'), \
          patch('options_agent.PortfolioOverseer'), \
          patch('options_agent.AllocationController'):
         from options_agent import OptionsAgent
@@ -66,7 +66,7 @@ def _make_stock_agent():
          patch('autonomous_agent.StockHistoricalDataClient'), \
          patch('autonomous_agent.StockDiscovery'), \
          patch('autonomous_agent.load_dotenv'), \
-         patch('autonomous_agent.inference_client'), \
+         patch('autonomous_agent.load_model_once'), \
          patch('autonomous_agent.PortfolioOverseer'), \
          patch('autonomous_agent.AllocationController'):
         from autonomous_agent import AutonomousAgent
