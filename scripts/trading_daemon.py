@@ -128,7 +128,7 @@ class TradingDaemon:
             
             result = subprocess.run(
                 [sys.executable, str(_SCRIPTS_DIR / 'agents' / 'autonomous_agent.py')],
-                timeout=900
+                timeout=2700
             )
             
             if result.returncode == 0:

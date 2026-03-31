@@ -3,6 +3,9 @@
 Model Inference with LoRA - OPTIMIZED with model caching
 """
 import os
+import fcntl
+import atexit
+import logging
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel
@@ -18,12 +21,49 @@ _MODEL_CACHE = {
     'loaded': False
 }
 
+# ---------------------------------------------------------------------------
+# GPU lock — prevents two bots from loading the 32B model simultaneously
+# which would exhaust VRAM on a single-GPU machine.
+# The lock is held for the lifetime of the process and released on exit.
+# ---------------------------------------------------------------------------
+_GPU_LOCK_PATH = _SCRIPTS_DIR.parent / 'logs' / 'gpu.lock'
+_gpu_lock_fd = None
+
+def _acquire_gpu_lock() -> None:
+    global _gpu_lock_fd
+    if _gpu_lock_fd is not None:
+        return  # already held
+    _GPU_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _gpu_lock_fd = open(_GPU_LOCK_PATH, 'w')
+    logging.info("⏳ Waiting for GPU lock (another session may be using the model)...")
+    fcntl.flock(_gpu_lock_fd, fcntl.LOCK_EX)   # blocks until free
+    _gpu_lock_fd.write(f"{os.getpid()}\n")
+    _gpu_lock_fd.flush()
+    logging.info("🔒 GPU lock acquired")
+
+def _release_gpu_lock() -> None:
+    global _gpu_lock_fd
+    if _gpu_lock_fd is not None:
+        fcntl.flock(_gpu_lock_fd, fcntl.LOCK_UN)
+        _gpu_lock_fd.close()
+        _gpu_lock_fd = None
+
+atexit.register(_release_gpu_lock)
+
+
 def load_model_once():
     """Load model into cache if not already loaded."""
     if _MODEL_CACHE['loaded']:
         print("✅ Using cached model (already loaded)")
         return _MODEL_CACHE['model'], _MODEL_CACHE['tokenizer']
-    
+
+    _acquire_gpu_lock()
+    # Re-check after acquiring lock in case another process just finished loading
+    # (this process can't reuse another process's cache, but avoids a redundant load
+    # if load_model_once is somehow called twice in the same process)
+    if _MODEL_CACHE['loaded']:
+        return _MODEL_CACHE['model'], _MODEL_CACHE['tokenizer']
+
     print("Loading base model and tokenizer...")
     base_model_path = os.getenv('BASE_MODEL', 'Qwen/Qwen2.5-32B-Instruct')
     lora_adapter_path = os.getenv(

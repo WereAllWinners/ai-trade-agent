@@ -837,6 +837,10 @@ class AutonomousAgent:
                 decision['decision'] in ['buy', 'sell']
                 and decision['confidence'] >= self.params['min_confidence']
             )
+            # Short-circuit SELL when we have no position — avoids an ~80s debate call
+            if will_execute and decision['decision'] == 'sell' and self.get_position(symbol) is None:
+                logging.warning(f"⚠️  Skipping SELL {symbol}: no open position held")
+                will_execute = False
             if will_execute and decision['confidence'] >= _DEBATE_CONFIDENCE_THRESHOLD:
                 logging.info(f"⚖️  Debating {symbol} ({decision['decision'].upper()} @ {decision['confidence']:.0%})...")
                 debate_result = debate_trade(
