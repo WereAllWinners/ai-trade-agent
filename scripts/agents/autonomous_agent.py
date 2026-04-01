@@ -152,7 +152,7 @@ class AutonomousAgent:
         defaults = {
             'max_position_size': 0.05,  # 5% per trade
             'min_confidence': 0.60,     # AI confidence threshold
-            'max_stocks_to_analyze': 25,
+            'max_stocks_to_analyze': 35,
             'max_daily_trades': 10,
             'cooldown_minutes': 15,
             'stop_loss': -0.07,         # -7% stop loss
