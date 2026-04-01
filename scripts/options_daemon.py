@@ -125,7 +125,7 @@ class OptionsDaemon:
             
             result = subprocess.run(
                 [sys.executable, str(_SCRIPTS_DIR / 'agents' / 'options_agent.py')],
-                timeout=1200
+                timeout=2700
             )
             
             if result.returncode == 0:
