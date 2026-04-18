@@ -4,6 +4,7 @@ Trading Daemon - Runs stock trading bot 24/7
 """
 import json
 import os
+import signal
 import sys
 import time
 import logging
@@ -50,17 +51,23 @@ class TradingDaemon:
         self.weekly_report_time = datetime.strptime('10:00', '%H:%M').time()  # Sat 10:00 AM
         self.weekend_strategist_time = datetime.strptime('11:00', '%H:%M').time()  # Sat 11:00 AM
 
+        self._finetune_requested = False
+        signal.signal(signal.SIGUSR1, self._handle_finetune_signal)
+
         logging.info("🤖 Trading Daemon Initialized")
         logging.info("⏰ Stock trading every 30 minutes")
         logging.info("📊 Performance analysis scheduled for 5:00 PM EST daily")
         logging.info("🔍 Market research + 🎓 Fine-tuning scheduled for 8:00 PM EST daily")
         logging.info("🏖️  Weekend deep analysis scheduled for Saturday 11:00 AM EST")
+        logging.info("📬 Send SIGUSR1 to trigger an off-cycle fine-tune: systemctl kill -s SIGUSR1 ai-trading-bot.service")
 
         # Preflight: validate Alpaca account before any sessions start
         self._run_preflight()
 
-        # Warm up inference backend so first session has no cold-start latency
-        inference_client.warmup()
+        # Pre-load the 32B LoRA model so first trading session has no cold-start delay.
+        # inference_client (Ollama) is not used for decisions — model_inference_lora is.
+        from model_inference_lora import load_model_once
+        load_model_once()
     
     def _run_preflight(self) -> None:
         """Validate the Alpaca account. Logs critical issues but never aborts the daemon."""
@@ -84,17 +91,22 @@ class TradingDaemon:
         except Exception as e:
             logging.warning(f"⚠️  Preflight check failed to run: {e}")
 
+    def _handle_finetune_signal(self, signum, frame):
+        """SIGUSR1 handler — set flag to trigger an off-cycle fine-tune."""
+        logging.info("📬 SIGUSR1 received — off-cycle fine-tune requested")
+        self._finetune_requested = True
+
     def is_market_open(self):
         """Check if market is currently open."""
         now = datetime.now(self.est)
-        
+
         # Check if weekend
         if now.weekday() >= 5:
             return False
-        
+
         current_time = now.time()
         return self.market_open <= current_time <= self.market_close
-    
+
     def get_next_market_open(self):
         """Get next market open time."""
         now = datetime.now(self.est)
@@ -128,7 +140,7 @@ class TradingDaemon:
             
             result = subprocess.run(
                 [sys.executable, str(_SCRIPTS_DIR / 'agents' / 'autonomous_agent.py')],
-                timeout=2700
+                timeout=14400  # 4 hours — 35 stocks × ~6 min/inference
             )
             
             if result.returncode == 0:
@@ -174,7 +186,25 @@ class TradingDaemon:
 
         except Exception as e:
             logging.error(f"❌ Performance analysis failed: {e}")
-    
+
+        # Step 3: Live-trading readiness check (only meaningful in paper mode)
+        if os.getenv('PAPER_TRADING', 'true').lower() != 'false':
+            try:
+                import db as _db
+                from dotenv import load_dotenv
+                from alpaca.trading.client import TradingClient
+                from allocation_controller import AllocationController
+                from alerts import alert_live_trading_ready
+                load_dotenv()
+                _client = TradingClient(
+                    os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY'), paper=True
+                )
+                ctrl = AllocationController(_db)
+                m, equity, paper_days, unmet = ctrl.check_live_readiness(_client)
+                alert_live_trading_ready('stock-bot', m, equity, paper_days, unmet)
+            except Exception as e:
+                logging.warning(f"⚠️ Live readiness check failed: {e}")
+
     def run_weekly_report(self):
         """Generate the weekly performance report (runs Saturday morning)."""
         try:
@@ -269,7 +299,9 @@ class TradingDaemon:
 
             result = subprocess.run(
                 [sys.executable, str(_SCRIPTS_DIR / 'training' / 'finetune_model.py')],
-                timeout=600
+                # No timeout here — finetune_model.py manages its own internal timeouts
+                # (3600s for training + 2400s for promotion eval). Killing it early
+                # causes the orphan-process issue where promotion never runs.
             )
 
             if result.returncode == 0:
@@ -330,8 +362,11 @@ class TradingDaemon:
         logging.info("🏖️  Weekend analysis: Saturday 11:00 AM EST")
 
         last_trade_time = None
-        analysis_done_today = False
-        finetune_done_today = False
+        # Initialise from wall-clock time so a restart mid-day doesn't
+        # immediately re-run analysis or fine-tuning that already ran today.
+        _startup = datetime.now(self.est).time()
+        analysis_done_today = _startup >= self.analysis_time
+        finetune_done_today = _startup >= self.finetune_time
         weekly_report_done_this_week = False
         weekend_strategist_done_this_week = False
         last_weekly_report_week = None
@@ -343,6 +378,14 @@ class TradingDaemon:
                 current_date = now.date()
                 current_week = now.isocalendar()[1]
 
+                # Off-cycle fine-tune triggered by SIGUSR1
+                if self._finetune_requested:
+                    self._finetune_requested = False
+                    finetune_done_today = False
+                    logging.info("🔔 Running off-cycle fine-tune (SIGUSR1)...")
+                    self.run_finetuning()
+                    finetune_done_today = True
+
                 # Reset daily flags on date change
                 if last_trade_time and last_trade_time.date() != current_date:
                     analysis_done_today = False
@@ -352,7 +395,7 @@ class TradingDaemon:
                 if last_weekly_report_week != current_week:
                     weekly_report_done_this_week = False
                     weekend_strategist_done_this_week = False
-                
+
                 logging.info(f"📅 Current time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
                 _write_heartbeat('running', self.is_market_open())
                 

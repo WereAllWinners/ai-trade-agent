@@ -43,6 +43,8 @@ _RECENT_N         = 50   # train on this many most-recent examples
 _ONLINE_LR        = 5e-5
 _ONLINE_EPOCHS    = 1
 
+from training import FINETUNE_PYTHON as _FINETUNE_PYTHON, FINETUNE_PTXAS as _FINETUNE_PTXAS
+
 
 def _load_state() -> dict:
     """Load persisted trainer state (last training time and outcome count)."""
@@ -119,12 +121,32 @@ def should_train(min_new_outcomes: int) -> tuple[bool, str]:
     return True, f"{new_count} new outcomes since {last_trained_at[:10]}"
 
 
+_GPU_TEMP_LIMIT = 75   # °C — skip training above this to prevent thermal shutdown
+
+
+def _gpu_temp() -> int | None:
+    """Return current GPU temperature in °C, or None if unavailable."""
+    try:
+        out = subprocess.check_output(
+            ['nvidia-smi', '--query-gpu=temperature.gpu', '--format=csv,noheader'],
+            timeout=5,
+        )
+        return int(out.decode().strip())
+    except Exception:
+        return None
+
+
 def run_online_training(min_new_outcomes: int = _MIN_NEW_OUTCOMES,
                         recent_n: int = _RECENT_N) -> bool:
     """
     Check threshold and run a lightweight fine-tune if met.
     Returns True if training ran, False if skipped or failed.
     """
+    temp = _gpu_temp()
+    if temp is not None and temp >= _GPU_TEMP_LIMIT:
+        logging.warning(f"🌡️  GPU at {temp}°C — skipping online training to prevent thermal shutdown (limit: {_GPU_TEMP_LIMIT}°C)")
+        return False
+
     _db.init_db()
     ready, reason = should_train(min_new_outcomes)
 
@@ -150,7 +172,7 @@ def run_online_training(min_new_outcomes: int = _MIN_NEW_OUTCOMES,
 
     fine_tune_script = _PROJECT_ROOT / 'finetune' / 'fine_tune_llm.py'
     cmd = [
-        sys.executable, str(fine_tune_script),
+        _FINETUNE_PYTHON, str(fine_tune_script),
         '--data', str(data_path),
         '--continue-from', adapter,
         '--epochs', str(_ONLINE_EPOCHS),
@@ -162,8 +184,13 @@ def run_online_training(min_new_outcomes: int = _MIN_NEW_OUTCOMES,
     logging.info(f"   Base adapter: {adapter}")
     logging.info(f"   Data: {data_path} ({recent_n} recent examples)")
 
+    # TRITON_PTXAS_BLACKWELL_PATH: Triton 3.6.0 requires a separate ptxas-blackwell
+    # binary for arch >= 100 (GB10 sm_121a). Point it to the CUDA 13.2 ptxas which
+    # supports Blackwell natively. Much faster than the old TRITON_INTERPRET=1 workaround.
+    finetune_env = {**os.environ, "TRITON_PTXAS_BLACKWELL_PATH": _FINETUNE_PTXAS}
+
     try:
-        result = subprocess.run(cmd, timeout=1800)
+        result = subprocess.run(cmd, timeout=1800, env=finetune_env)
         if result.returncode != 0:
             logging.error(f"❌ Online training failed with code {result.returncode}")
             return False

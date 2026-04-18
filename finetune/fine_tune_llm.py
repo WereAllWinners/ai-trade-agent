@@ -84,20 +84,32 @@ You are an expert financial trading advisor with knowledge from the world's best
         print("📥 LOADING MODEL")
         print(f"{'='*70}")
 
+        def _from_pretrained(model_name):
+            return FastLanguageModel.from_pretrained(
+                model_name=model_name,
+                max_seq_length=self.max_seq_length,
+                dtype=None,
+                load_in_4bit=True,
+                device_map={"": 0},
+            )
+
+        def _load_with_offline_fallback(model_name):
+            try:
+                return _from_pretrained(model_name)
+            except Exception as e:
+                if os.environ.get("HF_HUB_OFFLINE") == "1":
+                    raise  # Already in offline mode — propagate
+                err = str(e)
+                if any(marker in err for marker in ("NameResolutionError", "ConnectionError", "Failed to resolve", "Max retries exceeded")):
+                    print(f"⚠️  Network unavailable ({type(e).__name__}), retrying with cached model (offline mode)...")
+                    os.environ["HF_HUB_OFFLINE"] = "1"
+                    return _from_pretrained(model_name)
+                raise
+
         if self.mode == "continue":
-            model, tokenizer = FastLanguageModel.from_pretrained(
-                model_name=self.existing_adapter,
-                max_seq_length=self.max_seq_length,
-                dtype=None,
-                load_in_4bit=True,
-            )
+            model, tokenizer = _load_with_offline_fallback(self.existing_adapter)
         else:
-            model, tokenizer = FastLanguageModel.from_pretrained(
-                model_name=self.base_model,
-                max_seq_length=self.max_seq_length,
-                dtype=None,
-                load_in_4bit=True,
-            )
+            model, tokenizer = _load_with_offline_fallback(self.base_model)
             model = FastLanguageModel.get_peft_model(
                 model,
                 r=64,

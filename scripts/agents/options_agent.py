@@ -10,7 +10,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetOptionContractsRequest, GetOrdersRequest, MarketOrderRequest
+from alpaca.trading.requests import GetOptionContractsRequest, GetOrdersRequest, MarketOrderRequest, LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, ContractType
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.requests import OptionLatestQuoteRequest
@@ -33,8 +33,8 @@ import unusual_flow_scanner
 import db as _db
 from portfolio_overseer import PortfolioOverseer
 from allocation_controller import AllocationController
+from paper_market_simulator import PaperMarketSimulator
 
-OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'qwen3:8b')
 _DEBATE_CONFIDENCE_THRESHOLD = 0.85   # Options trades require higher bar for debate
 _MIN_CASH_RESERVE = 500.0             # Never spend the account's last $500 of cash
 _DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'  # log orders but never submit
@@ -149,6 +149,9 @@ class OptionsAgent:
         # Pre-load the LoRA model so the first trading decision has no cold-start delay
         load_model_once()
 
+        self.paper_sim = PaperMarketSimulator(paper=_paper)
+        self._paper    = _paper
+
         # Portfolio-level guards (sector cap + correlation limit)
         self.overseer = PortfolioOverseer(self.trading_client)
 
@@ -173,7 +176,7 @@ class OptionsAgent:
             'timestamp':      datetime.now().isoformat(),
             'session_id':     self.session_id,
             'bot':            'options',
-            'model':          OLLAMA_MODEL,
+            'model':          os.getenv('BASE_MODEL', 'Qwen/Qwen2.5-32B-Instruct') + '+LoRA',
             'symbol':         symbol,
             'indicators':     indicators,
             'market_context': market_context,
@@ -631,12 +634,35 @@ Reasoning: <one sentence explaining the key signal>"""
             # Atomically reserve this cash so the stock bot can't double-spend it
             reservation_id = _db.reserve_cash('options', estimated_cost)
 
-            # Create order
-            order = MarketOrderRequest(
+            # Paper-trading realism: simulate options spread, partial fills, non-fills
+            indicators = decision.get('indicators', {})
+            fill_sim = self.paper_sim.simulate_options_fill(
+                side='buy',
+                mid_price=option_price,
+                contracts=quantity,
+                open_interest=int(indicators.get('open_interest', 0)),
+                daily_volume=int(indicators.get('volume', 0)),
+            )
+            self.paper_sim.log_fill(contract.symbol, fill_sim)
+
+            if not fill_sim.filled:
+                logging.warning(f"⚠️  {contract.symbol} options non-fill simulated — skipping trade")
+                return False
+
+            quantity   = fill_sim.fill_qty
+            fill_price = fill_sim.fill_price
+            estimated_cost = fill_price * 100 * quantity
+
+            if quantity == 0:
+                logging.warning(f"⚠️  Options partial fill resulted in 0 contracts for {symbol}")
+                return False
+
+            order = LimitOrderRequest(
                 symbol=contract.symbol,
                 qty=quantity,
                 side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY
+                limit_price=round(fill_price, 2),
+                time_in_force=TimeInForce.DAY,
             )
 
             # DRY RUN: log the order without submitting it
@@ -644,12 +670,11 @@ Reasoning: <one sentence explaining the key signal>"""
                 dry_id = f"dry-run-{datetime.now().strftime('%H%M%S%f')}"
                 logging.info(
                     f"[DRY RUN] Would submit BUY {quantity} contracts of "
-                    f"{contract.symbol} @ ${option_price:.2f}/share "
-                    f"(est. cost=${estimated_cost:.2f}, order_id={dry_id})"
+                    f"{contract.symbol} @ ${fill_price:.4f} limit "
+                    f"(slippage {fill_sim.slippage_bps:.0f}bps, est. cost=${estimated_cost:.2f})"
                 )
                 submitted_order = type('_DryOrder', (), {'id': dry_id})()
             else:
-                # Submit order
                 submitted_order = self.trading_client.submit_order(order)
             
             # Log trade

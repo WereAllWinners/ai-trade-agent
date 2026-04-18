@@ -4,6 +4,7 @@ Options Trading Daemon - Runs options bot 24/7
 """
 import json
 import os
+import signal
 import sys
 import time
 import logging
@@ -48,17 +49,23 @@ class OptionsDaemon:
         self.finetune_time = datetime.strptime('02:00', '%H:%M').time()  # 2:00 AM
         self.weekend_strategist_time = datetime.strptime('10:00', '%H:%M').time()  # Sat 10:00 AM
 
+        self._finetune_requested = False
+        signal.signal(signal.SIGUSR1, self._handle_finetune_signal)
+
         logging.info("🤖 Options Trading Daemon Initialized")
         logging.info("⏰ Options trading every 60 minutes")
         logging.info("📊 Performance analysis scheduled for 5:30 PM EST daily")
         logging.info("🔍 Market research + 🎓 Fine-tuning scheduled for 2:00 AM EST daily")
         logging.info("🏖️  Weekend deep analysis scheduled for Saturday 10:00 AM EST")
+        logging.info("📬 Send SIGUSR1 to trigger an off-cycle fine-tune: systemctl kill -s SIGUSR1 ai-options-bot.service")
 
         # Preflight: validate Alpaca account + options approval level
         self._run_preflight()
 
-        # Warm up inference backend so first session has no cold-start latency
-        inference_client.warmup()
+        # Pre-load the 32B LoRA model so first trading session has no cold-start delay.
+        # inference_client (Ollama) is not used for decisions — model_inference_lora is.
+        from model_inference_lora import load_model_once
+        load_model_once()
     
     def _run_preflight(self) -> None:
         """Validate the Alpaca account including options approval level."""
@@ -82,14 +89,19 @@ class OptionsDaemon:
         except Exception as e:
             logging.warning(f"⚠️  Preflight check failed to run: {e}")
 
+    def _handle_finetune_signal(self, signum, frame):
+        """SIGUSR1 handler — set flag to trigger an off-cycle fine-tune."""
+        logging.info("📬 SIGUSR1 received — off-cycle fine-tune requested")
+        self._finetune_requested = True
+
     def is_market_open(self):
         """Check if market is currently open."""
         now = datetime.now(self.est)
-        
+
         # Check if weekend
         if now.weekday() >= 5:
             return False
-        
+
         current_time = now.time()
         return self.market_open <= current_time <= self.market_close
     
@@ -138,26 +150,78 @@ class OptionsDaemon:
         except Exception as e:
             logging.error(f"❌ Options trading session failed: {e}")
     
+    def run_outcome_tracker(self) -> None:
+        """Fetch Alpaca fill prices and reconcile closed options positions into outcomes log."""
+        try:
+            logging.info("📥 Fetching options fill prices and computing P&L...")
+            result = subprocess.run(
+                [sys.executable, str(_SCRIPTS_DIR / 'analysis' / 'options_outcome_tracker.py')],
+                timeout=120
+            )
+            if result.returncode != 0:
+                logging.warning(f"⚠️ Options outcome tracker exited with code: {result.returncode}")
+        except Exception as e:
+            logging.warning(f"⚠️ Options outcome tracker failed: {e}")
+
     def run_performance_analysis(self):
-        """Run options performance analysis."""
+        """Run outcome tracking then options performance analysis."""
+        # Step 1: Reconcile fills and compute realized P&L
+        self.run_outcome_tracker()
+
+        # Step 2: Run performance analysis (reads from outcomes log)
         try:
             logging.info("🔔 Time for options performance analysis!")
             logging.info("======================================================================")
             logging.info("📊 RUNNING OPTIONS PERFORMANCE ANALYSIS")
             logging.info("======================================================================")
-            
+
             result = subprocess.run(
                 [sys.executable, str(_SCRIPTS_DIR / 'analysis' / 'options_performance_analyzer.py')],
                 timeout=1200
             )
-            
+
             if result.returncode == 0:
                 logging.info("✅ Options performance analysis complete")
             else:
-                logging.error(f"❌ Options performance analysis failed: {result.stderr}")
-                
+                logging.error(f"❌ Options performance analysis failed with code: {result.returncode}")
+
         except Exception as e:
             logging.error(f"❌ Options performance analysis failed: {e}")
+
+        # Step 3: Live-trading readiness check (only meaningful in paper mode)
+        if os.getenv('PAPER_TRADING', 'true').lower() != 'false':
+            try:
+                import db as _db
+                from dotenv import load_dotenv
+                from alpaca.trading.client import TradingClient
+                from allocation_controller import AllocationController
+                from alerts import alert_live_trading_ready
+                load_dotenv()
+                _client = TradingClient(
+                    os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY'), paper=True
+                )
+                ctrl = AllocationController(_db)
+                m, equity, paper_days, unmet = ctrl.check_live_readiness(_client)
+                alert_live_trading_ready('options-bot', m, equity, paper_days, unmet)
+            except Exception as e:
+                logging.warning(f"⚠️ Live readiness check failed: {e}")
+
+    def run_online_training(self) -> None:
+        """Trigger lightweight LoRA update if enough new outcomes have closed."""
+        try:
+            logging.info("🔬 Checking online training threshold...")
+            result = subprocess.run(
+                [sys.executable, str(_SCRIPTS_DIR / 'training' / 'online_trainer.py')],
+                timeout=1800,
+            )
+            if result.returncode == 0:
+                logging.info("✅ Online training check complete")
+            else:
+                logging.warning(f"⚠️  Online trainer exited with code: {result.returncode}")
+        except subprocess.TimeoutExpired:
+            logging.error("❌ Online training timed out")
+        except Exception as e:
+            logging.warning(f"⚠️  Online training failed: {e}")
     
     def run_market_research(self):
         """Run nightly market research before fine-tuning."""
@@ -230,7 +294,8 @@ class OptionsDaemon:
                     str(_SCRIPTS_DIR / 'training' / 'finetune_model.py'),
                     '--data', training_data_path,
                 ],
-                timeout=3600  # 1 hour max
+                # No timeout — finetune_model.py manages its own internal timeouts
+                # (3600s training + 2400s promotion eval).
             )
 
             if result.returncode == 0:
@@ -300,8 +365,11 @@ class OptionsDaemon:
         logging.info("🏖️  Weekend analysis: Saturday 10:00 AM EST")
 
         last_trade_time = None
-        analysis_done_today = False
-        finetune_done_today = False
+        # Initialise from wall-clock time so a restart mid-day doesn't
+        # immediately re-run analysis or fine-tuning that already ran today.
+        _startup = datetime.now(self.est).time()
+        analysis_done_today = _startup >= self.analysis_time
+        finetune_done_today = _startup >= self.finetune_time
         weekend_strategist_done_this_week = False
         last_weekend_week = None
         
@@ -310,8 +378,15 @@ class OptionsDaemon:
                 now = datetime.now(self.est)
                 current_time = now.time()
                 current_date = now.date()
-                
                 current_week = now.isocalendar()[1]
+
+                # Off-cycle fine-tune triggered by SIGUSR1
+                if self._finetune_requested:
+                    self._finetune_requested = False
+                    finetune_done_today = False
+                    logging.info("🔔 Running off-cycle fine-tune (SIGUSR1)...")
+                    self.run_finetuning()
+                    finetune_done_today = True
 
                 # Reset daily flags
                 if last_trade_time and last_trade_time.date() != current_date:
@@ -321,7 +396,7 @@ class OptionsDaemon:
                 # Reset weekly flag on new calendar week
                 if last_weekend_week != current_week:
                     weekend_strategist_done_this_week = False
-                
+
                 logging.info(f"📅 Current time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
                 _write_heartbeat('running', self.is_market_open())
                 
@@ -333,9 +408,10 @@ class OptionsDaemon:
                     weekend_strategist_done_this_week = True
                     last_weekend_week = current_week
 
-                # Performance analysis at 5:30 PM
+                # Performance analysis at 5:30 PM, followed by online training check
                 if not analysis_done_today and current_time >= self.analysis_time:
                     self.run_performance_analysis()
+                    self.run_online_training()
                     analysis_done_today = True
                 
                 # Fine-tuning at 9:00 PM

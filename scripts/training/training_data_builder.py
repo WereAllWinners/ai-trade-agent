@@ -119,7 +119,8 @@ def _build_ideal_output(decision: str, confidence: float, reasoning: str,
     elif label.startswith('loser'):
         outcome_note = f"Loss ({pnl_pct:+.1%}) — avoid similar setups."
     else:
-        outcome_note = f"Minor loss or breakeven ({pnl_pct:+.1% if pnl_pct is not None else 'N/A'})."
+        _pnl_str = f"{pnl_pct:+.1%}" if pnl_pct is not None else "N/A"
+        outcome_note = f"Minor loss or breakeven ({_pnl_str})."
 
     reward_str = f" Reward signal: {reward:+.4f}" if reward is not None else ""
 

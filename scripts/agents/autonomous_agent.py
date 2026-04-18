@@ -27,10 +27,11 @@ from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_fail
 import news_fetcher
 import db as _db
 from fee_simulator import FeeSimulator
+from paper_market_simulator import PaperMarketSimulator
+from alpaca.trading.requests import LimitOrderRequest
 from portfolio_overseer import PortfolioOverseer
 from allocation_controller import AllocationController
 
-OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'qwen3:8b')
 _DEBATE_CONFIDENCE_THRESHOLD = 0.90   # Only debate very high-conviction trades
 _MIN_CASH_RESERVE = 500.0             # Never spend the account's last $500 of cash
 _DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'  # log orders but never submit
@@ -117,7 +118,9 @@ class AutonomousAgent:
         self.last_reset_date = datetime.now().date()
         self.daily_start_equity = None  # Set at start of each trading day
         self.pdt_blocked = False        # Set True if PDT restriction detected
-        self.fee_simulator = FeeSimulator(paper=_paper)
+        self.fee_simulator      = FeeSimulator(paper=_paper)
+        self.paper_sim          = PaperMarketSimulator(paper=_paper)
+        self._paper             = _paper
 
         # Decision logging — unique ID per process run for replay correlation
         self.session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -194,7 +197,7 @@ class AutonomousAgent:
             'timestamp':    datetime.now().isoformat(),
             'session_id':   self.session_id,
             'bot':          'stock',
-            'model':        OLLAMA_MODEL,
+            'model':        os.getenv('BASE_MODEL', 'Qwen/Qwen2.5-32B-Instruct') + '+LoRA',
             'symbol':       symbol,
             'indicators':   indicators,
             'prompt':       prompt,
@@ -341,7 +344,9 @@ class AutonomousAgent:
             'macd': macd.iloc[-1],
             'volume_ratio': volume_ratio,
             'price_change_pct': price_change_pct,
-            'current_price': df['close'].iloc[-1]
+            'current_price': df['close'].iloc[-1],
+            'avg_volume': float(avg_volume.iloc[-1]),
+            'session_volume': float(current_volume),
         }
     
     def get_position(self, symbol):
@@ -423,13 +428,40 @@ class AutonomousAgent:
                 logging.warning(f"⚠️  Position too small for {symbol}")
                 return False
 
-            # Simple market orders only — no bracket orders.
-            # Bracket child orders lock up shares and cause "insufficient qty" errors.
-            order = MarketOrderRequest(
+            # Paper-trading realism: simulate slippage, partial fills, non-fills
+            indicators = decision.get('indicators', {})
+            avg_volume     = indicators.get('avg_volume', 1_000_000)
+            session_volume = indicators.get('session_volume', avg_volume)
+            fill_sim = self.paper_sim.simulate_stock_fill(
+                side=side.value,
+                price=current_price,
+                qty=shares,
+                adv=avg_volume,
+                session_volume=session_volume,
+            )
+            self.paper_sim.log_fill(symbol, fill_sim)
+
+            if not fill_sim.filled:
+                logging.warning(f"⚠️  {symbol} order non-fill simulated — skipping trade")
+                return False
+
+            # Apply partial fill to share count
+            shares = fill_sim.fill_qty
+            fill_price = fill_sim.fill_price
+
+            if shares == 0:
+                logging.warning(f"⚠️  Partial fill resulted in 0 shares for {symbol}")
+                return False
+
+            # Use a limit order at the simulated fill price.
+            # This ensures Alpaca records a realistic entry price rather than
+            # the instantaneous market price.
+            order = LimitOrderRequest(
                 symbol=symbol,
                 qty=shares,
                 side=side,
-                time_in_force=TimeInForce.GTC,
+                limit_price=round(fill_price, 2),
+                time_in_force=TimeInForce.DAY,
             )
 
             # DRY RUN: log the order without submitting it
@@ -437,11 +469,10 @@ class AutonomousAgent:
                 dry_id = f"dry-run-{datetime.now().strftime('%H%M%S%f')}"
                 logging.info(
                     f"[DRY RUN] Would submit {side.value.upper()} {shares} {symbol} "
-                    f"@ ${current_price:.2f} (order_id={dry_id})"
+                    f"@ ${fill_price:.4f} limit (slippage {fill_sim.slippage_bps:.1f}bps)"
                 )
                 submitted_order = type('_DryOrder', (), {'id': dry_id})()
             else:
-                # Submit order
                 submitted_order = self.trading_client.submit_order(order)
 
             # Log trade

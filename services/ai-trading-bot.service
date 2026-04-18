@@ -5,9 +5,6 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Update User/Group and paths to match your setup
-User=zgx
-Group=zgx
 WorkingDirectory=/home/zgx/personal-projects/ai-trade-agent
 
 # Load environment variables from .env
@@ -27,4 +24,4 @@ StandardError=journal
 SyslogIdentifier=ai-trading-bot
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

@@ -231,6 +231,68 @@ class AllocationController:
 
         return 1
 
+    def check_live_readiness(
+        self,
+        trading_client,
+        min_paper_days: int = 30,
+        min_trades: int = 50,
+        min_sharpe: float = 1.0,
+        max_dd: float = 0.08,
+        min_win_rate: float = 0.45,
+        min_equity: float = 25_000.0,
+    ) -> tuple[dict, float, int, list[str]]:
+        """
+        Evaluate whether this agent is ready for live trading.
+
+        Returns (metrics, equity, paper_days, unmet_criteria).
+        unmet_criteria is empty when all gates pass.
+        """
+        import os as _os
+        from datetime import datetime as _dt, timezone as _tz
+
+        self.refresh()
+        m = self._cached_metrics or {}
+
+        # Equity from Alpaca
+        equity = 0.0
+        try:
+            account = trading_client.get_account()
+            equity = float(getattr(account, 'equity', 0) or 0)
+        except Exception as e:
+            logging.warning(f"live_readiness: could not fetch equity: {e}")
+
+        # Days of paper trading — earliest outcome timestamp
+        paper_days = 0
+        try:
+            rows = self._db.get_recent_trades(limit=10_000)
+            if rows:
+                timestamps = [r.get('timestamp') or r.get('entry_timestamp') or '' for r in rows]
+                timestamps = [t for t in timestamps if t]
+                if timestamps:
+                    earliest = min(timestamps)
+                    earliest_dt = _dt.fromisoformat(earliest.replace('Z', '+00:00'))
+                    if earliest_dt.tzinfo is None:
+                        earliest_dt = earliest_dt.replace(tzinfo=_tz.utc)
+                    paper_days = (_dt.now(_tz.utc) - earliest_dt).days
+        except Exception as e:
+            logging.warning(f"live_readiness: could not compute paper_days: {e}")
+
+        unmet: list[str] = []
+        if equity < min_equity:
+            unmet.append(f"equity ${equity:,.0f} < ${min_equity:,.0f} (PDT minimum)")
+        if paper_days < min_paper_days:
+            unmet.append(f"paper trading {paper_days}d < {min_paper_days}d minimum")
+        if m.get('total_trades', 0) < min_trades:
+            unmet.append(f"trades {m.get('total_trades',0)} < {min_trades}")
+        if m.get('sharpe', 0) < min_sharpe:
+            unmet.append(f"Sharpe {m.get('sharpe',0):.2f} < {min_sharpe}")
+        if m.get('max_dd', 1) > max_dd:
+            unmet.append(f"max drawdown {m.get('max_dd',1):.1%} > {max_dd:.1%}")
+        if m.get('win_rate', 0) < min_win_rate:
+            unmet.append(f"win rate {m.get('win_rate',0):.1%} < {min_win_rate:.1%}")
+
+        return m, equity, paper_days, unmet
+
     def _persist(self, metrics: dict) -> None:
         try:
             _ALLOC_CONFIG.parent.mkdir(parents=True, exist_ok=True)

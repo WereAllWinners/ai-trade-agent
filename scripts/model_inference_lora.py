@@ -68,7 +68,7 @@ def load_model_once():
     print("✅ Model loaded and cached successfully!")
     return model, tokenizer
 
-def get_trading_decision(prompt, max_new_tokens=512, temperature=0.7):
+def get_trading_decision(prompt, max_new_tokens=200, temperature=0.7):
     """
     Get trading decision from the model.
     Uses cached model for fast inference.

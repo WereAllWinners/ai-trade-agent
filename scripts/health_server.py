@@ -148,7 +148,7 @@ def build_status_payload() -> dict:
     inference_model   = (
         os.getenv('VLLM_MODEL', 'Qwen/Qwen2.5-7B-Instruct-AWQ')
         if inference_backend == 'vllm'
-        else os.getenv('OLLAMA_MODEL', 'qwen3:8b')
+        else os.getenv('BASE_MODEL', 'Qwen/Qwen2.5-32B-Instruct') + '+LoRA'
     )
 
     # Last fine-tune timestamp (trading_daemon writes this)
@@ -326,6 +326,7 @@ if __name__ == '__main__':
                         help='Port to listen on (default: 8765)')
     args = parser.parse_args()
 
+    HTTPServer.allow_reuse_address = True
     server = HTTPServer(('0.0.0.0', args.port), HealthHandler)
     print(f"Health server listening on :")
     print(f"  http://0.0.0.0:{args.port}/health   — liveness")

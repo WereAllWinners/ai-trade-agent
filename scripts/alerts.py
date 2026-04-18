@@ -164,6 +164,38 @@ def alert_trade_failed(agent_name: str, symbol: str, error: str) -> None:
     )
 
 
+def alert_live_trading_ready(agent_name: str, metrics: dict, equity: float,
+                              paper_days: int, unmet: list[str]) -> None:
+    """
+    Notify that an agent has met (or not yet met) live-trading criteria.
+    Called once per daily performance analysis cycle.
+    """
+    if not unmet:
+        body = (
+            f"{agent_name} has met all live-trading criteria.\n\n"
+            f"  Equity        : ${equity:,.2f}\n"
+            f"  Paper days    : {paper_days}\n"
+            f"  Trades        : {metrics.get('total_trades', 0)}\n"
+            f"  Win rate      : {metrics.get('win_rate', 0):.1%}\n"
+            f"  Sharpe        : {metrics.get('sharpe', 0):.2f}\n"
+            f"  Max drawdown  : {metrics.get('max_dd', 1):.1%}\n\n"
+            f"Set PAPER_TRADING=false in .env and restart when ready."
+        )
+        send_alert(
+            AlertLevel.INFO,
+            'live_trading_ready',
+            f"{agent_name}: all live-trading criteria met — you may go live",
+            data={'agent': agent_name, 'metrics': metrics,
+                  'equity': equity, 'paper_days': paper_days},
+        )
+        log.info(body)
+    else:
+        log.info(
+            f"{agent_name} live-trading readiness: NOT YET READY — "
+            + "; ".join(unmet)
+        )
+
+
 if __name__ == '__main__':
     # Quick smoke test: logs to file, prints to console, skips email if unconfigured
     print("Testing alerts system...")
