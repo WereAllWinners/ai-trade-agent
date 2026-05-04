@@ -24,3 +24,4 @@ finetune/
 .cache/
 __pycache__/
 unsloth_compiled_cache/
+CLAUDE.md
