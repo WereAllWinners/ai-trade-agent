@@ -10,12 +10,11 @@ Flow:
   4. Promote if candidate.pass_rate >= current.pass_rate − TOLERANCE
      (ties go to the candidate — always prefer fresher training data)
   5. On promote: update finance_qwen_32b_lora_latest symlink + .env LORA_ADAPTER_PATH
-               + restart services
+               (next trading session subprocess picks up the new adapter automatically)
   6. On reject:  keep current adapter, log reason
 
 Usage:
     python3 scripts/training/model_promoter.py --candidate finetune/finance_qwen_32b_lora_20260417_010236
-    python3 scripts/training/model_promoter.py --candidate <path> --skip-restart
 """
 
 import argparse
@@ -122,21 +121,21 @@ def _update_env(adapter_path: str) -> None:
 
 
 def _restart_services() -> None:
-    """Fire-and-forget systemd restart so the caller isn't killed mid-function."""
-    logging.info("🔄 Restarting services to pick up new adapter...")
-    # Services are system-level (sudo systemctl). The daemon runs as root so
-    # no sudo prefix needed — plain 'systemctl restart' works from root.
-    subprocess.Popen(
-        ['systemctl', 'restart', 'ai-trading-bot', 'ai-options-bot'],
-        start_new_session=True,
-    )
+    # No-op: each trading session runs as a subprocess that starts a fresh Python
+    # interpreter and re-reads LORA_ADAPTER_PATH from .env on every call to
+    # load_model_once(). The updated .env written by _update_env() is therefore
+    # picked up automatically at the next session — no daemon restart required.
+    # Attempting 'systemctl restart' from within the service also fails with
+    # "Interactive authentication required" since the service runs as a non-root
+    # user without polkit permission to restart system units.
+    logging.info("ℹ️  New adapter will be loaded automatically by the next trading session (no restart needed)")
 
 
 # ---------------------------------------------------------------------------
 # Core promotion logic
 # ---------------------------------------------------------------------------
 
-def promote(candidate_path: str, skip_restart: bool = False) -> bool:
+def promote(candidate_path: str) -> bool:
     """
     Compare candidate adapter to the current production adapter.
     Returns True if the candidate was promoted, False if rejected.
@@ -149,8 +148,7 @@ def promote(candidate_path: str, skip_restart: bool = False) -> bool:
         logging.info("No existing production adapter found — auto-promoting candidate")
         _update_latest_symlink(candidate_path)
         _update_env(candidate_path)
-        if not skip_restart:
-            _restart_services()
+        _restart_services()
         return True
 
     if candidate_path == current_path:
@@ -192,8 +190,7 @@ def promote(candidate_path: str, skip_restart: bool = False) -> bool:
         )
         _update_latest_symlink(candidate_path)
         _update_env(candidate_path)
-        if not skip_restart:
-            _restart_services()
+        _restart_services()
     else:
         logging.info(
             f"\n⏪ REJECTED — pass_rate {c_pass:.1%} < {p_pass:.1%} "
@@ -226,11 +223,9 @@ def main():
     parser = argparse.ArgumentParser(description='Evaluate and promote a fine-tuned LoRA adapter')
     parser.add_argument('--candidate', type=str, required=True,
                         help='Path to the candidate (newly fine-tuned) adapter directory')
-    parser.add_argument('--skip-restart', action='store_true',
-                        help='Update symlink and .env but do not restart services')
     args = parser.parse_args()
 
-    promoted = promote(args.candidate, skip_restart=args.skip_restart)
+    promoted = promote(args.candidate)
     # Exit 0 = promoted, 2 = rejected (not an error — caller can check)
     sys.exit(0 if promoted else 2)
 

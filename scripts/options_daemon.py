@@ -62,10 +62,11 @@ class OptionsDaemon:
         # Preflight: validate Alpaca account + options approval level
         self._run_preflight()
 
-        # Pre-load the 32B LoRA model so first trading session has no cold-start delay.
-        # inference_client (Ollama) is not used for decisions — model_inference_lora is.
-        from model_inference_lora import load_model_once
-        load_model_once()
+        # NOTE: do NOT preload the model here. Every options session runs as a
+        # subprocess (options_agent.py) with its own Python interpreter and its
+        # own _MODEL_CACHE — so a model loaded in the daemon process is never shared
+        # with or used by those subprocesses. Holding 45 GB in the daemon process
+        # just steals memory from the nightly fine-tune subprocess.
     
     def _run_preflight(self) -> None:
         """Validate the Alpaca account including options approval level."""
@@ -367,11 +368,13 @@ class OptionsDaemon:
         last_trade_time = None
         # Initialise from wall-clock time so a restart mid-day doesn't
         # immediately re-run analysis or fine-tuning that already ran today.
-        _startup = datetime.now(self.est).time()
+        _startup_now = datetime.now(self.est)
+        _startup = _startup_now.time()
         analysis_done_today = _startup >= self.analysis_time
         finetune_done_today = _startup >= self.finetune_time
         weekend_strategist_done_this_week = False
         last_weekend_week = None
+        last_reset_date = _startup_now.date()  # tracks the last date flags were reset
         
         while True:
             try:
@@ -388,10 +391,14 @@ class OptionsDaemon:
                     self.run_finetuning()
                     finetune_done_today = True
 
-                # Reset daily flags
-                if last_trade_time and last_trade_time.date() != current_date:
+                # Reset daily flags at midnight — use a dedicated date tracker so
+                # the reset fires exactly once per calendar day regardless of whether
+                # any trades happened (the old last_trade_time approach missed resets
+                # on weekends and caused double fine-tunes on market-open mornings).
+                if current_date != last_reset_date:
                     analysis_done_today = False
                     finetune_done_today = False
+                    last_reset_date = current_date
 
                 # Reset weekly flag on new calendar week
                 if last_weekend_week != current_week:
@@ -414,8 +421,11 @@ class OptionsDaemon:
                     self.run_online_training()
                     analysis_done_today = True
                 
-                # Fine-tuning at 9:00 PM
-                if not finetune_done_today and current_time >= self.finetune_time:
+                # Fine-tuning at 2:00 AM — never run during market hours to avoid
+                # OOM from simultaneous inference + training on the same GPU.
+                if (not finetune_done_today
+                        and current_time >= self.finetune_time
+                        and not self.is_market_open()):
                     self.run_finetuning()
                     finetune_done_today = True
                 

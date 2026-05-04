@@ -7,10 +7,18 @@ import logging
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel
+from filelock import FileLock, Timeout as FileLockTimeout
 import re
 from pathlib import Path
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
+
+# Cross-process GPU inference lock — prevents both agents from running generate()
+# simultaneously, which would burst past 128 GB of unified memory on the GB10.
+# Both models stay resident; only the generate() call is serialized.
+_INFERENCE_LOCK_PATH = _SCRIPTS_DIR.parent / 'logs' / 'inference.lock'
+_INFERENCE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+_INFERENCE_LOCK = FileLock(str(_INFERENCE_LOCK_PATH), timeout=600)
 
 # Global model cache - load once, use many times
 _MODEL_CACHE = {
@@ -75,40 +83,44 @@ def get_trading_decision(prompt, max_new_tokens=200, temperature=0.7):
     """
     # Get cached model
     model, tokenizer = load_model_once()
-    
-    # Format prompt for Qwen
+
+    # Format prompt for Qwen — CPU work, no lock needed
     messages = [
         {"role": "system", "content": "You are a professional stock trading analyst. Provide clear, actionable trading decisions with confidence scores."},
         {"role": "user", "content": prompt}
     ]
-    
     text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True
     )
-    
-    # Tokenize
-    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
-    
-    # Generate
-    with torch.no_grad():
-        generated_ids = model.generate(
-            **model_inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            do_sample=True,
-            top_p=0.9,
-            pad_token_id=tokenizer.eos_token_id
+    model_inputs_cpu = tokenizer([text], return_tensors="pt")
+
+    # Serialize GPU work across all processes (trading-bot + options-bot share
+    # 128 GB unified memory; simultaneous generate() calls burst past the limit).
+    try:
+        with _INFERENCE_LOCK:
+            model_inputs = model_inputs_cpu.to(model.device)
+            with torch.no_grad():
+                generated_ids = model.generate(
+                    **model_inputs,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    do_sample=True,
+                    top_p=0.9,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+            generated_ids = [
+                output_ids[len(input_ids):]
+                for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+            ]
+            response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    except FileLockTimeout:
+        raise RuntimeError(
+            "Inference lock timeout (600 s) — the other agent may be hung. "
+            "Check the trading-bot and options-bot services."
         )
-    
-    # Decode
-    generated_ids = [
-        output_ids[len(input_ids):] 
-        for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-    ]
-    
-    response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
     return response
 
 def parse_decision(response):

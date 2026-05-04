@@ -88,7 +88,24 @@ def finetune_model(training_data_path: Path) -> None:
 
     fine_tune_script = _PROJECT_ROOT / 'finetune' / 'fine_tune_llm.py'
     finetune_env = {**os.environ, "TRITON_PTXAS_BLACKWELL_PATH": _FINETUNE_PTXAS}
-    cmd = [_FINETUNE_PYTHON, str(fine_tune_script), '--data', str(training_data_path)]
+
+    # Always continue from the current production adapter so training is
+    # incremental (1 epoch) rather than FRESH (3 epochs from base model).
+    # FRESH mode loads the 33B base model and runs 3× more gradient steps,
+    # which has caused kernel-level NVRM OOM crashes on the GB10.
+    lora_latest = _PROJECT_ROOT / 'finetune' / 'finance_qwen_32b_lora_latest'
+    continue_from = str(lora_latest.resolve()) if lora_latest.exists() else None
+
+    cmd = [
+        _FINETUNE_PYTHON, str(fine_tune_script),
+        '--data', str(training_data_path),
+        '--epochs', '1',       # nightly incremental: 1 epoch is sufficient
+        '--batch-size', '1',   # batch 1 is safe on 128 GB unified memory;
+                               # batch 2 + inference model = kernel OOM
+        '--no-dpo',            # skip DPO for nightly runs (saves time + memory)
+    ]
+    if continue_from:
+        cmd += ['--continue-from', continue_from]
 
     # Snapshot adapter directories before training so we can detect the new one
     finetune_dir = _PROJECT_ROOT / 'finetune'
@@ -98,14 +115,14 @@ def finetune_model(training_data_path: Path) -> None:
     }
 
     try:
-        result = subprocess.run(cmd, timeout=3600, env=finetune_env)
+        result = subprocess.run(cmd, timeout=7200, env=finetune_env)
         if result.returncode == 0:
             logging.info("✅ Model fine-tuning complete")
             _run_promoter(finetune_dir, adapters_before)
         else:
             logging.error(f"❌ Fine-tuning failed with code {result.returncode}")
     except subprocess.TimeoutExpired:
-        logging.error("❌ Fine-tuning timed out after 60 minutes")
+        logging.error("❌ Fine-tuning timed out after 120 minutes")
     except Exception as e:
         logging.error(f"❌ Fine-tuning failed: {e}")
 
