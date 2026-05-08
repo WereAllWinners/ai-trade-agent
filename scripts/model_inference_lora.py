@@ -4,6 +4,7 @@ Model Inference with LoRA - OPTIMIZED with model caching
 """
 import os
 import logging
+import time
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel
@@ -98,23 +99,33 @@ def get_trading_decision(prompt, max_new_tokens=200, temperature=0.7):
 
     # Serialize GPU work across all processes (trading-bot + options-bot share
     # 128 GB unified memory; simultaneous generate() calls burst past the limit).
+    # Retry on PermissionError: filelock 3.25.x deletes the file on release, creating
+    # a brief race window where os.open() can fail instead of returning EAGAIN.
     try:
-        with _INFERENCE_LOCK:
-            model_inputs = model_inputs_cpu.to(model.device)
-            with torch.no_grad():
-                generated_ids = model.generate(
-                    **model_inputs,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    do_sample=True,
-                    top_p=0.9,
-                    pad_token_id=tokenizer.eos_token_id
-                )
-            generated_ids = [
-                output_ids[len(input_ids):]
-                for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-            ]
-            response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        for _retry in range(5):
+            try:
+                with _INFERENCE_LOCK:
+                    model_inputs = model_inputs_cpu.to(model.device)
+                    with torch.no_grad():
+                        generated_ids = model.generate(
+                            **model_inputs,
+                            max_new_tokens=max_new_tokens,
+                            temperature=temperature,
+                            do_sample=True,
+                            top_p=0.9,
+                            pad_token_id=tokenizer.eos_token_id
+                        )
+                    generated_ids = [
+                        output_ids[len(input_ids):]
+                        for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+                    ]
+                    response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+                break
+            except PermissionError:
+                if _retry == 4:
+                    raise
+                logging.warning("inference.lock PermissionError (attempt %d/5), retrying in 1s", _retry + 1)
+                time.sleep(1)
     except FileLockTimeout:
         raise RuntimeError(
             "Inference lock timeout (600 s) — the other agent may be hung. "
