@@ -2,7 +2,7 @@
 """
 Alerts module - sends notifications for critical trading events.
 
-Supports two channels:
+Supports three channels:
   1. File log (always active) — appends to logs/alerts.jsonl
   2. Email (optional) — configure via environment variables:
        ALERT_EMAIL_FROM    sender address
@@ -11,6 +11,10 @@ Supports two channels:
        ALERT_SMTP_PORT     SMTP server port      (default: 587)
        ALERT_SMTP_USER     SMTP login user       (defaults to ALERT_EMAIL_FROM)
        ALERT_SMTP_PASSWORD SMTP password / app password
+  3. Telegram (optional) — configure via environment variables:
+       TELEGRAM_BOT_TOKEN       Bot token from @BotFather
+       TELEGRAM_CHAT_ID         Chat/channel ID to send messages to
+       TELEGRAM_ALERTS_ENABLED  Set to 'false' to disable (default: true)
 
 Usage:
   from alerts import send_alert, AlertLevel
@@ -63,9 +67,12 @@ def send_alert(level: AlertLevel, event: str, message: str, data: dict = None) -
     if data:
         record['data'] = data
 
+    full_message = f"[{level}] {event}\n{message}"
+
     _write_to_log(record)
     _log_to_stderr(level, event, message)
     _send_email(level, event, message, record)
+    _send_telegram(full_message)
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +136,25 @@ def _send_email(level: AlertLevel, event: str, message: str, record: dict) -> No
         log.info(f"alerts: email sent to {recipients}")
     except Exception as e:
         log.error(f"alerts: email failed ({e}). Check ALERT_SMTP_* env vars.")
+
+
+def _send_telegram(message: str) -> None:
+    """Send message to Telegram if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are configured."""
+    if os.getenv('TELEGRAM_ALERTS_ENABLED', 'true').lower() == 'false':
+        return
+
+    token = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
+    chat_id = os.getenv('TELEGRAM_CHAT_ID', '').strip()
+
+    if not token or not chat_id:
+        return
+
+    import requests as _requests
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        _requests.post(url, json={'chat_id': chat_id, 'text': message}, timeout=10)
+    except Exception as e:
+        log.debug(f"alerts: telegram failed: {e}")
 
 
 # ---------------------------------------------------------------------------

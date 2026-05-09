@@ -1,3 +1,4 @@
+import os
 import requests
 import yfinance as yf
 import pandas as pd
@@ -13,9 +14,30 @@ warnings.filterwarnings('ignore', message='Failed to fetch')
 
 logging.basicConfig(level=logging.INFO)
 
+# Liquidity thresholds — override via environment variables
+_MIN_AVG_DAILY_VOLUME = int(os.getenv('MIN_AVG_DAILY_VOLUME_STOCKS', '1_000_000'.replace('_', '')))
+_MIN_MARKET_CAP       = int(os.getenv('MIN_MARKET_CAP',               '500_000_000'.replace('_', '')))
+
 _DELISTED_CACHE_PATH = Path(__file__).resolve().parent.parent / 'logs' / 'delisted_cache.json'
 _DISCOVERY_CACHE_PATH = Path(__file__).resolve().parent.parent / 'logs' / 'discovery_cache.json'
 _DISCOVERY_CACHE_TTL_HOURS = 4  # Reuse discovery results for up to 4 hours
+
+
+def passes_liquidity_filter(symbol: str, info: dict) -> bool:
+    """Return True if symbol meets minimum volume and market-cap thresholds.
+
+    Checks `averageVolume` and `marketCap` from a yfinance `.info` dict.
+    Missing or None values are treated as 0 (fail).
+    """
+    avg_vol = info.get('averageVolume') or 0
+    mkt_cap = info.get('marketCap') or 0
+    if avg_vol < _MIN_AVG_DAILY_VOLUME:
+        logging.debug(f"{symbol}: liquidity fail — avgVol {avg_vol:,} < {_MIN_AVG_DAILY_VOLUME:,}")
+        return False
+    if mkt_cap < _MIN_MARKET_CAP:
+        logging.debug(f"{symbol}: liquidity fail — mktCap {mkt_cap:,} < {_MIN_MARKET_CAP:,}")
+        return False
+    return True
 
 
 def _load_delisted_cache() -> set:
@@ -270,6 +292,12 @@ class StockDiscovery:
                 volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
                 
                 if volume_ratio >= 2.0:
+                    try:
+                        info = stock.info
+                    except Exception:
+                        info = {}
+                    if not passes_liquidity_filter(symbol, info):
+                        continue
                     unusual_stocks.append((symbol, volume_ratio))
                     self.opportunities[symbol].append(f"Unusual volume: {volume_ratio:.1f}x")
 
@@ -302,6 +330,12 @@ class StockDiscovery:
                 
                 if current_price >= high_52week * 0.98:
                     pct_from_high = ((current_price - high_52week) / high_52week) * 100
+                    try:
+                        info = stock.info
+                    except Exception:
+                        info = {}
+                    if not passes_liquidity_filter(symbol, info):
+                        continue
                     breakout_stocks.append((symbol, pct_from_high))
                     self.opportunities[symbol].append(f"52W breakout: {pct_from_high:+.1f}%")
 
@@ -337,6 +371,12 @@ class StockDiscovery:
                 current_rsi = rsi.iloc[-1]
                 
                 if current_rsi < 30:
+                    try:
+                        info = stock.info
+                    except Exception:
+                        info = {}
+                    if not passes_liquidity_filter(symbol, info):
+                        continue
                     oversold_stocks.append((symbol, current_rsi))
                     self.opportunities[symbol].append(f"Oversold RSI: {current_rsi:.1f}")
 
@@ -369,6 +409,12 @@ class StockDiscovery:
                 return_pct = ((current_price - price_20d_ago) / price_20d_ago) * 100
                 
                 if return_pct >= 5.0:
+                    try:
+                        info = stock.info
+                    except Exception:
+                        info = {}
+                    if not passes_liquidity_filter(symbol, info):
+                        continue
                     momentum_stocks.append((symbol, return_pct))
                     self.opportunities[symbol].append(f"20D momentum: +{return_pct:.1f}%")
 
@@ -401,6 +447,12 @@ class StockDiscovery:
                 gap_pct = ((current_open - prev_close) / prev_close) * 100
                 
                 if abs(gap_pct) >= 3.0:
+                    try:
+                        info = stock.info
+                    except Exception:
+                        info = {}
+                    if not passes_liquidity_filter(symbol, info):
+                        continue
                     gap_stocks.append((symbol, gap_pct))
                     direction = "up" if gap_pct > 0 else "down"
                     self.opportunities[symbol].append(f"Gap {direction}: {gap_pct:+.1f}%")
@@ -437,6 +489,12 @@ class StockDiscovery:
                 below_high_pct = ((current_price - high_60d) / high_60d) * 100
                 
                 if below_avg_pct <= -10 and below_high_pct >= -30:
+                    try:
+                        info = stock.info
+                    except Exception:
+                        info = {}
+                    if not passes_liquidity_filter(symbol, info):
+                        continue
                     reversion_stocks.append((symbol, below_avg_pct))
                     self.opportunities[symbol].append(f"Mean reversion: {below_avg_pct:.1f}% below avg")
 

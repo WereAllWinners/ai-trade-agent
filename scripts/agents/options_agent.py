@@ -44,6 +44,10 @@ _DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'  # log orders but nev
 # (the broker's minimum notional to avoid a pointless trade + commission)
 _MIN_EXIT_VALUE_USD = 10.0
 
+# Options liquidity thresholds — override via environment variables
+_MIN_OPEN_INTEREST = int(os.getenv('MIN_OPEN_INTEREST_OPTIONS', '200'))
+_MIN_OPTION_VOLUME = int(os.getenv('MIN_OPTION_VOLUME', '50'))
+
 def _json_default(obj):
     """JSON serializer for types that the stdlib encoder can't handle."""
     if isinstance(obj, (np.integer,)):
@@ -597,13 +601,21 @@ Reasoning: <one sentence explaining the key signal>"""
                 if isinstance(exp, str):
                     exp = datetime.strptime(exp, '%Y-%m-%d').date()
                 dte = (exp - datetime.now().date()).days
-                
-                # Score based on proximity to target delta and DTE
+
+                # Liquidity gate: skip contracts with insufficient open interest
+                oi = int(contract.open_interest or 0)
+                if oi < _MIN_OPEN_INTEREST:
+                    logging.debug(
+                        f"  Skipping {contract.symbol}: OI {oi} < {_MIN_OPEN_INTEREST}"
+                    )
+                    continue
+
+                # Score based on proximity to target strike and DTE
                 strike_diff = abs(strike - strike_price) / strike_price
                 dte_score = abs(dte - 30) / 30  # Target ~30 DTE
-                
+
                 score = strike_diff + dte_score
-                
+
                 if score < best_score:
                     best_score = score
                     best_contract = contract
@@ -653,7 +665,11 @@ Reasoning: <one sentence explaining the key signal>"""
         return max(1, max_contracts)
     
     def get_option_price(self, contract_symbol):
-        """Get current mid-price for an option contract from Alpaca market data."""
+        """Get current mid-price for an option contract from Alpaca market data.
+
+        Returns None if the contract has no tradeable price OR if bid+ask size
+        is below _MIN_OPTION_VOLUME (illiquid contract gate).
+        """
         try:
             request = OptionLatestQuoteRequest(symbol_or_symbols=contract_symbol)
             quotes = self.option_data_client.get_option_latest_quote(request)
@@ -661,6 +677,17 @@ Reasoning: <one sentence explaining the key signal>"""
                 q = quotes[contract_symbol]
                 bid = float(q.bid_price) if q.bid_price else 0.0
                 ask = float(q.ask_price) if q.ask_price else 0.0
+
+                # Volume gate: sum of bid+ask sizes is a proxy for quote depth
+                bid_size = int(q.bid_size) if getattr(q, 'bid_size', None) else 0
+                ask_size = int(q.ask_size) if getattr(q, 'ask_size', None) else 0
+                quote_depth = bid_size + ask_size
+                if quote_depth > 0 and quote_depth < _MIN_OPTION_VOLUME:
+                    logging.debug(
+                        f"  Skipping {contract_symbol}: quote depth {quote_depth} < {_MIN_OPTION_VOLUME}"
+                    )
+                    return None
+
                 if bid > 0 and ask > 0:
                     return (bid + ask) / 2.0
                 elif ask > 0:

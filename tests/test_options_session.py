@@ -92,11 +92,13 @@ def make_stock_position(symbol, qty, market_value='5000.00'):
     return pos
 
 
-def make_contract(symbol='AAPL270319C00207000', strike='207.00', exp='2026-03-19'):
+def make_contract(symbol='AAPL270319C00207000', strike='207.00', exp='2026-03-19',
+                  open_interest=500):
     c = MagicMock()
     c.symbol = symbol
     c.strike_price = strike
     c.expiration_date = exp
+    c.open_interest = open_interest  # satisfies _MIN_OPEN_INTEREST gate (default 200)
     return c
 
 
@@ -110,6 +112,9 @@ def make_quote(bid='3.50', ask='3.70'):
     q = MagicMock()
     q.bid_price = bid
     q.ask_price = ask
+    # bid_size=0 / ask_size=0 → quote_depth=0 → volume gate is bypassed (depth unknown)
+    q.bid_size = 0
+    q.ask_size = 0
     return q
 
 
