@@ -31,6 +31,7 @@ from model_inference_lora import get_trading_decision, parse_decision, load_mode
 from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
 import news_fetcher
 import unusual_flow_scanner
+import economic_calendar
 import db as _db
 from portfolio_overseer import PortfolioOverseer
 from allocation_controller import AllocationController
@@ -59,6 +60,128 @@ def _json_default(obj):
 def _settled_cash(account) -> float:
     """Return fully settled cash (non_marginable_buying_power), excluding T+1 unsettled proceeds."""
     return float(account.non_marginable_buying_power)
+
+
+def _load_macro_context_block() -> str:
+    """Read the most recent options macro context entry and format it for prompts.
+
+    Reads logs/market_context_options.json (written nightly by market_researcher).
+    Returns '' if file is missing or entry is stale (>36 h old).
+    """
+    try:
+        path = Path(__file__).resolve().parent.parent / 'logs' / 'market_context_options.json'
+        if not path.exists():
+            return ''
+        with open(path) as f:
+            records = json.load(f)
+        if not records:
+            return ''
+        latest = records[-1]
+        ts = datetime.fromisoformat(latest['timestamp'])
+        if (datetime.now() - ts).total_seconds() > 36 * 3600:
+            return ''
+
+        macro     = latest.get('macro', {})
+        vix_d     = macro.get('vix', {})
+        spy_d     = macro.get('spy', {})
+        vix_val   = vix_d.get('current', '?')
+        vix_reg   = vix_d.get('regime', '?')
+        spy_trend = spy_d.get('trend', '?')
+        spy_ma    = 'above 50MA' if spy_d.get('above_50ma') else 'below 50MA'
+
+        line1 = f"Regime: {spy_trend} | VIX: {vix_val} ({vix_reg}) | SPY: {spy_ma}"
+
+        params = latest.get('recommended_params', {})
+        bias   = params.get('market_bias', '')
+        iv_elv = params.get('iv_elevated_tickers', [])[:4]
+
+        parts = []
+        if bias:
+            parts.append(f"Market bias: {bias}")
+        if iv_elv:
+            parts.append(f"IV elevated on: {', '.join(iv_elv)}")
+        line2 = ' | '.join(parts)
+
+        lines = ['Market Context (as of last night):', f'  {line1}']
+        if line2:
+            lines.append(f'  {line2}')
+        return '\n'.join(lines)
+    except Exception as e:
+        logging.debug(f"Could not load options macro context block: {e}")
+        return ''
+
+
+def _load_weekend_context_block() -> str:
+    """Read the most recent weekend strategist entry and format it for prompts.
+
+    Reads logs/weekend_context_options.json (written Saturday).
+    Only injected Mon–Fri before 2 PM and when the file is ≤5 days old.
+    Returns '' if conditions are not met or on any error.
+    """
+    try:
+        now = datetime.now()
+        if now.weekday() >= 5 or now.hour >= 14:
+            return ''
+
+        path = Path(__file__).resolve().parent.parent / 'logs' / 'weekend_context_options.json'
+        if not path.exists():
+            return ''
+        with open(path) as f:
+            records = json.load(f)
+        if not records:
+            return ''
+        latest = records[-1]
+        ts = datetime.fromisoformat(latest['timestamp'])
+        if (now - ts).total_seconds() > 5 * 86400:
+            return ''
+
+        params      = latest.get('recommended_params', {})
+        sector_data = latest.get('sector_analysis', {})
+        iv_analysis = latest.get('iv_analysis', {})
+        earnings    = latest.get('earnings_next_7_days', [])[:5]
+
+        top_sectors  = params.get('top_sectors', [])[:3]
+        weak_sectors = params.get('weak_sectors', [])[:2]
+        sector_parts = []
+        if top_sectors:
+            top_str = ', '.join(
+                f"{s} ({sector_data.get(s, {}).get('return_1m_pct', 0):+.1f}%)"
+                for s in top_sectors
+            )
+            sector_parts.append(f"Top sectors: {top_str}")
+        if weak_sectors:
+            weak_str = ', '.join(
+                f"{s} ({sector_data.get(s, {}).get('return_1m_pct', 0):+.1f}%)"
+                for s in weak_sectors
+            )
+            sector_parts.append(f"Avoid: {weak_str}")
+        sectors_line = ' | '.join(sector_parts)
+
+        cong_bull  = params.get('congressional_bullish', [])[:5]
+        cong_bear  = params.get('congressional_bearish', [])[:5]
+        cong_parts = []
+        if cong_bull:
+            cong_parts.append(f"bullish {', '.join(cong_bull)}")
+        if cong_bear:
+            cong_parts.append(f"bearish {', '.join(cong_bear)}")
+        cong_line = f"Congressional: {' | '.join(cong_parts)}" if cong_parts else ''
+
+        elevated = [s for s, v in iv_analysis.items() if v.get('vol_regime') == 'elevated'][:4]
+        iv_line  = (f"IV regime: elevated on {', '.join(elevated)} — premium buying expensive this week"
+                    if elevated else '')
+
+        earn_parts = [f"{e['symbol']} ({e.get('earnings_in_days', '?')}d)" for e in earnings]
+        earn_line  = (f"Earnings this week: {', '.join(earn_parts)} — avoid new positions day-before"
+                      if earn_parts else '')
+
+        content_lines = [l for l in [sectors_line, cong_line, iv_line, earn_line] if l]
+        if not content_lines:
+            return ''
+        lines = ['Weekend Research Context:'] + [f'  {l}' for l in content_lines]
+        return '\n'.join(lines)
+    except Exception as e:
+        logging.debug(f"Could not load weekend context block: {e}")
+        return ''
 
 
 def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) -> dict:
@@ -362,7 +485,10 @@ class OptionsAgent:
     def get_ai_options_decision(self, analysis, market_bias: str = 'neutral',
                                symbol_bias: str = 'neutral',
                                news_snippet: str = '', flow_snippet: str = '',
-                               greeks: dict | None = None):
+                               greeks: dict | None = None,
+                               macro_context_block: str = '',
+                               weekend_context_block: str = '',
+                               macro_guard_block: str = ''):
         """Get AI decision for options trading.
 
         Returns (decision, prompt, raw_response) so callers can log all three
@@ -371,9 +497,16 @@ class OptionsAgent:
         greeks (optional): dict with delta, theta, gamma, vega, iv keys from
             get_atm_option_greeks().  When provided they are included in the
             prompt so the model can factor in IV crush risk and time decay.
+        macro_context_block: nightly macro summary (Fix D).
+        weekend_context_block: Saturday research summary (Fix E).
+        macro_guard_block: today's high-impact economic events (Fix C).
         """
         extra_context = (news_snippet + flow_snippet).strip()
         context_block = f"\n{extra_context}" if extra_context else ''
+
+        # Weekend context appended to context_block (Fix E)
+        if weekend_context_block:
+            context_block += f"\n{weekend_context_block}"
 
         # Greeks block — only appended when data is available
         greeks_block = ''
@@ -390,17 +523,22 @@ class OptionsAgent:
             if parts:
                 greeks_block = '\n\nLive Option Greeks (ATM contract):\n' + '\n'.join(f'- {p}' for p in parts)
 
+        # Fix D: macro context block inserted before Market Context section
+        _macro_ctx = f"\n{macro_context_block}\n" if macro_context_block else ''
+        # Fix C: macro guard block inserted before the decision instructions
+        _guard = f"\n{macro_guard_block}\n" if macro_guard_block else ''
+
         prompt = f"""You are a decisive options trader. Analyze {analysis['symbol']} and give a clear options decision.
 
 Current Price: ${analysis['current_price']:.2f}
 RSI (14): {analysis['rsi']:.1f}  (>70 overbought, <30 oversold)
 Volatility (20d): {analysis['volatility']:.1%}  (historical vol)
 Momentum (20d): {analysis['momentum']:.1%}  (positive = bullish trend){greeks_block}
-
+{_macro_ctx}
 Market Context (from overnight research):
 - Overall market bias: {market_bias}
 - Symbol-specific bias: {symbol_bias}{context_block}
-
+{_guard}
 Make a decisive call based on the signals above:
 - BUY_CALL if momentum and bias are bullish (avoid if IV is extremely high — IV crush risk)
 - BUY_PUT if momentum and bias are bearish (avoid if IV is extremely high — IV crush risk)
@@ -975,6 +1113,32 @@ Reasoning: <one sentence explaining the key signal>"""
         except Exception as e:
             logging.error(f"❌ Failed to check circuit breaker: {e}")
 
+        # ── Macro guard (Fix B/C) ──────────────────────────────────────────────
+        macro_events = economic_calendar.get_todays_high_impact_events()
+        halt, halt_reason = economic_calendar.should_halt_trading(macro_events)
+        if halt:
+            logging.warning(f"🛑 MACRO GUARD: {halt_reason} — halting options session")
+            return
+
+        # For options: tighten min_conf by +0.05 whenever any high-impact event
+        # exists today (even outside the halt window) — options are more sensitive
+        # to vol spikes than stocks.
+        if macro_events:
+            min_conf = min(min_conf + 0.05, 0.99)
+            logging.info(
+                f"📅 Macro events today — tightening options min_conf to {min_conf:.0%}"
+            )
+
+        # ── Session-level context blocks (Fix D / Fix E) ─────────────────────
+        macro_context_block   = _load_macro_context_block()
+        weekend_context_block = _load_weekend_context_block()
+        macro_guard_block     = economic_calendar.format_macro_guard_block(
+            macro_events,
+            economic_calendar.get_earnings_today(self.watchlist),
+        )
+        if macro_guard_block:
+            logging.info(f"📅 Options macro guard:\n{macro_guard_block}")
+
         logging.info(f"📊 Daily options trades: {self.daily_trades}/{self.params['max_daily_trades']}")
 
         # Step 2: Check if we can trade more
@@ -1032,6 +1196,9 @@ Reasoning: <one sentence explaining the key signal>"""
                 analysis, market_bias=market_bias, symbol_bias=sym_bias,
                 news_snippet=news_snippet, flow_snippet=flow_snippet,
                 greeks=greeks,
+                macro_context_block=macro_context_block,
+                weekend_context_block=weekend_context_block,
+                macro_guard_block=macro_guard_block,
             )
 
             logging.info(f"📊 {symbol}: {decision['decision'].upper()} "

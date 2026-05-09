@@ -2,11 +2,14 @@
 """
 News Fetcher — Polygon.io free news API (5 calls/min).
 
-Fetches recent headlines per symbol, applies lightweight keyword sentiment,
-and formats a compact snippet for LLM prompt injection.
+Fetches recent headlines per symbol, applies LLM-scored sentiment (with
+keyword fallback), and formats a compact snippet for LLM prompt injection.
 
 In-memory cache (1-hour TTL) prevents redundant API calls when the same
 symbol is analyzed multiple times within a session.
+
+Env flags:
+  NEWS_LLM_SENTIMENT=false  — skip LLM scoring, use keyword fallback only
 """
 import os
 import time
@@ -21,10 +24,14 @@ load_dotenv()
 
 log = logging.getLogger(__name__)
 
-_API_KEY      = os.getenv('POLYGON_API_KEY', '')
-_BASE_URL     = 'https://api.polygon.io/v2/reference/news'
-_CALL_GAP     = 13.0   # seconds between calls: 60s / 5 calls + margin
-_CACHE_TTL    = 3600   # 1 hour in seconds
+_API_KEY   = os.getenv('POLYGON_API_KEY', '')
+_BASE_URL  = 'https://api.polygon.io/v2/reference/news'
+_CALL_GAP  = 13.0   # seconds between calls: 60s / 5 calls + margin
+_CACHE_TTL = 3600   # 1 hour in seconds
+
+# Gate: set NEWS_LLM_SENTIMENT=false to fall back to keyword matching during
+# GPU-contention hours without restarting the daemon.
+NEWS_LLM_SENTIMENT: bool = os.getenv('NEWS_LLM_SENTIMENT', 'true').lower() != 'false'
 
 _last_call_ts: float = 0.0
 _cache: dict = {}      # symbol -> (fetched_ts, articles)
@@ -40,7 +47,7 @@ def _rate_limit() -> None:
     _last_call_ts = time.monotonic()
 
 
-# ── Keyword sentiment (no extra API needed) ───────────────────────────────────
+# ── Keyword sentiment (fallback, no extra API needed) ─────────────────────────
 
 _BULLISH = {
     'beat', 'beats', 'exceeds', 'surpasses', 'upgrade', 'upgraded', 'outperform',
@@ -63,6 +70,52 @@ def _sentiment(text: str) -> str:
     return 'neutral'
 
 
+# ── LLM sentiment scoring ─────────────────────────────────────────────────────
+
+def score_sentiment_with_llm(title: str, description: str) -> dict:
+    """Score news sentiment via the local Qwen model.
+
+    Returns dict with keys: sentiment, magnitude, sentiment_reason.
+    Falls back to keyword _sentiment() on any exception (import error,
+    model timeout, parse failure, etc.).
+
+    The LLM call is capped at 60 tokens to keep latency low — it fires
+    only on cache miss (once per symbol per hour).
+    """
+    try:
+        from model_inference_lora import get_trading_decision  # lazy import
+        prompt = (
+            f"Analyze this financial news headline and brief description.\n"
+            f"Headline: {title}\n"
+            f"Description: {description[:150]}\n\n"
+            f"Respond in this exact format:\n"
+            f"Sentiment: <bullish|bearish|neutral>\n"
+            f"Magnitude: <low|medium|high>\n"
+            f"Reason: <one phrase, max 10 words>"
+        )
+        response = get_trading_decision(prompt, max_new_tokens=60, temperature=0.3)
+        sentiment = 'neutral'
+        magnitude = 'medium'
+        reason    = ''
+        for line in response.splitlines():
+            lower = line.lower().strip()
+            if lower.startswith('sentiment:'):
+                val = lower.split(':', 1)[1].strip()
+                if val in ('bullish', 'bearish', 'neutral'):
+                    sentiment = val
+            elif lower.startswith('magnitude:'):
+                val = lower.split(':', 1)[1].strip()
+                if val in ('low', 'medium', 'high'):
+                    magnitude = val
+            elif lower.startswith('reason:'):
+                reason = line.split(':', 1)[1].strip()[:80]
+        return {'sentiment': sentiment, 'magnitude': magnitude, 'sentiment_reason': reason}
+    except Exception as e:
+        log.debug(f"LLM sentiment failed, using keyword fallback: {e}")
+        text = title + ' ' + description
+        return {'sentiment': _sentiment(text), 'magnitude': 'medium', 'sentiment_reason': ''}
+
+
 # ── Core fetch ────────────────────────────────────────────────────────────────
 
 def fetch_news(symbol: str, limit: int = 5, max_age_hours: int = 24) -> list:
@@ -70,7 +123,8 @@ def fetch_news(symbol: str, limit: int = 5, max_age_hours: int = 24) -> list:
     Return up to `limit` recent articles for `symbol` from Polygon.
     Results are cached for 1 hour. Returns [] if API key absent or call fails.
 
-    Each article dict has: title, description, published_utc, age, sentiment.
+    Each article dict has: title, description, published_utc, age,
+    sentiment, magnitude, sentiment_reason.
     """
     if not _API_KEY:
         log.debug("POLYGON_API_KEY not set — skipping news")
@@ -118,12 +172,23 @@ def fetch_news(symbol: str, limit: int = 5, max_age_hours: int = 24) -> list:
         except Exception:
             age_str = ''
 
+        if NEWS_LLM_SENTIMENT:
+            scored = score_sentiment_with_llm(title, desc)
+        else:
+            scored = {
+                'sentiment':        _sentiment(title + ' ' + desc),
+                'magnitude':        'medium',
+                'sentiment_reason': '',
+            }
+
         articles.append({
-            'title':       title,
-            'description': desc,
-            'published_utc': pub,
-            'age':         age_str,
-            'sentiment':   _sentiment(title + ' ' + desc),
+            'title':            title,
+            'description':      desc,
+            'published_utc':    pub,
+            'age':              age_str,
+            'sentiment':        scored['sentiment'],
+            'magnitude':        scored['magnitude'],
+            'sentiment_reason': scored['sentiment_reason'],
         })
 
     _cache[symbol] = (time.monotonic(), articles)
@@ -136,6 +201,10 @@ def format_for_prompt(symbol: str, max_articles: int = 3) -> str:
     """
     Fetch news and return a compact multi-line string ready for prompt injection.
     Returns '' if no recent news or API unavailable.
+
+    Format example:
+      Recent News (NVDA, last 24h):
+        • Jensen Huang signals data center demand [BULLISH/HIGH — demand catalyst]  (3h ago)
     """
     articles = fetch_news(symbol)
     if not articles:
@@ -143,6 +212,12 @@ def format_for_prompt(symbol: str, max_articles: int = 3) -> str:
 
     lines = [f"\nRecent News ({symbol}, last 24h):"]
     for a in articles[:max_articles]:
-        tag = f" [{a['sentiment'].upper()}]" if a['sentiment'] != 'neutral' else ''
-        lines.append(f"  • {a['title']}{tag}  ({a['age']})")
+        if a['sentiment'] != 'neutral':
+            tag = f"[{a['sentiment'].upper()}/{a['magnitude'].upper()}"
+            if a.get('sentiment_reason'):
+                tag += f" — {a['sentiment_reason']}"
+            tag += ']'
+            lines.append(f"  • {a['title']} {tag}  ({a['age']})")
+        else:
+            lines.append(f"  • {a['title']}  ({a['age']})")
     return '\n'.join(lines)

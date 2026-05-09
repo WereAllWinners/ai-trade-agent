@@ -25,6 +25,7 @@ from model_inference_lora import get_trading_decision, parse_decision, load_mode
 from stock_discovery import StockDiscovery
 from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
 import news_fetcher
+import economic_calendar
 import db as _db
 from fee_simulator import FeeSimulator
 from paper_market_simulator import PaperMarketSimulator
@@ -50,6 +51,135 @@ def _json_default(obj):
     if isinstance(obj, np.ndarray):
         return obj.tolist()
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def _load_macro_context_block() -> str:
+    """Read the most recent trading macro context entry and format it for prompts.
+
+    Reads logs/market_context_trading.json (written nightly by market_researcher).
+    Returns '' if the file is missing or its newest entry is stale (>36 h old).
+    Cached per call — callers should invoke once per session and reuse.
+    """
+    try:
+        path = Path('logs/market_context_trading.json')
+        if not path.exists():
+            return ''
+        with open(path) as f:
+            records = json.load(f)
+        if not records:
+            return ''
+        latest = records[-1]
+        ts = datetime.fromisoformat(latest['timestamp'])
+        if (datetime.now() - ts).total_seconds() > 36 * 3600:
+            return ''
+
+        macro    = latest.get('macro', {})
+        vix_d    = macro.get('vix', {})
+        spy_d    = macro.get('spy', {})
+        vix_val  = vix_d.get('current', '?')
+        vix_reg  = vix_d.get('regime', '?')
+        spy_trend = spy_d.get('trend', '?')
+        spy_ma   = 'above 50MA' if spy_d.get('above_50ma') else 'below 50MA'
+
+        line1 = f"Regime: {spy_trend} | VIX: {vix_val} ({vix_reg}) | SPY: {spy_ma}"
+
+        # Additional context: top momentum + oversold tickers from nightly scan
+        momentum = latest.get('top_momentum_tickers', [])[:5]
+        oversold = latest.get('oversold_tickers', [])[:3]
+        parts = []
+        if momentum:
+            parts.append(f"Momentum leaders: {', '.join(momentum)}")
+        if oversold:
+            parts.append(f"Oversold: {', '.join(oversold)}")
+        line2 = ' | '.join(parts)
+
+        lines = ['Market Context (as of last night):', f'  {line1}']
+        if line2:
+            lines.append(f'  {line2}')
+        return '\n'.join(lines)
+    except Exception as e:
+        logging.debug(f"Could not load macro context block: {e}")
+        return ''
+
+
+def _load_weekend_context_block() -> str:
+    """Read the most recent weekend strategist entry and format it for prompts.
+
+    Reads logs/weekend_context_options.json (written Saturday by the weekend
+    strategist).  Only injected Mon–Fri before 2 PM and when the file is ≤5
+    days old — by Friday the weekend research is stale.
+    Returns '' if conditions are not met or on any error.
+    """
+    try:
+        now = datetime.now()
+        # Only valid on weekdays (Mon=0 … Fri=4) before 2 PM local time
+        if now.weekday() >= 5 or now.hour >= 14:
+            return ''
+
+        path = Path('logs/weekend_context_options.json')
+        if not path.exists():
+            return ''
+        with open(path) as f:
+            records = json.load(f)
+        if not records:
+            return ''
+        latest = records[-1]
+        ts = datetime.fromisoformat(latest['timestamp'])
+        if (now - ts).total_seconds() > 5 * 86400:
+            return ''
+
+        params      = latest.get('recommended_params', {})
+        sector_data = latest.get('sector_analysis', {})
+        iv_analysis = latest.get('iv_analysis', {})
+        earnings    = latest.get('earnings_next_7_days', [])[:5]
+
+        # Sector summary
+        top_sectors  = params.get('top_sectors', [])[:3]
+        weak_sectors = params.get('weak_sectors', [])[:2]
+        sector_parts = []
+        if top_sectors:
+            top_str = ', '.join(
+                f"{s} ({sector_data.get(s, {}).get('return_1m_pct', 0):+.1f}%)"
+                for s in top_sectors
+            )
+            sector_parts.append(f"Top sectors: {top_str}")
+        if weak_sectors:
+            weak_str = ', '.join(
+                f"{s} ({sector_data.get(s, {}).get('return_1m_pct', 0):+.1f}%)"
+                for s in weak_sectors
+            )
+            sector_parts.append(f"Avoid: {weak_str}")
+        sectors_line = ' | '.join(sector_parts)
+
+        # Congressional signals
+        cong_bull = params.get('congressional_bullish', [])[:5]
+        cong_bear = params.get('congressional_bearish', [])[:5]
+        cong_parts = []
+        if cong_bull:
+            cong_parts.append(f"bullish {', '.join(cong_bull)}")
+        if cong_bear:
+            cong_parts.append(f"bearish {', '.join(cong_bear)}")
+        cong_line = f"Congressional: {' | '.join(cong_parts)}" if cong_parts else ''
+
+        # IV elevated tickers
+        elevated = [s for s, v in iv_analysis.items() if v.get('vol_regime') == 'elevated'][:4]
+        iv_line = (f"IV regime: elevated on {', '.join(elevated)} — premium buying expensive"
+                   if elevated else '')
+
+        # Earnings this week
+        earn_parts = [f"{e['symbol']} ({e.get('earnings_in_days', '?')}d)"
+                      for e in earnings]
+        earn_line = (f"Earnings this week: {', '.join(earn_parts)} — avoid new positions day-before"
+                     if earn_parts else '')
+
+        content_lines = [l for l in [sectors_line, cong_line, iv_line, earn_line] if l]
+        if not content_lines:
+            return ''
+        lines = ['Weekend Research Context:'] + [f'  {l}' for l in content_lines]
+        return '\n'.join(lines)
+    except Exception as e:
+        logging.debug(f"Could not load weekend context block: {e}")
+        return ''
 
 
 def _write_rotation_log(sell_sym, buy_sym, sell_oid, buy_oid, outcome):
@@ -849,7 +979,25 @@ class AutonomousAgent:
             )
             alert_circuit_breaker('StockAgent', daily_pnl_pct, equity)
             return
-        
+
+        # ── Macro guard (Fix B/C) ──────────────────────────────────────────────
+        macro_events = economic_calendar.get_todays_high_impact_events()
+        halt, halt_reason = economic_calendar.should_halt_trading(macro_events)
+        if halt:
+            logging.warning(f"🛑 MACRO GUARD: {halt_reason} — halting session")
+            return
+
+        # ── Session-level context blocks (Fix D / Fix E) ─────────────────────
+        # Loaded once; reused for every symbol in the opportunity loop.
+        macro_context_block  = _load_macro_context_block()
+        weekend_context_block = _load_weekend_context_block()
+
+        # Format macro guard prompt fragment (empty when no events)
+        macro_guard_block = economic_calendar.format_macro_guard_block(
+            macro_events,
+            economic_calendar.get_earnings_today([]),  # symbols added below after discovery
+        )
+
         # Discover opportunities
         max_stocks = self.params['max_stocks_to_analyze']
         logging.info(f"🔍 Discovering top {max_stocks} opportunities...")
@@ -883,7 +1031,19 @@ class AutonomousAgent:
         if not opportunities:
             logging.warning("⚠️  No opportunities found")
             return
-        
+
+        # Refresh earnings guard now that we have the symbol list
+        opp_symbols = [
+            (opp['symbol'] if isinstance(opp, dict) else opp)
+            for opp in opportunities
+        ]
+        macro_guard_block = economic_calendar.format_macro_guard_block(
+            macro_events,
+            economic_calendar.get_earnings_today(opp_symbols),
+        )
+        if macro_guard_block:
+            logging.info(f"📅 Macro guard active:\n{macro_guard_block}")
+
         # Analyze each opportunity
         trades_executed = 0
         remaining_cash = settled - _MIN_CASH_RESERVE  # track spendable cash from settled funds only
@@ -926,7 +1086,13 @@ class AutonomousAgent:
             # Fetch recent news snippet (no-op if POLYGON_API_KEY not set)
             news_snippet = news_fetcher.format_for_prompt(symbol)
 
-            # Create AI prompt
+            # Build optional context segments (empty string = no contribution)
+            _macro_ctx = f"\n{macro_context_block}\n" if macro_context_block else ''
+            _weekend   = f"\n{weekend_context_block}" if weekend_context_block else ''
+            _guard     = f"\n{macro_guard_block}\n" if macro_guard_block else ''
+
+            # Create AI prompt (Fix D: macro context before Discovery Signals;
+            # Fix E: weekend context after news; Fix C: guard before decision line)
             prompt = f"""You are a decisive short-term stock trader. Analyze {symbol} and give a clear trading decision.
 
             Current Price: ${indicators['current_price']:.2f}
@@ -934,9 +1100,9 @@ class AutonomousAgent:
             MACD: {indicators['macd']:.2f}  (positive = bullish momentum)
             Volume Ratio: {indicators['volume_ratio']:.1f}x average  (>1.5 = elevated activity)
             Price Change (100 bars): {indicators['price_change_pct']:+.1f}%
-
-            Discovery Signals: {', '.join(self.discovery.opportunities.get(symbol, []))}{news_snippet}
-
+{_macro_ctx}
+            Discovery Signals: {', '.join(self.discovery.opportunities.get(symbol, []))}{news_snippet}{_weekend}
+{_guard}
             Make a decisive call. Only use HOLD if the indicators are genuinely mixed with no clear edge.
             Use confidence above 0.70 when signals align, below 0.60 when signals conflict.
 
