@@ -59,6 +59,16 @@ def _make_options_agent():
     overseer = MagicMock()
     overseer.is_buy_allowed.return_value = (True, '')
     agent.overseer = overseer
+    fill_result = MagicMock()
+    fill_result.filled = True
+    fill_result.slippage_bps = 0.0
+    paper_sim = MagicMock()
+    paper_sim.simulate_options_fill.side_effect = lambda side, mid_price, contracts, **_kw: (
+        setattr(fill_result, 'fill_qty', contracts) or
+        setattr(fill_result, 'fill_price', mid_price) or
+        fill_result
+    )
+    agent.paper_sim = paper_sim
     return agent
 
 
@@ -92,6 +102,16 @@ def _make_stock_agent():
     overseer = MagicMock()
     overseer.is_buy_allowed.return_value = (True, '')
     agent.overseer = overseer
+    fill_result = MagicMock()
+    fill_result.filled = True
+    fill_result.slippage_bps = 0.0
+    paper_sim = MagicMock()
+    paper_sim.simulate_stock_fill.side_effect = lambda side, price, qty, **_kw: (
+        setattr(fill_result, 'fill_qty', qty) or
+        setattr(fill_result, 'fill_price', price) or
+        fill_result
+    )
+    agent.paper_sim = paper_sim
     return agent
 
 

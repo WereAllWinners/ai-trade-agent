@@ -73,6 +73,13 @@ You are an expert financial trading advisor with knowledge from the world's best
                     "label": ex.get("label")
                 })
 
+        _SFT_EXCLUDE_LABELS = {'weak_loser', 'loser', 'strong_loser'}
+        before = len(all_examples)
+        all_examples = [ex for ex in all_examples if ex.get('label') not in _SFT_EXCLUDE_LABELS]
+        filtered = before - len(all_examples)
+        print(f"🔍 SFT label filter: removed {filtered} loser examples "
+              f"({filtered/max(before,1):.1%} of total); {len(all_examples)} remain for training")
+
         print(f"\n✅ Total formatted examples: {len(all_examples)}")
         if len(all_examples) == 0:
             raise ValueError("No valid training examples found!")

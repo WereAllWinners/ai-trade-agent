@@ -15,7 +15,7 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
 # Add scripts/ root and all subdirs to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -51,6 +51,28 @@ def _json_default(obj):
         return obj.tolist()
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
+
+def _write_rotation_log(sell_sym, buy_sym, sell_oid, buy_oid, outcome):
+    """Append a rotation event record to logs/rotation_log.jsonl."""
+    record = {
+        'timestamp': datetime.now().isoformat(),
+        'sell_symbol': sell_sym,
+        'buy_symbol':  buy_sym,
+        'sell_order_id': sell_oid,
+        'buy_order_id':  buy_oid,
+        'outcome':       outcome,
+    }
+    try:
+        os.makedirs('logs', exist_ok=True)
+        with open('logs/rotation_log.jsonl', 'a') as f:
+            f.write(json.dumps(record) + '\n')
+    except Exception as e:
+        logging.warning(f"⚠️  Could not write rotation log: {e}")
+
+
+def _settled_cash(account) -> float:
+    """Return fully settled cash (non_marginable_buying_power), excluding T+1 unsettled proceeds."""
+    return float(account.non_marginable_buying_power)
 
 
 def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) -> dict:
@@ -101,6 +123,12 @@ class AutonomousAgent:
             os.getenv('ALPACA_SECRET_KEY'),
             paper=_paper
         )
+        from utils.alpaca_retry import retry_on_rate_limit
+        for _m in ('submit_order', 'get_account', 'get_all_positions', 'get_orders', 'get_order_by_id'):
+            if hasattr(self.trading_client, _m):
+                method = getattr(self.trading_client, _m)
+                if not hasattr(method, '_mock_name'):  # skip wrapping unittest.mock stubs
+                    setattr(self.trading_client, _m, retry_on_rate_limit(method))
         self.data_client = StockHistoricalDataClient(
             os.getenv('ALPACA_API_KEY'),
             os.getenv('ALPACA_SECRET_KEY')
@@ -120,6 +148,7 @@ class AutonomousAgent:
         self.pdt_blocked = False        # Set True if PDT restriction detected
         self.fee_simulator      = FeeSimulator(paper=_paper)
         self.paper_sim          = PaperMarketSimulator(paper=_paper)
+        self._last_order_id: str | None = None
         self._paper             = _paper
 
         # Decision logging — unique ID per process run for replay correlation
@@ -453,15 +482,20 @@ class AutonomousAgent:
                 logging.warning(f"⚠️  Partial fill resulted in 0 shares for {symbol}")
                 return False
 
-            # Use a limit order at the simulated fill price.
-            # This ensures Alpaca records a realistic entry price rather than
-            # the instantaneous market price.
+            # Bracket order at the simulated fill price with broker-native
+            # stop-loss and take-profit child orders. Alpaca manages the exits
+            # automatically so we don't rely on the LLM to re-examine positions.
+            stop_price   = round(fill_price * (1 + self.params['stop_loss']), 2)
+            target_price = round(fill_price * (1 + self.params['take_profit']), 2)
             order = LimitOrderRequest(
                 symbol=symbol,
                 qty=shares,
                 side=side,
                 limit_price=round(fill_price, 2),
                 time_in_force=TimeInForce.DAY,
+                order_class=OrderClass.BRACKET,
+                stop_loss=StopLossRequest(stop_price=stop_price),
+                take_profit=TakeProfitRequest(limit_price=target_price),
             )
 
             # DRY RUN: log the order without submitting it
@@ -475,6 +509,8 @@ class AutonomousAgent:
             else:
                 submitted_order = self.trading_client.submit_order(order)
 
+            self._last_order_id = str(submitted_order.id)
+
             # Log trade
             trade_log = {
                 'timestamp': datetime.now().isoformat(),
@@ -483,7 +519,9 @@ class AutonomousAgent:
                 'shares': shares,
                 'confidence': decision['confidence'],
                 'reasoning': decision['reasoning'],
-                'order_id': str(submitted_order.id)
+                'order_id': str(submitted_order.id),
+                'bracket_stop': stop_price,
+                'bracket_take_profit': target_price,
             }
 
             with open('logs/trade_log.jsonl', 'a') as f:
@@ -599,6 +637,23 @@ class AutonomousAgent:
 
         return max(scored_positions, key=lambda p: p['weakness_score'])
 
+    def _recent_avg_win_pct(self, lookback_days: int = 30, db_path=None) -> float:
+        """Mean pnl_pct of winning trades in the last lookback_days days; fallback 0.05 if < 5 wins."""
+        _FALLBACK = 0.05
+        _MIN_WINS = 5
+        try:
+            cutoff = (datetime.now() - timedelta(days=lookback_days)).isoformat()
+            with _db.get_conn(db_path or _db.DB_PATH) as conn:
+                rows = conn.execute(
+                    "SELECT pnl_pct FROM outcomes WHERE won = 1 AND exit_timestamp > ?",
+                    [cutoff],
+                ).fetchall()
+            if len(rows) >= _MIN_WINS:
+                return float(sum(r['pnl_pct'] for r in rows) / len(rows))
+        except Exception as e:
+            logging.debug("Could not compute recent avg win pct: %s", e)
+        return _FALLBACK
+
     def _attempt_rotation(
         self,
         new_symbol:   str,
@@ -614,9 +669,8 @@ class AutonomousAgent:
         Returns True if both the sell and buy completed successfully.
         """
         # Minimum net EV required to justify a rotation (1%)
-        MIN_NET_EV        = 0.01
-        # Assumed gain if the new trade goes right / loss if the held one goes wrong
-        ASSUMED_RETURN    = 0.05
+        MIN_NET_EV     = 0.01
+        assumed_return = self._recent_avg_win_pct()
 
         try:
             positions = self.trading_client.get_all_positions()
@@ -662,18 +716,18 @@ class AutonomousAgent:
         total_fee_pct    = fee_breakdown['total_cost_pct']
 
         # Net expected value calculation
-        new_ev           = new_decision['confidence'] * ASSUMED_RETURN
-        weakest_hold_cost = (weakest['confidence'] * ASSUMED_RETURN
+        new_ev            = new_decision['confidence'] * assumed_return
+        weakest_hold_cost = (weakest['confidence'] * assumed_return
                              if weakest['decision'] == 'sell' else 0.0)
-        net_ev           = new_ev + weakest_hold_cost - total_fee_pct
+        net_ev            = new_ev + weakest_hold_cost - total_fee_pct
 
         logging.info(
             f"⚙️  Rotation eval: SELL {weakest['symbol']} "
             f"(weakness={weakest['weakness_score']:.2f}, "
             f"unrealized={weakest['unrealized_pct']:+.1%}) "
             f"→ BUY {new_symbol} | "
-            f"new_ev={new_ev:.3f}, avoided_loss={weakest_hold_cost:.3f}, "
-            f"fees={total_fee_pct:.4%}, net_ev={net_ev:.3f}"
+            f"assumed_return={assumed_return:.3f}, new_ev={new_ev:.3f}, "
+            f"avoided_loss={weakest_hold_cost:.3f}, fees={total_fee_pct:.4%}, net_ev={net_ev:.3f}"
         )
 
         if net_ev < MIN_NET_EV:
@@ -707,8 +761,34 @@ class AutonomousAgent:
             logging.warning(f"⚙️  Rotation abandoned: could not sell {weakest['symbol']}")
             return False
 
-        post_sell_cash = remaining_cash + (exit_price * exit_shares)
-        bought = self.execute_trade(new_symbol, new_decision, equity, post_sell_cash)
+        sell_order_id = self._last_order_id
+
+        # Re-fetch settled cash — sale proceeds may not be immediately reflected.
+        try:
+            fresh_account = self.trading_client.get_account()
+            settled_cash = float(fresh_account.cash)
+        except Exception as e:
+            logging.warning(f"⚙️  Could not re-fetch cash after rotation sell: {e}")
+            settled_cash = remaining_cash + (exit_price * exit_shares)
+
+        entry_cost = entry_price * entry_shares
+        if settled_cash < entry_cost:
+            logging.warning(
+                f"⚙️  Rotation buy skipped: settled cash ${settled_cash:,.2f} "
+                f"< required ${entry_cost:,.2f} — sale proceeds not yet settled"
+            )
+            _write_rotation_log(
+                weakest['symbol'], new_symbol, sell_order_id, None,
+                'buy_skipped_insufficient_cash'
+            )
+            return False
+
+        bought = self.execute_trade(new_symbol, new_decision, equity, settled_cash)
+        buy_order_id = self._last_order_id
+        _write_rotation_log(
+            weakest['symbol'], new_symbol, sell_order_id, buy_order_id,
+            'completed' if bought else 'buy_failed'
+        )
         if not bought:
             logging.warning(
                 f"⚙️  Rotation incomplete: sold {weakest['symbol']} "
@@ -732,8 +812,12 @@ class AutonomousAgent:
         # Get account info
         account = self.trading_client.get_account()
         equity = float(account.equity)
-        cash = float(account.cash)   # actual settled cash — never use buying_power (margin)
-        logging.info(f"💰 Account Equity: ${equity:,.2f} | Cash: ${cash:,.2f}")
+        cash = float(account.cash)
+        settled = _settled_cash(account)
+        logging.info(
+            f"💰 Equity: ${equity:,.2f} | Cash: ${cash:,.2f} | "
+            f"Settled: ${settled:,.2f} (T+1 pending: ${cash - settled:,.2f})"
+        )
 
         # Hard gate: refuse all buys if cash is at or below the minimum reserve
         if cash <= _MIN_CASH_RESERVE:
@@ -743,10 +827,17 @@ class AutonomousAgent:
             )
             return
 
-        # Record starting equity for circuit breaker
+        # Record starting equity for circuit breaker — restore from DB first so
+        # a daemon restart mid-day doesn't reset the baseline to current equity.
         if self.daily_start_equity is None:
-            self.daily_start_equity = equity
-            logging.info(f"📌 Daily starting equity set: ${self.daily_start_equity:,.2f}")
+            saved = _db.load_daily_start_equity('stock')
+            if saved is not None:
+                self.daily_start_equity = saved
+                logging.info(f"📌 Restored daily starting equity from DB: ${saved:,.2f}")
+            else:
+                self.daily_start_equity = equity
+                _db.save_daily_start_equity('stock', equity)
+                logging.info(f"📌 Daily starting equity set: ${self.daily_start_equity:,.2f}")
 
         # Circuit breaker: stop trading if daily loss exceeds threshold
         daily_pnl_pct = (equity - self.daily_start_equity) / self.daily_start_equity
@@ -795,7 +886,7 @@ class AutonomousAgent:
         
         # Analyze each opportunity
         trades_executed = 0
-        remaining_cash = cash - _MIN_CASH_RESERVE  # track spendable cash — reserve is never touched
+        remaining_cash = settled - _MIN_CASH_RESERVE  # track spendable cash from settled funds only
 
         for opp in opportunities:
             try:

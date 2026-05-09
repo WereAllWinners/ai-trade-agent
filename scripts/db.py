@@ -154,6 +154,25 @@ CREATE TABLE IF NOT EXISTS training_examples (
 CREATE INDEX IF NOT EXISTS idx_training_label      ON training_examples(label);
 CREATE INDEX IF NOT EXISTS idx_training_symbol     ON training_examples(symbol);
 CREATE INDEX IF NOT EXISTS idx_training_entry_date ON training_examples(entry_date);
+
+-- Daily circuit-breaker baseline: survives daemon restarts within the same trading day.
+CREATE TABLE IF NOT EXISTS daily_state (
+    trade_date          TEXT NOT NULL,
+    bot                 TEXT NOT NULL,   -- 'stock' | 'options'
+    daily_start_equity  REAL NOT NULL,
+    PRIMARY KEY (trade_date, bot)
+);
+
+CREATE TABLE IF NOT EXISTS unreconciled_orders (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    recorded_at TEXT NOT NULL,
+    bot         TEXT NOT NULL,
+    order_id    TEXT NOT NULL,
+    symbol      TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    reason      TEXT,
+    UNIQUE(order_id, reason)
+);
 """
 
 
@@ -445,6 +464,46 @@ def get_existing_prompt_hashes(db_path: Path = DB_PATH) -> set[str]:
     with get_conn(db_path) as conn:
         rows = conn.execute("SELECT prompt_hash FROM training_examples WHERE prompt_hash IS NOT NULL").fetchall()
     return {r['prompt_hash'] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Daily circuit-breaker state
+# ---------------------------------------------------------------------------
+
+def save_daily_start_equity(bot: str, equity: float, db_path: Path = DB_PATH) -> None:
+    """Persist today's opening equity so the circuit breaker survives daemon restarts."""
+    today = datetime.now().date().isoformat()
+    with get_conn(db_path) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO daily_state (trade_date, bot, daily_start_equity) VALUES (?, ?, ?)",
+            (today, bot, equity),
+        )
+
+
+def load_daily_start_equity(bot: str, db_path: Path = DB_PATH) -> float | None:
+    """Return today's saved opening equity for *bot*, or None if not yet recorded."""
+    today = datetime.now().date().isoformat()
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT daily_start_equity FROM daily_state WHERE trade_date = ? AND bot = ?",
+            (today, bot),
+        ).fetchone()
+    return float(row['daily_start_equity']) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Unreconciled order audit
+# ---------------------------------------------------------------------------
+
+def insert_unreconciled_order(rec: dict, bot: str, db_path: Path = DB_PATH) -> None:
+    """Record an order that could not be matched to a filled P&L pair."""
+    with get_conn(db_path) as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO unreconciled_orders
+               (recorded_at, bot, order_id, symbol, status, reason)
+               VALUES (:recorded_at, :bot, :order_id, :symbol, :status, :reason)""",
+            {**rec, 'bot': bot},
+        )
 
 
 if __name__ == '__main__':

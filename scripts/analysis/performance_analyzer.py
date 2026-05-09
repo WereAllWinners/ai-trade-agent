@@ -302,6 +302,21 @@ class PerformanceAnalyzer:
         else:
             print("\n⏳ No closed trade outcomes yet — outcome tracker hasn't run or no completed trades.")
 
+        try:
+            import sys as _sys
+            _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+            import db as _db
+            with _db.get_conn() as conn:
+                unreconciled = conn.execute(
+                    "SELECT COUNT(*) FROM unreconciled_orders WHERE recorded_at > ?",
+                    [(datetime.now() - timedelta(days=30)).isoformat()]
+                ).fetchone()[0]
+            if unreconciled:
+                print(f"\n⚠️  Unreconciled orders (last 30d): {unreconciled} "
+                      f"— review unreconciled_orders table for manual action")
+        except Exception:
+            pass
+
         recommendations = self.generate_recommendations()
         if recommendations:
             print("\n💡 RECOMMENDATIONS:")

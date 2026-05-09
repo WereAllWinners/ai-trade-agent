@@ -69,6 +69,7 @@ def make_account(equity='100000.00'):
     acct = MagicMock()
     acct.equity = equity
     acct.cash = equity
+    acct.non_marginable_buying_power = equity
     return acct
 
 
@@ -78,6 +79,7 @@ def make_option_position(symbol, qty, unrealized_plpc):
     pos.qty = str(qty)
     pos.unrealized_plpc = str(unrealized_plpc)
     pos.market_value = str(float(qty) * 360.0)  # arbitrary option market value
+    pos.current_price = '3.60'
     return pos
 
 
@@ -225,25 +227,31 @@ class TestPositionManagement(unittest.TestCase):
 
     def _run_manage(self, positions):
         agent, tc, _ = build_agent(positions=positions)
-        with patch('builtins.open', unittest.mock.mock_open()):
+        with patch('builtins.open', unittest.mock.mock_open()), \
+             patch.object(agent, '_fill_timeout_retry',
+                          side_effect=lambda order, *a, **kw: order):
             agent.manage_existing_positions()
         return tc
 
     def test_take_profit_closes_position(self):
         """A position with +55% gain should trigger a sell order."""
+        from alpaca.trading.requests import LimitOrderRequest
         pos = make_option_position('AAPL270319C00207000', qty=2, unrealized_plpc=0.55)
         tc = self._run_manage([pos])
         tc.submit_order.assert_called_once()
         order_arg = tc.submit_order.call_args[0][0]
         self.assertEqual(order_arg.side.value, 'sell')
+        self.assertIsInstance(order_arg, LimitOrderRequest)
 
     def test_stop_loss_closes_position(self):
         """A position with -55% loss should trigger a sell order."""
+        from alpaca.trading.requests import LimitOrderRequest
         pos = make_option_position('TSLA270319P00250000', qty=1, unrealized_plpc=-0.55)
         tc = self._run_manage([pos])
         tc.submit_order.assert_called_once()
         order_arg = tc.submit_order.call_args[0][0]
         self.assertEqual(order_arg.side.value, 'sell')
+        self.assertIsInstance(order_arg, LimitOrderRequest)
 
     def test_normal_position_not_closed(self):
         """A position within normal range (-20%) should NOT trigger a sell."""
@@ -259,11 +267,14 @@ class TestPositionManagement(unittest.TestCase):
 
     def test_both_exits_in_same_session(self):
         """Take-profit and stop-loss in same position list → two sell orders."""
+        from alpaca.trading.requests import LimitOrderRequest
         pos_tp = make_option_position('AAPL270319C00207000', qty=2, unrealized_plpc=0.55)
         pos_sl = make_option_position('TSLA270319P00250000', qty=1, unrealized_plpc=-0.55)
         pos_ok = make_option_position('MSFT270319C00380000', qty=1, unrealized_plpc=0.10)
         tc = self._run_manage([pos_tp, pos_sl, pos_ok])
         self.assertEqual(tc.submit_order.call_count, 2)
+        for call_args in tc.submit_order.call_args_list:
+            self.assertIsInstance(call_args[0][0], LimitOrderRequest)
 
 
 class TestLowConfidenceHold(unittest.TestCase):
@@ -421,10 +432,16 @@ class TestFindOptimalOption(unittest.TestCase):
 
     def test_returns_best_contract(self):
         """Should return the contract whose strike is closest to target and DTE ~30."""
+        from datetime import date, timedelta
+        # Use dates relative to today so the test never goes stale
+        today = date.today()
+        d_near  = (today + timedelta(days=10)).strftime('%Y-%m-%d')
+        d_mid   = (today + timedelta(days=32)).strftime('%Y-%m-%d')   # ~30 DTE, closer to target
+        d_far   = (today + timedelta(days=75)).strftime('%Y-%m-%d')
         contracts = [
-            make_contract('AAPL270319C00200000', '200.00', '2026-03-19'),
-            make_contract('AAPL260416C00207000', '207.00', '2026-04-16'),  # ~closer to 30 DTE
-            make_contract('AAPL260619C00215000', '215.00', '2026-06-19'),
+            make_contract('AAPL_NEAR_C00200000', '200.00', d_near),
+            make_contract('AAPL_MID_C00207000',  '207.00', d_mid),   # closest to 30 DTE + target
+            make_contract('AAPL_FAR_C00215000',  '215.00', d_far),
         ]
         self.tc.get_option_contracts.return_value = make_contracts_resp(contracts)
         from alpaca.trading.enums import ContractType

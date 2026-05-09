@@ -5,6 +5,7 @@ Options Trading Agent - Trades options contracts (puts/calls)
 import os
 import sys
 import json
+import time
 import logging
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -55,6 +56,10 @@ def _json_default(obj):
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
+def _settled_cash(account) -> float:
+    """Return fully settled cash (non_marginable_buying_power), excluding T+1 unsettled proceeds."""
+    return float(account.non_marginable_buying_power)
+
 
 def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) -> dict:
     """
@@ -104,6 +109,12 @@ class OptionsAgent:
             os.getenv('ALPACA_SECRET_KEY'),
             paper=_paper
         )
+        from utils.alpaca_retry import retry_on_rate_limit
+        for _m in ('submit_order', 'get_account', 'get_all_positions', 'get_orders', 'get_order_by_id'):
+            if hasattr(self.trading_client, _m):
+                method = getattr(self.trading_client, _m)
+                if not hasattr(method, '_mock_name'):  # skip wrapping unittest.mock stubs
+                    setattr(self.trading_client, _m, retry_on_rate_limit(method))
         self.option_data_client = OptionHistoricalDataClient(
             os.getenv('ALPACA_API_KEY'),
             os.getenv('ALPACA_SECRET_KEY')
@@ -229,6 +240,7 @@ class OptionsAgent:
             )
 
             cash = float(account.cash)
+            settled = _settled_cash(account)
 
             # Hard gate: no buys if cash is at or below the minimum reserve
             if cash <= _MIN_CASH_RESERVE:
@@ -250,12 +262,15 @@ class OptionsAgent:
             elif available < 0:
                 available = 0
 
-            # Hard cap: never exceed spendable cash (actual cash minus the reserve buffer)
-            spendable_cash = cash - _MIN_CASH_RESERVE
+            # Hard cap: never exceed settled cash (T+1 proceeds excluded) minus the reserve buffer
+            spendable_cash = settled - _MIN_CASH_RESERVE
             available = min(available, spendable_cash)
             available = max(available, 0)  # floor at zero
 
-            logging.info(f"💰 Total Equity: ${total_equity:,.2f} | Cash: ${cash:,.2f}")
+            logging.info(
+                f"💰 Total Equity: ${total_equity:,.2f} | Cash: ${cash:,.2f} | "
+                f"Settled: ${settled:,.2f} (T+1 pending: ${cash - settled:,.2f})"
+            )
             logging.info(f"💰 Options Value: ${options_value:,.2f} ({options_value/total_equity:.1%})")
             logging.info(f"💰 Available for Options: ${available:,.2f}")
 
@@ -738,6 +753,31 @@ Reasoning: <one sentence explaining the key signal>"""
             logging.warning(f"Could not check open orders for {symbol}: {e}")
             return False
 
+    def _fill_timeout_retry(self, submitted_order, position, qty: int, limit_price: float):
+        """Wait 5 minutes; cancel and resubmit at 99% of limit_price if not filled."""
+        time.sleep(300)
+        try:
+            order_status = self.trading_client.get_order_by_id(str(submitted_order.id))
+            if order_status.status.value not in ('filled', 'partially_filled'):
+                self.trading_client.cancel_order_by_id(str(submitted_order.id))
+                aggressive_price = round(limit_price * 0.99, 2)
+                retry_order = LimitOrderRequest(
+                    symbol=position.symbol,
+                    qty=qty,
+                    side=OrderSide.SELL,
+                    limit_price=aggressive_price,
+                    time_in_force=TimeInForce.DAY,
+                )
+                submitted_order = self.trading_client.submit_order(retry_order)
+                logging.info(
+                    f"🔄 Resubmitted exit at ${aggressive_price:.2f} (5-min timeout retry)"
+                )
+        except Exception as e:
+            logging.warning(
+                f"⚠️  Fill timeout check failed for {position.symbol[:20]}...: {e}"
+            )
+        return submitted_order
+
     def manage_existing_positions(self):
         """Monitor and manage existing options positions."""
         try:
@@ -812,12 +852,34 @@ Reasoning: <one sentence explaining the key signal>"""
                             f"Exiting to recover remaining value."
                         )
 
-                order = MarketOrderRequest(
-                    symbol=position.symbol,
-                    qty=int(qty),
-                    side=OrderSide.SELL,
-                    time_in_force=time_in_force
-                )
+                # Prefer a limit order at the mid-price to avoid wide-spread
+                # market-order slippage on illiquid contracts.  Fall back to
+                # market if we genuinely cannot determine a price.
+                try:
+                    limit_price = current_price if current_price is not None else (
+                        float(position.current_price) if position.current_price else 0.0
+                    )
+                except (TypeError, ValueError):
+                    limit_price = 0.0
+                if limit_price > 0:
+                    order = LimitOrderRequest(
+                        symbol=position.symbol,
+                        qty=int(qty),
+                        side=OrderSide.SELL,
+                        limit_price=round(limit_price, 2),
+                        time_in_force=time_in_force,
+                    )
+                else:
+                    logging.warning(
+                        f"⚠️  No price available for {position.symbol[:20]}...; "
+                        f"falling back to market order"
+                    )
+                    order = MarketOrderRequest(
+                        symbol=position.symbol,
+                        qty=int(qty),
+                        side=OrderSide.SELL,
+                        time_in_force=time_in_force,
+                    )
 
                 if _DRY_RUN:
                     dry_id = f"dry-run-{datetime.now().strftime('%H%M%S%f')}"
@@ -828,6 +890,13 @@ Reasoning: <one sentence explaining the key signal>"""
                     submitted_order = type('_DryOrder', (), {'id': dry_id})()
                 else:
                     submitted_order = self.trading_client.submit_order(order)
+
+                # 5-minute fill timeout for intraday (DAY) limit exits only.
+                # GTC exits must remain open until filled — no retry.
+                if not _DRY_RUN and limit_price > 0 and time_in_force == TimeInForce.DAY:
+                    submitted_order = self._fill_timeout_retry(
+                        submitted_order, position, int(qty), limit_price
+                    )
 
                 trade_log = {
                     'timestamp': datetime.now().isoformat(),
@@ -886,8 +955,14 @@ Reasoning: <one sentence explaining the key signal>"""
             account = self.trading_client.get_account()
             equity = float(account.equity)
             if self.daily_start_equity is None:
-                self.daily_start_equity = equity
-                logging.info(f"📌 Daily starting equity set: ${self.daily_start_equity:,.2f}")
+                saved = _db.load_daily_start_equity('options')
+                if saved is not None:
+                    self.daily_start_equity = saved
+                    logging.info(f"📌 Restored daily starting equity from DB: ${saved:,.2f}")
+                else:
+                    self.daily_start_equity = equity
+                    _db.save_daily_start_equity('options', equity)
+                    logging.info(f"📌 Daily starting equity set: ${self.daily_start_equity:,.2f}")
             daily_pnl_pct = (equity - self.daily_start_equity) / self.daily_start_equity
             max_loss = self.params['max_daily_loss_pct']
             if daily_pnl_pct <= -max_loss:

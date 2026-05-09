@@ -86,6 +86,15 @@ def finetune_model(training_data_path: Path) -> None:
 
     logging.info(f"📚 {len(training_data)} training examples found — starting full fine-tune")
 
+    # Build DPO preference pairs from labelled outcomes before SFT training.
+    dpo_script = _PROJECT_ROOT / 'finetune' / 'build_dpo_dataset.py'
+    if dpo_script.exists():
+        try:
+            subprocess.run([sys.executable, str(dpo_script)], timeout=120, check=True)
+            logging.info("✅ DPO pairs built")
+        except Exception as e:
+            logging.warning(f"⚠️  DPO dataset build failed (non-fatal): {e}")
+
     fine_tune_script = _PROJECT_ROOT / 'finetune' / 'fine_tune_llm.py'
     finetune_env = {**os.environ, "TRITON_PTXAS_BLACKWELL_PATH": _FINETUNE_PTXAS}
 

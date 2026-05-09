@@ -52,6 +52,7 @@ class TradingDaemon:
         self.weekend_strategist_time = datetime.strptime('11:00', '%H:%M').time()  # Sat 11:00 AM
 
         self._finetune_requested = False
+        self.trading_client = None  # set by _run_preflight; used for clock API
         signal.signal(signal.SIGUSR1, self._handle_finetune_signal)
 
         logging.info("🤖 Trading Daemon Initialized")
@@ -82,6 +83,7 @@ class TradingDaemon:
                 os.getenv('ALPACA_SECRET_KEY'),
                 paper=os.getenv('PAPER_TRADING', 'true').lower() != 'false',
             )
+            self.trading_client = client
             result = run_preflight(client, require_options=False)
             if not result.ok:
                 for issue in result.issues:
@@ -99,38 +101,42 @@ class TradingDaemon:
         self._finetune_requested = True
 
     def is_market_open(self):
-        """Check if market is currently open."""
-        now = datetime.now(self.est)
-
-        # Check if weekend
-        if now.weekday() >= 5:
-            return False
-
-        current_time = now.time()
-        return self.market_open <= current_time <= self.market_close
+        """Check if market is currently open, using the Alpaca clock API when available."""
+        try:
+            clock = self.trading_client.get_clock()
+            return clock.is_open
+        except Exception as e:
+            logging.warning(f"⚠️  Clock API unavailable, falling back to time-based check: {e}")
+            now = datetime.now(self.est)
+            if now.weekday() >= 5:
+                return False
+            return self.market_open <= now.time() <= self.market_close
 
     def get_next_market_open(self):
-        """Get next market open time."""
-        now = datetime.now(self.est)
-        
-        # If weekend, next Monday
-        if now.weekday() >= 5:
-            days_ahead = 7 - now.weekday()
-            next_open = now + timedelta(days=days_ahead)
-            next_open = next_open.replace(hour=9, minute=30, second=0, microsecond=0)
-        # If before market open today
-        elif now.time() < self.market_open:
-            next_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
-        # If after market close, next day
-        else:
-            next_open = now + timedelta(days=1)
-            next_open = next_open.replace(hour=9, minute=30, second=0, microsecond=0)
-            # Skip weekend
-            if next_open.weekday() >= 5:
-                days_ahead = 7 - next_open.weekday()
-                next_open = next_open + timedelta(days=days_ahead)
-        
-        return next_open
+        """Return the next market open time, using the Alpaca clock API when available."""
+        try:
+            clock = self.trading_client.get_clock()
+            return clock.next_open.astimezone(self.est)
+        except Exception as e:
+            logging.warning(f"⚠️  Clock API unavailable, falling back to time-based calculation: {e}")
+            now = datetime.now(self.est)
+            # If weekend, next Monday
+            if now.weekday() >= 5:
+                days_ahead = 7 - now.weekday()
+                next_open = now + timedelta(days=days_ahead)
+                next_open = next_open.replace(hour=9, minute=30, second=0, microsecond=0)
+            # If before market open today
+            elif now.time() < self.market_open:
+                next_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+            # If after market close, next day
+            else:
+                next_open = now + timedelta(days=1)
+                next_open = next_open.replace(hour=9, minute=30, second=0, microsecond=0)
+                # Skip weekend
+                if next_open.weekday() >= 5:
+                    days_ahead = 7 - next_open.weekday()
+                    next_open = next_open + timedelta(days=days_ahead)
+            return next_open
     
     def run_trading_session(self):
         """Run stock trading session."""
@@ -286,10 +292,23 @@ class TradingDaemon:
         except Exception as e:
             logging.warning(f"⚠️  Online training failed: {e}")
 
+    def run_dpo_builder(self):
+        """Build DPO preference pairs from this session's labelled outcomes."""
+        dpo_script = _SCRIPTS_DIR.parent / 'finetune' / 'build_dpo_dataset.py'
+        try:
+            result = subprocess.run([sys.executable, str(dpo_script)], timeout=120)
+            if result.returncode == 0:
+                logging.info("✅ DPO pairs built")
+            else:
+                logging.warning(f"⚠️  DPO dataset build returned code {result.returncode}")
+        except Exception as e:
+            logging.warning(f"⚠️  DPO dataset build failed (non-fatal): {e}")
+
     def run_finetuning(self):
         """Run market research, build training data, then full fine-tune."""
         self.run_market_research()
         self.run_training_data_builder()
+        self.run_dpo_builder()
         # Free GPU VRAM by unloading the inference model before the training job
         # loads a 32B base model.  The backend will auto-reload on the next inference call.
         inference_client.stop_for_finetuning()

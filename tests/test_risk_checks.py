@@ -58,6 +58,17 @@ class TestAutonomousAgentRisk:
             overseer = MagicMock()
             overseer.is_buy_allowed.return_value = (True, '')
             agent.overseer = overseer
+            # Mock paper market simulator — fill at current_price with no slippage
+            fill_result = MagicMock()
+            fill_result.filled = True
+            fill_result.slippage_bps = 0.0
+            paper_sim = MagicMock()
+            paper_sim.simulate_stock_fill.side_effect = lambda side, price, qty, **_kw: (
+                setattr(fill_result, 'fill_qty', qty) or
+                setattr(fill_result, 'fill_price', price) or
+                fill_result
+            )
+            agent.paper_sim = paper_sim
             return agent
 
     def test_circuit_breaker_triggers_on_5pct_loss(self):
@@ -102,8 +113,8 @@ class TestAutonomousAgentRisk:
         assert result is False
         agent.trading_client.submit_order.assert_not_called()
 
-    def test_market_order_submitted_for_buy(self):
-        """execute_trade should submit a market order for BUY (no bracket orders)."""
+    def test_bracket_order_submitted_for_buy(self):
+        """execute_trade should submit a bracket limit order with stop-loss and take-profit."""
         agent = self._make_agent()
         mock_order = MagicMock()
         mock_order.id = 'order-123'
@@ -127,10 +138,18 @@ class TestAutonomousAgentRisk:
             result = agent.execute_trade('AAPL', decision, 100_000.0, 9_500.0)
 
         assert result is True
-        # Simple market order — no bracket orders (they cause "insufficient qty" errors)
         call_args = agent.trading_client.submit_order.call_args[0][0]
-        from alpaca.trading.requests import MarketOrderRequest
-        assert isinstance(call_args, MarketOrderRequest)
+        from alpaca.trading.requests import LimitOrderRequest
+        from alpaca.trading.enums import OrderClass
+        assert isinstance(call_args, LimitOrderRequest)
+        assert call_args.order_class == OrderClass.BRACKET
+        # params: stop_loss=-0.07, take_profit=0.15; fill price ≈ current_price=100.0
+        # Exact fill comes from PaperMarketSimulator which may add slippage, so
+        # just verify the child orders are present and have the right direction.
+        assert call_args.stop_loss is not None
+        assert call_args.take_profit is not None
+        assert call_args.stop_loss.stop_price < call_args.limit_price
+        assert call_args.take_profit.limit_price > call_args.limit_price
 
     def test_buy_uses_spendable_cash_for_sizing(self):
         """Shares must be sized from (live_cash - _MIN_CASH_RESERVE), not full cash."""
@@ -290,3 +309,442 @@ class TestBacktesterMetrics:
         # profit_factor = 150 / 70 ≈ 2.14
         assert metrics['profit_factor'] > 2.0
         assert metrics['profit_factor'] < 2.5
+
+
+# ---------------------------------------------------------------------------
+# Fix 5 — Rotation settled-cash guard
+# ---------------------------------------------------------------------------
+
+class TestRotationCashGuard:
+    """_attempt_rotation() must re-fetch settled cash and skip the buy when insufficient."""
+
+    def _make_rotation_agent(self):
+        """Minimal AutonomousAgent wired for rotation tests."""
+        with patch('autonomous_agent.TradingClient'), \
+             patch('autonomous_agent.StockHistoricalDataClient'), \
+             patch('autonomous_agent.StockDiscovery'), \
+             patch('autonomous_agent.load_dotenv'), \
+             patch('autonomous_agent.load_model_once'), \
+             patch('autonomous_agent.PortfolioOverseer'), \
+             patch('autonomous_agent.AllocationController'):
+            from autonomous_agent import AutonomousAgent
+            agent = AutonomousAgent.__new__(AutonomousAgent)
+
+        agent.params = {
+            'max_position_size': 0.05,
+            'stop_loss': -0.07,
+            'take_profit': 0.15,
+            'max_daily_loss_pct': 0.05,
+            'max_daily_trades': 10,
+            'cooldown_minutes': 15,
+            'min_confidence': 0.60,
+            'max_stocks_to_analyze': 25,
+        }
+        agent.daily_trades = 0
+        agent.daily_start_equity = None
+        agent.cooldowns = {}
+        agent.pdt_blocked = False
+        agent._last_order_id = None
+        from datetime import datetime
+        agent.last_reset_date = datetime.now().date()
+        agent.trading_client = MagicMock()
+
+        fee_breakdown = {'total_cost_pct': 0.001, 'total_cost': 0.15}
+        agent.fee_simulator = MagicMock()
+        agent.fee_simulator.estimate_round_trip_cost.return_value = fee_breakdown
+
+        fill_result = MagicMock()
+        fill_result.filled = True
+        fill_result.slippage_bps = 0.0
+        paper_sim = MagicMock()
+        paper_sim.simulate_stock_fill.side_effect = lambda side, price, qty, **_kw: (
+            setattr(fill_result, 'fill_qty', qty) or
+            setattr(fill_result, 'fill_price', price) or
+            fill_result
+        )
+        agent.paper_sim = paper_sim
+        return agent
+
+    def _run_rotation(self, agent, settled_cash_str):
+        """Set up scoring mocks and invoke _attempt_rotation with given settled cash."""
+        from autonomous_agent import AutonomousAgent
+
+        weakest = {
+            'symbol':        'AAPL',
+            'current_price': 150.0,
+            'qty':           10,
+            'confidence':    0.30,
+            'decision':      'sell',
+            'weakness_score': 0.5,
+            'unrealized_pct': -0.05,
+        }
+        new_decision = {
+            'decision':      'buy',
+            'confidence':    0.90,
+            'current_price': 200.0,
+            'stop_loss':     -0.07,
+            'take_profit':   0.15,
+            'reasoning':     'test rotation',
+        }
+
+        mock_pos = MagicMock()
+        mock_pos.symbol = 'AAPL'
+        agent.trading_client.get_all_positions.return_value = [mock_pos]
+
+        fresh_account = MagicMock()
+        fresh_account.cash = settled_cash_str
+
+        def get_account_side_effect():
+            return fresh_account
+
+        agent.trading_client.get_account.side_effect = get_account_side_effect
+
+        def sell_side_effect(symbol, decision, equity, cash):
+            agent._last_order_id = 'sell-order-1'
+            return True
+
+        with patch.object(agent, '_score_position', return_value=weakest), \
+             patch.object(agent, '_find_weakest_position', return_value=weakest), \
+             patch.object(agent, 'check_cooldown', return_value=False), \
+             patch.object(agent, 'execute_trade', side_effect=sell_side_effect) as mock_et, \
+             patch('autonomous_agent._write_rotation_log'), \
+             patch('autonomous_agent._DRY_RUN', False):
+            result = AutonomousAgent._attempt_rotation(
+                agent, 'TSLA', new_decision, 1000.0, 100_000.0
+            )
+        return result, mock_et
+
+    def test_rotation_buy_skipped_when_settled_cash_insufficient(self):
+        """
+        After sell succeeds, if re-fetched settled cash < entry_cost,
+        the buy must not be executed and _attempt_rotation returns False.
+        """
+        agent = self._make_rotation_agent()
+        # entry_cost = 200 * max(int(1500/200), 1) = 200 * 7 = 1400
+        # settled_cash = 1000 < 1400 → buy skipped
+        result, mock_et = self._run_rotation(agent, '1000.00')
+
+        assert result is False
+        assert mock_et.call_count == 1  # only the sell, no buy
+
+    def test_rotation_buy_proceeds_when_settled_cash_sufficient(self):
+        """
+        After sell succeeds, if settled cash covers entry_cost, the buy executes.
+        """
+        agent = self._make_rotation_agent()
+
+        # Need buy to succeed too — patch execute_trade with two side effects
+        from autonomous_agent import AutonomousAgent
+
+        weakest = {
+            'symbol':        'AAPL',
+            'current_price': 150.0,
+            'qty':           10,
+            'confidence':    0.30,
+            'decision':      'sell',
+            'weakness_score': 0.5,
+            'unrealized_pct': -0.05,
+        }
+        new_decision = {
+            'decision':      'buy',
+            'confidence':    0.90,
+            'current_price': 200.0,
+            'stop_loss':     -0.07,
+            'take_profit':   0.15,
+            'reasoning':     'test rotation',
+        }
+
+        mock_pos = MagicMock()
+        mock_pos.symbol = 'AAPL'
+        agent.trading_client.get_all_positions.return_value = [mock_pos]
+
+        fresh_account = MagicMock()
+        fresh_account.cash = '5000.00'  # more than entry_cost (1400)
+        agent.trading_client.get_account.side_effect = lambda: fresh_account
+
+        call_count = [0]
+
+        def et_side_effect(symbol, decision, equity, cash):
+            call_count[0] += 1
+            agent._last_order_id = f'order-{call_count[0]}'
+            return True
+
+        with patch.object(agent, '_score_position', return_value=weakest), \
+             patch.object(agent, '_find_weakest_position', return_value=weakest), \
+             patch.object(agent, 'check_cooldown', return_value=False), \
+             patch.object(agent, 'execute_trade', side_effect=et_side_effect) as mock_et, \
+             patch('autonomous_agent._write_rotation_log'), \
+             patch('autonomous_agent._DRY_RUN', False):
+            result = AutonomousAgent._attempt_rotation(
+                agent, 'TSLA', new_decision, 1000.0, 100_000.0
+            )
+
+        assert result is True
+        assert mock_et.call_count == 2  # sell + buy
+
+
+# ---------------------------------------------------------------------------
+# Fix 8: TestSettledCash — remaining_cash must come from non_marginable_buying_power
+# ---------------------------------------------------------------------------
+
+class TestSettledCash:
+    """_settled_cash() and run_trading_session() must use non_marginable_buying_power for trading budget."""
+
+    def _make_agent(self):
+        with patch('autonomous_agent.TradingClient'), \
+             patch('autonomous_agent.StockHistoricalDataClient'), \
+             patch('autonomous_agent.StockDiscovery'), \
+             patch('autonomous_agent.load_dotenv'), \
+             patch('autonomous_agent.load_model_once'), \
+             patch('autonomous_agent.PortfolioOverseer'), \
+             patch('autonomous_agent.AllocationController'):
+            from autonomous_agent import AutonomousAgent
+            agent = AutonomousAgent.__new__(AutonomousAgent)
+        agent.params = {
+            'max_position_size': 0.05,
+            'stop_loss': -0.07,
+            'take_profit': 0.15,
+            'max_daily_loss_pct': 0.05,
+            'max_daily_trades': 10,
+            'cooldown_minutes': 15,
+            'min_confidence': 0.60,
+            'max_stocks_to_analyze': 25,
+        }
+        agent.daily_trades = 0
+        agent.daily_start_equity = 50_000.0
+        agent.cooldowns = {}
+        agent.pdt_blocked = False
+        from datetime import datetime
+        agent.last_reset_date = datetime.now().date()
+        agent.trading_client = MagicMock()
+        alloc_ctrl = MagicMock()
+        alloc_ctrl.get_position_size_pct.return_value = 0.05
+        agent.alloc_controller = alloc_ctrl
+        overseer = MagicMock()
+        overseer.is_buy_allowed.return_value = (True, '')
+        agent.overseer = overseer
+        fill_result = MagicMock()
+        fill_result.filled = True
+        fill_result.slippage_bps = 0.0
+        paper_sim = MagicMock()
+        paper_sim.simulate_stock_fill.side_effect = lambda side, price, qty, **_kw: (
+            setattr(fill_result, 'fill_qty', qty) or
+            setattr(fill_result, 'fill_price', price) or
+            fill_result
+        )
+        agent.paper_sim = paper_sim
+        return agent
+
+    def test_settled_cash_helper(self):
+        """_settled_cash() should cast non_marginable_buying_power to float."""
+        from autonomous_agent import _settled_cash
+        acct = MagicMock()
+        acct.non_marginable_buying_power = '1234.56'
+        assert _settled_cash(acct) == 1234.56
+
+    def test_remaining_cash_uses_non_marginable_buying_power(self):
+        """run_trading_session should pass settled cash (not total cash) to execute_trade."""
+        agent = self._make_agent()
+
+        mock_account = MagicMock()
+        mock_account.equity = '50000'
+        mock_account.cash = '2000'
+        mock_account.non_marginable_buying_power = '800'
+        agent.trading_client.get_account.return_value = mock_account
+
+        discovery = MagicMock()
+        discovery.discover_opportunities.return_value = [{'symbol': 'TSLA', 'signals': []}]
+        discovery.opportunities = {'TSLA': []}
+        agent.discovery = discovery
+
+        indicators = {
+            'current_price': 100.0, 'rsi': 50.0, 'macd': 0.1,
+            'volume_ratio': 1.2, 'price_change_pct': 1.0,
+        }
+        captured = {}
+
+        def fake_execute(symbol, decision, equity, available_cash):
+            captured['available_cash'] = available_cash
+            return False
+
+        import autonomous_agent as aa
+        with patch.object(agent, 'check_cooldown', return_value=False), \
+             patch.object(agent, 'get_market_data', return_value=MagicMock()), \
+             patch.object(agent, 'calculate_indicators', return_value=indicators), \
+             patch.object(agent, 'execute_trade', side_effect=fake_execute), \
+             patch.object(agent, '_log_decision', return_value=None), \
+             patch.object(aa, 'get_trading_decision', return_value=''), \
+             patch.object(aa, 'parse_decision', return_value={
+                 'decision': 'buy', 'confidence': 0.80,
+                 'reasoning': 'test', 'current_price': 100.0,
+             }), \
+             patch.object(aa, 'news_fetcher'), \
+             patch.object(aa, '_db') as mock_db:
+            mock_db.load_daily_start_equity.return_value = 50_000.0
+            from autonomous_agent import AutonomousAgent
+            AutonomousAgent.run_trading_session(agent)
+
+        from autonomous_agent import _MIN_CASH_RESERVE
+        assert captured.get('available_cash') == 800.0 - _MIN_CASH_RESERVE
+
+
+# ---------------------------------------------------------------------------
+# Fix 10: TestDynamicAssumedReturn — rotation EV uses live win-rate, not 0.05
+# ---------------------------------------------------------------------------
+
+import pytest
+
+@pytest.fixture()
+def db_path(tmp_path):
+    import db as _db
+    p = tmp_path / 'test_trading.db'
+    _db.init_db(p)
+    return p
+
+
+class TestDynamicAssumedReturn:
+    """_recent_avg_win_pct() should query real outcomes; _attempt_rotation uses the result."""
+
+    def _make_rotation_agent(self):
+        with patch('autonomous_agent.TradingClient'), \
+             patch('autonomous_agent.StockHistoricalDataClient'), \
+             patch('autonomous_agent.StockDiscovery'), \
+             patch('autonomous_agent.load_dotenv'), \
+             patch('autonomous_agent.load_model_once'), \
+             patch('autonomous_agent.PortfolioOverseer'), \
+             patch('autonomous_agent.AllocationController'):
+            from autonomous_agent import AutonomousAgent
+            agent = AutonomousAgent.__new__(AutonomousAgent)
+        agent.params = {
+            'max_position_size': 0.05,
+            'stop_loss': -0.07,
+            'take_profit': 0.15,
+            'max_daily_loss_pct': 0.05,
+            'max_daily_trades': 10,
+            'cooldown_minutes': 15,
+            'min_confidence': 0.60,
+            'max_stocks_to_analyze': 25,
+        }
+        agent.daily_trades = 0
+        agent.daily_start_equity = None
+        agent.cooldowns = {}
+        agent.pdt_blocked = False
+        agent._last_order_id = None
+        from datetime import datetime
+        agent.last_reset_date = datetime.now().date()
+        agent.trading_client = MagicMock()
+        fee_breakdown = {'total_cost_pct': 0.001, 'total_cost': 0.15}
+        agent.fee_simulator = MagicMock()
+        agent.fee_simulator.estimate_round_trip_cost.return_value = fee_breakdown
+        fill_result = MagicMock()
+        fill_result.filled = True
+        fill_result.slippage_bps = 0.0
+        paper_sim = MagicMock()
+        paper_sim.simulate_stock_fill.side_effect = lambda side, price, qty, **_kw: (
+            setattr(fill_result, 'fill_qty', qty) or
+            setattr(fill_result, 'fill_price', price) or fill_result
+        )
+        agent.paper_sim = paper_sim
+        return agent
+
+    def test_recent_avg_win_pct_returns_mean_of_wins(self, db_path):
+        """Returns mean pnl_pct of winning trades when 5+ wins exist."""
+        import db as _db
+        from datetime import datetime, timedelta
+
+        base = datetime.now() - timedelta(days=1)
+        pnl_values = [0.10, 0.08, 0.12, 0.09, 0.11, 0.07]
+        for i, pnl in enumerate(pnl_values):
+            _db.insert_outcome({
+                'symbol': f'TICK{i}',
+                'buy_order_id': f'buy-{i}',
+                'sell_order_id': f'sell-{i}',
+                'entry_timestamp': (base - timedelta(hours=2)).isoformat(),
+                'exit_timestamp': base.isoformat(),
+                'entry_price': 100.0,
+                'exit_price': 100.0 * (1 + pnl),
+                'shares': 10,
+                'realized_pnl': round(100.0 * pnl * 10, 2),
+                'pnl_pct': pnl,
+                'hold_hours': 2.0,
+                'entry_confidence': 0.80,
+                'entry_reasoning': 'test',
+                'won': True,
+            }, db_path=db_path)
+
+        agent = self._make_rotation_agent()
+        result = agent._recent_avg_win_pct(lookback_days=30, db_path=db_path)
+        expected = sum(pnl_values) / len(pnl_values)
+        assert abs(result - expected) < 1e-9
+
+    def test_recent_avg_win_pct_falls_back_when_fewer_than_5_wins(self, db_path):
+        """Returns 0.05 fallback when fewer than 5 wins are in the window."""
+        import db as _db
+        from datetime import datetime, timedelta
+
+        base = datetime.now() - timedelta(days=1)
+        for i in range(3):
+            _db.insert_outcome({
+                'symbol': f'WIN{i}',
+                'buy_order_id': f'buy-{i}',
+                'sell_order_id': f'sell-{i}',
+                'entry_timestamp': (base - timedelta(hours=2)).isoformat(),
+                'exit_timestamp': base.isoformat(),
+                'entry_price': 100.0,
+                'exit_price': 110.0,
+                'shares': 10,
+                'realized_pnl': 100.0,
+                'pnl_pct': 0.10,
+                'hold_hours': 2.0,
+                'entry_confidence': 0.80,
+                'entry_reasoning': 'test',
+                'won': True,
+            }, db_path=db_path)
+
+        agent = self._make_rotation_agent()
+        result = agent._recent_avg_win_pct(lookback_days=30, db_path=db_path)
+        assert result == 0.05
+
+    def test_rotation_uses_dynamic_assumed_return(self):
+        """_attempt_rotation log line must contain the dynamic assumed_return value."""
+        agent = self._make_rotation_agent()
+
+        weakest = {
+            'symbol': 'AAPL', 'current_price': 150.0, 'qty': 10,
+            'confidence': 0.30, 'decision': 'sell',
+            'weakness_score': 0.5, 'unrealized_pct': -0.05,
+        }
+        new_decision = {
+            'decision': 'buy', 'confidence': 0.90, 'current_price': 200.0,
+            'stop_loss': -0.07, 'take_profit': 0.15, 'reasoning': 'test',
+        }
+
+        mock_pos = MagicMock()
+        mock_pos.symbol = 'AAPL'
+        agent.trading_client.get_all_positions.return_value = [mock_pos]
+
+        fresh_account = MagicMock()
+        fresh_account.cash = '5000.00'
+        agent.trading_client.get_account.side_effect = lambda: fresh_account
+
+        call_count = [0]
+
+        def et_side_effect(symbol, decision, equity, cash):
+            call_count[0] += 1
+            agent._last_order_id = f'order-{call_count[0]}'
+            return True
+
+        with patch.object(agent, '_recent_avg_win_pct', return_value=0.10) as mock_win_pct, \
+             patch.object(agent, '_score_position', return_value=weakest), \
+             patch.object(agent, '_find_weakest_position', return_value=weakest), \
+             patch.object(agent, 'check_cooldown', return_value=False), \
+             patch.object(agent, 'execute_trade', side_effect=et_side_effect), \
+             patch('autonomous_agent._write_rotation_log'), \
+             patch('autonomous_agent._DRY_RUN', False), \
+             patch('autonomous_agent.logging') as mock_log:
+            from autonomous_agent import AutonomousAgent
+            AutonomousAgent._attempt_rotation(agent, 'TSLA', new_decision, 1000.0, 100_000.0)
+
+        mock_win_pct.assert_called_once()
+        log_calls = [str(c) for c in mock_log.info.call_args_list]
+        assert any('assumed_return=0.100' in s for s in log_calls)

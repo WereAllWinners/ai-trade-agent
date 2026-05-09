@@ -79,6 +79,16 @@ def _make_options_agent(tmp_db=None):
     overseer = MagicMock()
     overseer.is_buy_allowed.return_value = (True, '')
     agent.overseer = overseer
+    fill_result = MagicMock()
+    fill_result.filled = True
+    fill_result.slippage_bps = 0.0
+    paper_sim = MagicMock()
+    paper_sim.simulate_options_fill.side_effect = lambda side, mid_price, contracts, **_kw: (
+        setattr(fill_result, 'fill_qty', contracts) or
+        setattr(fill_result, 'fill_price', mid_price) or
+        fill_result
+    )
+    agent.paper_sim = paper_sim
     return agent
 
 
@@ -121,6 +131,16 @@ def _make_stock_agent():
     overseer = MagicMock()
     overseer.is_buy_allowed.return_value = (True, '')
     agent.overseer = overseer
+    fill_result = MagicMock()
+    fill_result.filled = True
+    fill_result.slippage_bps = 0.0
+    paper_sim = MagicMock()
+    paper_sim.simulate_stock_fill.side_effect = lambda side, price, qty, **_kw: (
+        setattr(fill_result, 'fill_qty', qty) or
+        setattr(fill_result, 'fill_price', price) or
+        fill_result
+    )
+    agent.paper_sim = paper_sim
     return agent
 
 
@@ -365,6 +385,7 @@ class TestNearZeroOptionExit:
         with patch.object(agent, 'parse_dte_from_symbol', return_value=1), \
              patch.object(agent, '_has_open_exit_order', return_value=False), \
              patch.object(agent, 'get_option_price', return_value=0.10), \
+             patch.object(agent, '_fill_timeout_retry', return_value=mock_order), \
              patch.object(oa, '_DRY_RUN', False), \
              patch.object(oa, '_MIN_EXIT_VALUE_USD', 10.0), \
              patch('builtins.open', MagicMock()), \

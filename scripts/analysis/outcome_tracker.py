@@ -30,6 +30,8 @@ logging.basicConfig(
 
 
 class OutcomeTracker:
+    _bot_name = 'stock'
+
     def __init__(self, paper=None):
         if paper is None:
             paper = os.getenv('PAPER_TRADING', 'true').lower() != 'false'
@@ -91,17 +93,24 @@ class OutcomeTracker:
     # Alpaca data fetching
     # ------------------------------------------------------------------
 
-    def get_fill_price(self, order_id):
-        """Fetch average fill price for an order from Alpaca."""
+    def get_order_status(self, order_id) -> dict:
+        """Return status, filled_qty, and avg_price for an order."""
         if not order_id:
-            return None
+            return {'status': 'unknown', 'filled_qty': 0, 'avg_price': None}
         try:
             order = self.trading_client.get_order_by_id(order_id)
-            if order.filled_avg_price:
-                return float(order.filled_avg_price)
+            return {
+                'status':     order.status.value if hasattr(order.status, 'value') else str(order.status),
+                'filled_qty': float(order.filled_qty) if order.filled_qty else 0,
+                'avg_price':  float(order.filled_avg_price) if order.filled_avg_price else None,
+            }
         except Exception as e:
-            logging.debug("Could not fetch fill for order %s: %s", order_id, e)
-        return None
+            logging.debug("Could not fetch order status for %s: %s", order_id, e)
+            return {'status': 'unknown', 'filled_qty': 0, 'avg_price': None}
+
+    def get_fill_price(self, order_id):
+        """Thin wrapper kept for backwards compatibility."""
+        return self.get_order_status(order_id)['avg_price']
 
     # ------------------------------------------------------------------
     # Pair matching and P&L calculation
@@ -140,10 +149,23 @@ class OutcomeTracker:
                     exit_price = exit_fill
 
                     if not entry_price or not exit_price:
-                        logging.debug(
-                            "Missing fill price for %s pair (entry=%s, exit=%s) — skipping P&L",
-                            symbol, entry_price, exit_price
+                        missing_side = 'missing_entry_fill' if not entry_price else 'missing_exit_fill'
+                        missing_oid = entry.get('order_id') if not entry_price else trade.get('order_id')
+                        oid_status = self.get_order_status(missing_oid)
+                        logging.warning(
+                            "⚠️  Unreconciled order %s for %s — status=%s reason=%s",
+                            missing_oid, symbol, oid_status['status'], missing_side
                         )
+                        try:
+                            _db.insert_unreconciled_order({
+                                'recorded_at': datetime.now().isoformat(),
+                                'order_id':    missing_oid or '',
+                                'symbol':      symbol,
+                                'status':      oid_status['status'],
+                                'reason':      missing_side,
+                            }, bot=self._bot_name)
+                        except Exception as db_err:
+                            logging.debug("Could not write unreconciled order: %s", db_err)
                         continue
 
                     shares = min(

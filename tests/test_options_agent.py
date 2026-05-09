@@ -19,6 +19,7 @@ from datetime import datetime, date, timedelta
 from unittest.mock import MagicMock, patch, call
 
 import pytest
+from alpaca.trading.requests import LimitOrderRequest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
 
@@ -68,6 +69,7 @@ def _make_position(symbol, unrealized_plpc='-0.10', qty='2'):
     pos.symbol          = symbol
     pos.unrealized_plpc = unrealized_plpc
     pos.qty             = qty
+    pos.current_price   = '1.50'
     return pos
 
 
@@ -210,6 +212,8 @@ class TestManageExistingPositionsDTE:
             agent.manage_existing_positions()
 
         agent.trading_client.submit_order.assert_called_once()
+        submitted = agent.trading_client.submit_order.call_args[0][0]
+        assert isinstance(submitted, LimitOrderRequest)
 
     def test_dte_exit_fires_below_threshold(self):
         """DTE=0 (expiration day) must also trigger exit."""
@@ -256,6 +260,24 @@ class TestManageExistingPositionsDTE:
 
         submitted = agent.trading_client.submit_order.call_args[0][0]
         assert submitted.time_in_force == TimeInForce.GTC
+        assert isinstance(submitted, LimitOrderRequest)
+
+    def test_dte_exit_skips_timeout_retry(self):
+        """_fill_timeout_retry must NOT be called for DTE (GTC) exits."""
+        agent = _make_agent()
+        pos = _make_position('SPY250328P00560000', unrealized_plpc='-0.10')
+        agent.trading_client.get_all_positions.return_value = [pos]
+        agent.trading_client.get_orders.return_value = []
+        mock_order = MagicMock(); mock_order.id = 'gtc-no-retry'
+        agent.trading_client.submit_order.return_value = mock_order
+
+        with patch.object(agent, 'parse_dte_from_symbol', return_value=2), \
+             patch.object(agent, '_fill_timeout_retry') as mock_retry, \
+             patch('options_agent.alert_trade_executed'), \
+             patch('builtins.open', MagicMock()):
+            agent.manage_existing_positions()
+
+        mock_retry.assert_not_called()
 
     def test_pl_stop_loss_still_uses_day(self):
         """Stop-loss exits (not DTE) must keep DAY time-in-force."""
@@ -269,12 +291,14 @@ class TestManageExistingPositionsDTE:
         agent.trading_client.submit_order.return_value = mock_order
 
         with patch.object(agent, 'parse_dte_from_symbol', return_value=30), \
+             patch.object(agent, '_fill_timeout_retry', return_value=mock_order), \
              patch('options_agent.alert_trade_executed'), \
              patch('builtins.open', MagicMock()):
             agent.manage_existing_positions()
 
         submitted = agent.trading_client.submit_order.call_args[0][0]
         assert submitted.time_in_force == TimeInForce.DAY
+        assert isinstance(submitted, LimitOrderRequest)
 
     def test_pl_take_profit_uses_day(self):
         """Take-profit exits must keep DAY time-in-force."""
@@ -287,12 +311,14 @@ class TestManageExistingPositionsDTE:
         agent.trading_client.submit_order.return_value = mock_order
 
         with patch.object(agent, 'parse_dte_from_symbol', return_value=30), \
+             patch.object(agent, '_fill_timeout_retry', return_value=mock_order), \
              patch('options_agent.alert_trade_executed'), \
              patch('builtins.open', MagicMock()):
             agent.manage_existing_positions()
 
         submitted = agent.trading_client.submit_order.call_args[0][0]
         assert submitted.time_in_force == TimeInForce.DAY
+        assert isinstance(submitted, LimitOrderRequest)
 
     def test_pl_exit_takes_priority_over_dte(self):
         """When both P&L and DTE thresholds are met, P&L reason is logged (fires first)."""
@@ -313,6 +339,7 @@ class TestManageExistingPositionsDTE:
             return original_dumps(data, **kw)
 
         with patch.object(agent, 'parse_dte_from_symbol', return_value=1), \
+             patch.object(agent, '_fill_timeout_retry', return_value=mock_order), \
              patch('options_agent.alert_trade_executed'), \
              patch('json.dumps', side_effect=capture_log), \
              patch('builtins.open', MagicMock()):
@@ -367,6 +394,7 @@ class TestDuplicateExitGuard:
         agent.trading_client.submit_order.return_value = mock_order
 
         with patch.object(agent, 'parse_dte_from_symbol', return_value=30), \
+             patch.object(agent, '_fill_timeout_retry', return_value=mock_order), \
              patch('options_agent.alert_trade_executed'), \
              patch('builtins.open', MagicMock()):
             agent.manage_existing_positions()
@@ -470,6 +498,7 @@ class TestAlertOnExit:
         agent.trading_client.submit_order.return_value = mock_order
 
         with patch.object(agent, 'parse_dte_from_symbol', return_value=30), \
+             patch.object(agent, '_fill_timeout_retry', return_value=mock_order), \
              patch('options_agent.alert_trade_executed') as mock_alert, \
              patch('builtins.open', MagicMock()):
             agent.manage_existing_positions()
@@ -582,6 +611,7 @@ class TestNearZeroValueWarning:
 
         with patch.object(agent, 'parse_dte_from_symbol', return_value=30), \
              patch.object(agent, 'get_option_price', return_value=0.01), \
+             patch.object(agent, '_fill_timeout_retry', return_value=mock_order), \
              patch('options_agent.alert_trade_executed'), \
              patch('builtins.open', MagicMock()), \
              patch('options_agent.logging') as mock_log:
@@ -651,3 +681,66 @@ class TestResearchParamOverride:
             agent.run_options_session()
 
         assert applied_threshold == [2]
+
+
+# ===========================================================================
+# 9. Fix 4 — _fill_timeout_retry retry behavior
+# ===========================================================================
+
+class TestFillTimeoutRetry:
+
+    def test_pl_exit_retries_at_aggressive_price(self):
+        """
+        When a DAY limit exit is not filled after 5 minutes, _fill_timeout_retry
+        must cancel the original order and resubmit at limit_price * 0.99.
+        """
+        from alpaca.trading.enums import TimeInForce
+        agent = _make_agent()
+
+        original_order = MagicMock()
+        original_order.id = 'orig-order-1'
+
+        retry_order = MagicMock()
+        retry_order.id = 'retry-order-1'
+
+        # Simulate unfilled order status
+        unfilled_status = MagicMock()
+        unfilled_status.status.value = 'accepted'
+        agent.trading_client.get_order_by_id.return_value = unfilled_status
+        agent.trading_client.submit_order.return_value = retry_order
+
+        pos = _make_position('SPY250425P00560000')
+        limit_price = 2.00
+
+        with patch('options_agent.time') as mock_time:
+            result = agent._fill_timeout_retry(original_order, pos, 2, limit_price)
+
+        mock_time.sleep.assert_called_once_with(300)
+        agent.trading_client.cancel_order_by_id.assert_called_once_with('orig-order-1')
+
+        submitted = agent.trading_client.submit_order.call_args[0][0]
+        assert isinstance(submitted, LimitOrderRequest)
+        assert submitted.limit_price == round(limit_price * 0.99, 2)
+        assert submitted.time_in_force == TimeInForce.DAY
+        assert result is retry_order
+
+    def test_no_retry_when_already_filled(self):
+        """_fill_timeout_retry must not cancel/resubmit if order is already filled."""
+        agent = _make_agent()
+
+        original_order = MagicMock()
+        original_order.id = 'filled-order-1'
+
+        filled_status = MagicMock()
+        filled_status.status.value = 'filled'
+        agent.trading_client.get_order_by_id.return_value = filled_status
+
+        pos = _make_position('SPY250425P00560000')
+
+        with patch('options_agent.time') as mock_time:
+            result = agent._fill_timeout_retry(original_order, pos, 2, 2.00)
+
+        mock_time.sleep.assert_called_once_with(300)
+        agent.trading_client.cancel_order_by_id.assert_not_called()
+        agent.trading_client.submit_order.assert_not_called()
+        assert result is original_order
