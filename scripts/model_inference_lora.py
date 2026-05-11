@@ -5,7 +5,11 @@ Model Inference with LoRA - OPTIMIZED with model caching
 import os
 import logging
 import time
+import warnings
 import torch
+
+# GB10 (sm_121) exceeds PyTorch's compiled max (sm_120); bitsandbytes handles it fine
+warnings.filterwarnings("ignore", message=".*cuda capability.*", category=UserWarning)
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel
 from filelock import FileLock, Timeout as FileLockTimeout
