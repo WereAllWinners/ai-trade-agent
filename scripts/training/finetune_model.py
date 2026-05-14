@@ -54,12 +54,22 @@ def _run_promoter(finetune_dir: Path, adapters_before: set) -> None:
     new_adapter = new_adapters[-1]
     logging.info(f"🔍 New adapter detected: {new_adapter.name}")
 
+    # Look for a companion merged BF16 model (same timestamp, different name prefix).
+    # fine_tune_llm.py names it: finance_qwen_32b_lora_merged_bf16_YYYYMMDD_HHMMSS
+    merged_candidate = finetune_dir / new_adapter.name.replace('_lora_', '_lora_merged_bf16_')
+    merged_path = str(merged_candidate) if merged_candidate.exists() else None
+    if merged_path:
+        logging.info(f"🔍 Merged model detected: {merged_candidate.name}")
+    else:
+        logging.info("ℹ️  No merged model found — vLLM will keep serving the previous merged model")
+
     promoter_script = Path(__file__).resolve().parent / 'model_promoter.py'
+    cmd = [sys.executable, str(promoter_script), '--candidate', str(new_adapter)]
+    if merged_path:
+        cmd += ['--merged-model', merged_path]
+
     try:
-        subprocess.run(
-            [sys.executable, str(promoter_script), '--candidate', str(new_adapter)],
-            timeout=2400,  # 40 min for two evals
-        )
+        subprocess.run(cmd, timeout=2400)  # 40 min for two evals
     except subprocess.TimeoutExpired:
         logging.error("❌ Model promotion timed out after 40 minutes")
     except Exception as e:

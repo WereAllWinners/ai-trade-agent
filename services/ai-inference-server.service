@@ -1,0 +1,29 @@
+[Unit]
+Description=AI Inference Server — vLLM serving Qwen2.5-32B (shared by all trading agents)
+After=network-online.target
+Wants=network-online.target
+# All 4 trading bots declare After=ai-inference-server.service so they start
+# after this unit and their warmup() calls retry until vLLM is ready.
+
+[Service]
+Type=simple
+WorkingDirectory=/home/zgx/personal-projects/ai-trade-agent
+
+ExecStart=/home/zgx/personal-projects/ai-trade-agent/scripts/start_vllm_server.sh
+
+# On crash: wait 30s before restart to avoid thrashing on OOM.
+Restart=on-failure
+RestartSec=30s
+
+# vLLM takes 2-3 min to load and quantize the 32B model.
+# Trading agents use warmup() with retry backoff, so they don't need this unit
+# to be "ready" in the systemd sense — just not failed.
+TimeoutStartSec=300
+TimeoutStopSec=60
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-inference-server
+
+[Install]
+WantedBy=multi-user.target

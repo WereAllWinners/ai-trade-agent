@@ -35,8 +35,9 @@ import _pathfix  # noqa: F401
 _SCRIPTS_DIR  = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _SCRIPTS_DIR.parent
 _EVAL_DIR     = _PROJECT_ROOT / 'logs' / 'eval'
-_LATEST       = _PROJECT_ROOT / 'finetune' / 'finance_qwen_32b_lora_latest'
-_ENV_FILE     = _PROJECT_ROOT / '.env'
+_LATEST        = _PROJECT_ROOT / 'finetune' / 'finance_qwen_32b_lora_latest'
+_MERGED_LATEST = _PROJECT_ROOT / 'finetune' / 'finance_qwen_32b_merged_latest'
+_ENV_FILE      = _PROJECT_ROOT / '.env'
 
 # Candidate must score at least (current − TOLERANCE) to be promoted.
 # 0.0 = must be equal or better; 0.05 = allow up to 5% regression.
@@ -120,25 +121,52 @@ def _update_env(adapter_path: str) -> None:
     logging.info(f"📝 .env updated: LORA_ADAPTER_PATH={rel}")
 
 
+def _update_merged_symlink(merged_path: str) -> None:
+    """Update finance_qwen_32b_merged_latest to point at the newly merged BF16 model."""
+    if not merged_path or not Path(merged_path).exists():
+        logging.warning(f"Merged model not found at {merged_path} — skipping symlink update")
+        return
+    if _MERGED_LATEST.is_symlink() or _MERGED_LATEST.exists():
+        _MERGED_LATEST.unlink()
+    _MERGED_LATEST.symlink_to(merged_path)
+    logging.info(f"🔗 Symlink updated: {_MERGED_LATEST.name} → {Path(merged_path).name}")
+
+
 def _restart_services() -> None:
-    # No-op: each trading session runs as a subprocess that starts a fresh Python
-    # interpreter and re-reads LORA_ADAPTER_PATH from .env on every call to
-    # load_model_once(). The updated .env written by _update_env() is therefore
-    # picked up automatically at the next session — no daemon restart required.
-    # Attempting 'systemctl restart' from within the service also fails with
-    # "Interactive authentication required" since the service runs as a non-root
-    # user without polkit permission to restart system units.
-    logging.info("ℹ️  New adapter will be loaded automatically by the next trading session (no restart needed)")
+    # For vLLM backend: restart the inference server so it loads the newly merged model.
+    # Requires a passwordless sudo rule for this one command (see CLAUDE.md setup steps).
+    # For direct/ollama backends: the .env update is sufficient — each trading session
+    # subprocess re-reads LORA_ADAPTER_PATH fresh on every load_model_once() call.
+    logging.info("ℹ️  New adapter will be loaded automatically by the next trading session")
+    if os.getenv('INFERENCE_BACKEND', '').lower() != 'vllm':
+        return
+    try:
+        result = subprocess.run(
+            ['sudo', 'systemctl', 'restart', 'ai-inference-server.service'],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            logging.info("🔄 ai-inference-server restarting (new merged model loads in ~2-3 min)")
+        else:
+            logging.warning(f"systemctl restart returned {result.returncode}: {result.stderr.strip()}")
+            logging.warning("Trading agents will keep serving the previous merged model until next restart")
+    except Exception as e:
+        logging.warning(f"Could not restart inference server: {e}")
 
 
 # ---------------------------------------------------------------------------
 # Core promotion logic
 # ---------------------------------------------------------------------------
 
-def promote(candidate_path: str) -> bool:
+def promote(candidate_path: str, merged_path: str = None) -> bool:
     """
     Compare candidate adapter to the current production adapter.
     Returns True if the candidate was promoted, False if rejected.
+
+    merged_path: optional path to the BF16-merged model directory produced by
+                 fine_tune_llm.py. When provided and the candidate is promoted,
+                 the finance_qwen_32b_merged_latest symlink is updated and the
+                 vLLM inference server is restarted to load the new weights.
     """
     candidate_path = str(Path(candidate_path).resolve())
     current_path   = _current_production_adapter()
@@ -148,6 +176,8 @@ def promote(candidate_path: str) -> bool:
         logging.info("No existing production adapter found — auto-promoting candidate")
         _update_latest_symlink(candidate_path)
         _update_env(candidate_path)
+        if merged_path:
+            _update_merged_symlink(merged_path)
         _restart_services()
         return True
 
@@ -190,6 +220,8 @@ def promote(candidate_path: str) -> bool:
         )
         _update_latest_symlink(candidate_path)
         _update_env(candidate_path)
+        if merged_path:
+            _update_merged_symlink(merged_path)
         _restart_services()
     else:
         logging.info(
@@ -223,9 +255,11 @@ def main():
     parser = argparse.ArgumentParser(description='Evaluate and promote a fine-tuned LoRA adapter')
     parser.add_argument('--candidate', type=str, required=True,
                         help='Path to the candidate (newly fine-tuned) adapter directory')
+    parser.add_argument('--merged-model', type=str, default=None,
+                        help='Path to the BF16-merged model directory for vLLM serving (optional)')
     args = parser.parse_args()
 
-    promoted = promote(args.candidate)
+    promoted = promote(args.candidate, merged_path=args.merged_model)
     # Exit 0 = promoted, 2 = rejected (not an error — caller can check)
     sys.exit(0 if promoted else 2)
 

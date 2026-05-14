@@ -1,6 +1,6 @@
 [Unit]
 Description=AI Options Trading Bot (options_agent via options_daemon)
-After=network-online.target
+After=network-online.target ai-inference-server.service
 Wants=network-online.target
 
 [Service]

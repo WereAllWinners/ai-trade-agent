@@ -35,6 +35,12 @@ _MODEL_CACHE = {
 
 def load_model_once():
     """Load model into cache if not already loaded."""
+    _backend = os.getenv('INFERENCE_BACKEND', 'direct').lower()
+    if _backend in ('vllm', 'ollama'):
+        from inference_client import warmup
+        warmup()
+        return None, None
+
     if _MODEL_CACHE['loaded']:
         print("✅ Using cached model (already loaded)")
         return _MODEL_CACHE['model'], _MODEL_CACHE['tokenizer']
@@ -86,6 +92,11 @@ def get_trading_decision(prompt, max_new_tokens=200, temperature=0.7):
     Get trading decision from the model.
     Uses cached model for fast inference.
     """
+    _backend = os.getenv('INFERENCE_BACKEND', 'direct').lower()
+    if _backend in ('vllm', 'ollama'):
+        from inference_client import generate
+        return generate(prompt, max_tokens=max_new_tokens, temperature=temperature)
+
     # Get cached model
     model, tokenizer = load_model_once()
 

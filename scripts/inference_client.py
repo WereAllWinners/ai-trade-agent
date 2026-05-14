@@ -33,9 +33,9 @@ import os
 INFERENCE_BACKEND: str = os.getenv('INFERENCE_BACKEND', 'ollama').lower()
 OLLAMA_MODEL:      str = os.getenv('OLLAMA_MODEL', 'qwen3:8b')
 VLLM_BASE_URL:     str = os.getenv('VLLM_BASE_URL', 'http://localhost:8000/v1')
-VLLM_MODEL:        str = os.getenv('VLLM_MODEL', 'Qwen/Qwen2.5-7B-Instruct-AWQ')
+VLLM_MODEL:        str = os.getenv('VLLM_MODEL', 'Qwen/Qwen2.5-32B-Instruct')
 VLLM_API_KEY:      str = os.getenv('VLLM_API_KEY', 'token')
-INFERENCE_TIMEOUT: int = int(os.getenv('INFERENCE_TIMEOUT', '45'))
+INFERENCE_TIMEOUT: int = int(os.getenv('INFERENCE_TIMEOUT', '120'))
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +140,7 @@ def _stop_ollama() -> None:
 # ---------------------------------------------------------------------------
 
 def _generate_vllm(prompt: str, max_tokens: int, temperature: float) -> str:
-    import requests
+    import requests, time as _time
     payload = {
         "model": VLLM_MODEL,
         "prompt": prompt,
@@ -149,23 +149,39 @@ def _generate_vllm(prompt: str, max_tokens: int, temperature: float) -> str:
         "top_p": 0.9,
     }
     headers = {"Authorization": f"Bearer {VLLM_API_KEY}"}
-    try:
-        resp = requests.post(
-            f"{VLLM_BASE_URL}/completions",
-            json=payload,
-            headers=headers,
-            timeout=INFERENCE_TIMEOUT,
-        )
-        resp.raise_for_status()
-        return resp.json()['choices'][0]['text']
-    except Exception as e:
-        logging.error(f"vLLM inference failed: {e} — falling back to Ollama")
-        return _generate_ollama(prompt, max_tokens, temperature)
+    # Retry up to 3 times with 10 s gaps to ride out transient vLLM restart windows
+    # (e.g., the ~2-3 min reload after a nightly fine-tune promotes a new merged model).
+    last_exc = None
+    for attempt in range(1, 4):
+        try:
+            resp = requests.post(
+                f"{VLLM_BASE_URL}/completions",
+                json=payload,
+                headers=headers,
+                timeout=INFERENCE_TIMEOUT,
+            )
+            resp.raise_for_status()
+            return resp.json()['choices'][0]['text']
+        except Exception as e:
+            last_exc = e
+            if attempt < 3:
+                logging.warning(f"vLLM inference attempt {attempt}/3 failed: {e} — retrying in 10s")
+                _time.sleep(10)
+    raise RuntimeError(f"vLLM inference failed after 3 attempts: {last_exc}")
 
 
 def _warmup_vllm() -> None:
-    try:
-        _generate_vllm("warmup", max_tokens=1, temperature=0.0)
-        logging.info(f"🔥 vLLM model '{VLLM_MODEL}' warmed up at {VLLM_BASE_URL}")
-    except Exception as e:
-        logging.warning(f"⚠️  vLLM warm-up failed: {e}")
+    """Ping vLLM with a 1-token completion, retrying with backoff for the 2-3 min cold-start."""
+    import time as _time
+    for attempt in range(1, 21):   # up to ~4.5 min total
+        try:
+            _generate_vllm("warmup", max_tokens=1, temperature=0.0)
+            logging.info(f"🔥 vLLM model '{VLLM_MODEL}' ready at {VLLM_BASE_URL} (attempt {attempt}/20)")
+            return
+        except Exception as e:
+            if attempt == 20:
+                logging.error(f"⚠️  vLLM warm-up failed after 20 attempts: {e}")
+                return
+            delay = min(5.0 * (1.5 ** (attempt - 1)), 16.0)
+            logging.info(f"vLLM not ready yet ({attempt}/20), retrying in {delay:.1f}s...")
+            _time.sleep(delay)

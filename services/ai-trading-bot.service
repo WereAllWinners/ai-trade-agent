@@ -1,6 +1,6 @@
 [Unit]
 Description=AI Stock Trading Bot (autonomous_agent via trading_daemon)
-After=network-online.target
+After=network-online.target ai-inference-server.service
 Wants=network-online.target
 
 [Service]

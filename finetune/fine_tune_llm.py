@@ -13,6 +13,11 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 
+# Prevent unsloth from making HuggingFace telemetry network calls at startup.
+# The model is cached locally; HF being down should never abort a fine-tune run.
+os.environ.setdefault('TRANSFORMERS_OFFLINE', '1')
+os.environ.setdefault('HF_DATASETS_OFFLINE', '1')
+
 from unsloth import FastLanguageModel
 from datasets import Dataset
 from trl import SFTTrainer, DPOTrainer
@@ -222,6 +227,19 @@ You are an expert financial trading advisor with knowledge from the world's best
         model.save_pretrained(output_dir)
         tokenizer.save_pretrained(output_dir)
 
+        # Merge LoRA weights into the base model and save as BF16 for vLLM serving.
+        # vLLM cannot load LoRA adapters trained on bitsandbytes NF4 quantized models,
+        # so we produce a clean merged checkpoint that vLLM loads with --quantization bitsandbytes.
+        # model_promoter.py detects this directory and updates the vLLM symlink + restarts the server.
+        merged_dir = output_dir.replace('_lora_', '_lora_merged_bf16_')
+        try:
+            print(f"\n🔀 Merging LoRA → BF16 for vLLM serving: {merged_dir}")
+            model.save_pretrained_merged(merged_dir, tokenizer, save_method="merged_16bit")
+            print(f"✅ Merged model saved: {merged_dir}")
+        except Exception as e:
+            print(f"⚠️  Merge step failed ({e}) — LoRA adapter still saved; vLLM will serve the previous merged model until next successful merge")
+            merged_dir = None
+
         metadata = {
             'mode': self.mode,
             'base_model': self.base_model,
@@ -231,7 +249,8 @@ You are an expert financial trading advisor with knowledge from the world's best
             'checkpoint_resumed': checkpoint_path,
             'dpo_applied': do_dpo,
             'timestamp': timestamp,
-            'output_dir': output_dir
+            'output_dir': output_dir,
+            'merged_dir': merged_dir,
         }
         with open(f"{output_dir}/training_metadata.json", 'w') as f:
             json.dump(metadata, f, indent=2)
@@ -239,11 +258,11 @@ You are an expert financial trading advisor with knowledge from the world's best
         print(f"\n{'='*70}")
         print(f"🎉 TRAINING COMPLETE!")
         print(f"{'='*70}")
-        print(f"✅ Model saved to: {output_dir}")
+        print(f"✅ LoRA adapter: {output_dir}")
+        if merged_dir:
+            print(f"✅ Merged model: {merged_dir}")
         print(f"\n💡 Next steps:")
-        print(f"   python3 scripts/model_inference_lora.py")
-        print(f"   sudo systemctl restart ai-trading-bot.service")
-        print(f"   sudo systemctl restart ai-options-bot.service")
+        print(f"   sudo systemctl restart ai-inference-server.service  # picks up new merged model")
 
         return output_dir
 
