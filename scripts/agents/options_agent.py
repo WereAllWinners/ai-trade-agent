@@ -27,7 +27,7 @@ except Exception:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import _pathfix  # noqa: F401
-from model_inference_lora import get_trading_decision, parse_decision, load_model_once
+from model_inference_lora import get_trading_decision, parse_decision
 from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
 import news_fetcher
 import unusual_flow_scanner
@@ -36,6 +36,7 @@ import db as _db
 from portfolio_overseer import PortfolioOverseer
 from allocation_controller import AllocationController
 from paper_market_simulator import PaperMarketSimulator
+import account_config as _acfg
 
 _DEBATE_CONFIDENCE_THRESHOLD = 0.85   # Options trades require higher bar for debate
 _MIN_CASH_RESERVE = 500.0             # Never spend the account's last $500 of cash
@@ -62,8 +63,8 @@ def _json_default(obj):
 
 
 def _settled_cash(account) -> float:
-    """Return fully settled cash (non_marginable_buying_power), excluding T+1 unsettled proceeds."""
-    return float(account.non_marginable_buying_power)
+    """Return actual cash balance from Alpaca."""
+    return float(account.cash)
 
 
 def _load_macro_context_block() -> str:
@@ -231,21 +232,20 @@ class OptionsAgent:
         _paper = os.getenv('PAPER_TRADING', 'true').lower() != 'false'
         if not _paper:
             logging.warning("LIVE TRADING MODE ENABLED - real money is at risk!")
-        self.trading_client = TradingClient(
-            os.getenv('ALPACA_API_KEY'),
-            os.getenv('ALPACA_SECRET_KEY'),
-            paper=_paper
-        )
+        if not _paper:
+            _api_key    = os.getenv('ALPACA_API_KEY_LIVE') or os.getenv('ALPACA_API_KEY')
+            _api_secret = os.getenv('ALPACA_API_SECRET_LIVE') or os.getenv('ALPACA_SECRET_KEY')
+        else:
+            _api_key    = os.getenv('ALPACA_API_KEY')
+            _api_secret = os.getenv('ALPACA_SECRET_KEY')
+        self.trading_client = TradingClient(_api_key, _api_secret, paper=_paper)
         from utils.alpaca_retry import retry_on_rate_limit
         for _m in ('submit_order', 'get_account', 'get_all_positions', 'get_orders', 'get_order_by_id'):
             if hasattr(self.trading_client, _m):
                 method = getattr(self.trading_client, _m)
                 if not hasattr(method, '_mock_name'):  # skip wrapping unittest.mock stubs
                     setattr(self.trading_client, _m, retry_on_rate_limit(method))
-        self.option_data_client = OptionHistoricalDataClient(
-            os.getenv('ALPACA_API_KEY'),
-            os.getenv('ALPACA_SECRET_KEY')
-        )
+        self.option_data_client = OptionHistoricalDataClient(_api_key, _api_secret)
         
         # Options-specific parameters
         self.params = {
@@ -284,9 +284,6 @@ class OptionsAgent:
         if _DRY_RUN:
             logging.warning("🧪 DRY RUN MODE: orders will be logged but NOT submitted to Alpaca")
 
-        # Pre-load the LoRA model so the first trading decision has no cold-start delay
-        load_model_once()
-
         self.paper_sim = PaperMarketSimulator(paper=_paper)
         self._paper    = _paper
 
@@ -304,6 +301,7 @@ class OptionsAgent:
         # Init DB (creates tables including cash_reservations if needed)
         _db.init_db()
 
+        self._prev_equity: float | None = None
         logging.info("🎯 Options Agent Initialized")
     
     def _log_decision(self, symbol: str, prompt: str, raw_response: str,
@@ -883,7 +881,9 @@ Reasoning: <one sentence explaining the key signal>"""
             logging.info(f"✅ Executed OPTIONS trade: {quantity} contracts of {symbol} {contract_type.value}")
             alert_trade_executed(
                 'OptionsAgent', contract.symbol, 'buy',
-                quantity, option_price, str(submitted_order.id)
+                quantity, option_price, str(submitted_order.id),
+                target_price=round(option_price * (1 + self.params['take_profit']), 4),
+                stop_price=round(option_price * (1 + self.params['stop_loss']), 4),
             )
             return True
 
@@ -916,6 +916,19 @@ Reasoning: <one sentence explaining the key signal>"""
             )
         except Exception as e:
             logging.warning(f"Could not check open orders for {symbol}: {e}")
+            return False
+
+    def _opened_today(self, symbol: str) -> bool:
+        """True if a filled BUY order for this options contract was placed today (same-day PDT guard)."""
+        try:
+            today = datetime.now(_EST).date() if _EST else datetime.now().date()
+            today_start = datetime(today.year, today.month, today.day, 0, 0, 0)
+            orders = self.trading_client.get_orders(
+                GetOrdersRequest(status='closed', after=today_start, symbols=[symbol])
+            )
+            return any(o.side == OrderSide.BUY for o in orders)
+        except Exception as e:
+            logging.debug(f"_opened_today check failed for {symbol}: {e}")
             return False
 
     def _fill_timeout_retry(self, submitted_order, position, qty: int, limit_price: float):
@@ -984,6 +997,15 @@ Reasoning: <one sentence explaining the key signal>"""
                         time_in_force = TimeInForce.GTC
 
                 if not should_exit:
+                    continue
+
+                # no_same_day_close guard: small accounts must not round-trip the same
+                # option contract on the same calendar day — counts as a PDT day trade.
+                if self.params.get('no_same_day_close') and self._opened_today(position.symbol):
+                    logging.info(
+                        f"⏭️  no_same_day_close: {position.symbol[:20]}... opened today — "
+                        f"skipping {exit_reason} (will retry tomorrow)"
+                    )
                     continue
 
                 # Gap 1: skip if an open sell order for this position already exists
@@ -1078,10 +1100,14 @@ Reasoning: <one sentence explaining the key signal>"""
 
                 logging.info(f"✅ Closed option position: {exit_reason} ({unrealized_plpc:+.1%})")
 
-                # Gap 4: alert on every exit type including DTE exits
+                unrealized_pl  = float(position.unrealized_pl)
+                avg_entry      = float(position.avg_entry_price)
+                exit_price     = float(position.current_price)
                 alert_trade_executed(
                     'OptionsAgent', position.symbol, 'sell',
-                    int(qty), unrealized_plpc, str(submitted_order.id)
+                    int(qty), exit_price, str(submitted_order.id),
+                    pnl=unrealized_pl, pnl_pct=unrealized_plpc,
+                    avg_entry_price=avg_entry,
                 )
 
         except Exception as e:
@@ -1096,6 +1122,20 @@ Reasoning: <one sentence explaining the key signal>"""
             self.last_reset_date = today
             self.daily_start_equity = None
             logging.info("🔄 Daily options trade counter reset")
+
+        # Fetch equity once at session start — drives account_config param selection
+        # and the circuit breaker further below.
+        try:
+            _session_account = self.trading_client.get_account()
+            equity = float(_session_account.equity)
+        except Exception as _e:
+            logging.error(f"❌ Could not fetch account equity at session start: {_e}")
+            equity = 0.0
+
+        # Apply account-tier params (small <$25k vs full) and fire upgrade alert if crossed.
+        self.params.update(_acfg.get_options_params(equity))
+        _acfg.check_for_upgrade(equity, self._prev_equity)
+        self._prev_equity = equity
 
         # Load overnight research params first so exit_dte_threshold override is applied
         # before manage_existing_positions() runs.
@@ -1116,9 +1156,8 @@ Reasoning: <one sentence explaining the key signal>"""
         self.manage_existing_positions()
 
         # Circuit breaker: check daily P&L before opening any new positions
+        # (equity was already fetched at session start above)
         try:
-            account = self.trading_client.get_account()
-            equity = float(account.equity)
             if self.daily_start_equity is None:
                 saved = _db.load_daily_start_equity('options')
                 if saved is not None:

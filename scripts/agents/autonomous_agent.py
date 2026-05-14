@@ -32,6 +32,7 @@ from paper_market_simulator import PaperMarketSimulator
 from alpaca.trading.requests import LimitOrderRequest
 from portfolio_overseer import PortfolioOverseer
 from allocation_controller import AllocationController
+import account_config as _acfg
 
 _DEBATE_CONFIDENCE_THRESHOLD = 0.90   # Only debate very high-conviction trades
 _MIN_CASH_RESERVE = 500.0             # Never spend the account's last $500 of cash
@@ -201,8 +202,8 @@ def _write_rotation_log(sell_sym, buy_sym, sell_oid, buy_oid, outcome):
 
 
 def _settled_cash(account) -> float:
-    """Return fully settled cash (non_marginable_buying_power), excluding T+1 unsettled proceeds."""
-    return float(account.non_marginable_buying_power)
+    """Return actual cash balance from Alpaca."""
+    return float(account.cash)
 
 
 def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) -> dict:
@@ -253,6 +254,24 @@ class AutonomousAgent:
             os.getenv('ALPACA_SECRET_KEY'),
             paper=_paper
         )
+
+        # PDT gate: stock bot must stay on the paper endpoint until equity >= $25,000.
+        # If PAPER_TRADING=false was set prematurely, re-create the client as paper and warn.
+        if not _paper:
+            _equity = _acfg.fetch_equity(self.trading_client)
+            if not _acfg.stock_live_allowed(_equity):
+                logging.warning(
+                    f"⚠️  PAPER TRADING FORCED: account equity ${_equity:,.0f} is below "
+                    f"the ${_acfg.LIVE_EQUITY_THRESHOLD:,.0f} PDT threshold. "
+                    f"Stock bot will run on the paper endpoint until the threshold is cleared."
+                )
+                _paper = True
+                self.trading_client = TradingClient(
+                    os.getenv('ALPACA_API_KEY'),
+                    os.getenv('ALPACA_SECRET_KEY'),
+                    paper=True,
+                )
+
         from utils.alpaca_retry import retry_on_rate_limit
         for _m in ('submit_order', 'get_account', 'get_all_positions', 'get_orders', 'get_order_by_id'):
             if hasattr(self.trading_client, _m):
@@ -527,12 +546,14 @@ class AutonomousAgent:
                 return False
 
             # For sells, verify we actually hold the position
+            avg_entry_price = None
             if side == OrderSide.SELL:
                 position = self.get_position(symbol)
                 if position is None:
                     logging.warning(f"⚠️  Skipping SELL {symbol}: no open position held")
                     return False
                 shares = int(float(position.qty))
+                avg_entry_price = float(position.avg_entry_price)
             else:
                 # Proactive PDT check — count today's round trips before another buy
                 if not self.pdt_blocked:
@@ -662,10 +683,21 @@ class AutonomousAgent:
                 logging.warning(f"⚠️  Could not write trade to DB: {e}")
 
             logging.info(f"✅ Executed {decision['decision'].upper()} {shares} shares of {symbol}")
-            alert_trade_executed(
-                'StockAgent', symbol, decision['decision'],
-                shares, current_price, str(submitted_order.id)
-            )
+            if side == OrderSide.SELL and avg_entry_price is not None:
+                realized_pnl = (fill_price - avg_entry_price) * shares
+                realized_pnl_pct = (fill_price - avg_entry_price) / avg_entry_price
+                alert_trade_executed(
+                    'StockAgent', symbol, decision['decision'],
+                    shares, fill_price, str(submitted_order.id),
+                    pnl=realized_pnl, pnl_pct=realized_pnl_pct,
+                    avg_entry_price=avg_entry_price,
+                )
+            else:
+                alert_trade_executed(
+                    'StockAgent', symbol, decision['decision'],
+                    shares, fill_price, str(submitted_order.id),
+                    stop_price=stop_price, target_price=target_price,
+                )
 
             # Update cooldown
             self.cooldowns[symbol] = datetime.now()

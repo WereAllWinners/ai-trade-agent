@@ -20,6 +20,11 @@ sys.path.append(str(_SCRIPTS_DIR))
 import inference_client
 from preflight_check import run_preflight
 
+# When OPTIONS_LIVE_ONLY=1 this instance is the live $1,500 execution engine.
+# Skip all self-improvement work (fine-tune, analysis, research, weekend strategist)
+# so it never touches the shared GPU or training data at the same time as the paper bot.
+_LIVE_ONLY = os.getenv('OPTIONS_LIVE_ONLY', '0') == '1'
+
 
 def _write_heartbeat(status: str, market_open: bool) -> None:
     """Update heartbeat file so health_server.py can report daemon liveness."""
@@ -53,12 +58,16 @@ class OptionsDaemon:
         self.trading_client = None  # set by _run_preflight; used for clock API
         signal.signal(signal.SIGUSR1, self._handle_finetune_signal)
 
-        logging.info("🤖 Options Trading Daemon Initialized")
-        logging.info("⏰ Options trading every 60 minutes")
-        logging.info("📊 Performance analysis scheduled for 5:30 PM EST daily")
-        logging.info("🔍 Market research + 🎓 Fine-tuning scheduled for 2:00 AM EST daily")
-        logging.info("🏖️  Weekend deep analysis scheduled for Saturday 10:00 AM EST")
-        logging.info("📬 Send SIGUSR1 to trigger an off-cycle fine-tune: systemctl kill -s SIGUSR1 ai-options-bot.service")
+        if _LIVE_ONLY:
+            logging.info("🤖 Options Trading Daemon Initialized [LIVE-ONLY mode — no training/analysis]")
+            logging.info("⏰ Options trading every 60 minutes (live account only)")
+        else:
+            logging.info("🤖 Options Trading Daemon Initialized")
+            logging.info("⏰ Options trading every 60 minutes")
+            logging.info("📊 Performance analysis scheduled for 5:30 PM EST daily")
+            logging.info("🔍 Market research + 🎓 Fine-tuning scheduled for 2:00 AM EST daily")
+            logging.info("🏖️  Weekend deep analysis scheduled for Saturday 10:00 AM EST")
+            logging.info("📬 Send SIGUSR1 to trigger an off-cycle fine-tune: systemctl kill -s SIGUSR1 ai-options-bot.service")
 
         # Preflight: validate Alpaca account + options approval level
         self._run_preflight()
@@ -75,11 +84,14 @@ class OptionsDaemon:
             from dotenv import load_dotenv
             from alpaca.trading.client import TradingClient
             load_dotenv()
-            client = TradingClient(
-                os.getenv('ALPACA_API_KEY'),
-                os.getenv('ALPACA_SECRET_KEY'),
-                paper=os.getenv('PAPER_TRADING', 'true').lower() != 'false',
-            )
+            _paper = os.getenv('PAPER_TRADING', 'true').lower() != 'false'
+            if not _paper:
+                _api_key    = os.getenv('ALPACA_API_KEY_LIVE') or os.getenv('ALPACA_API_KEY')
+                _api_secret = os.getenv('ALPACA_API_SECRET_LIVE') or os.getenv('ALPACA_SECRET_KEY')
+            else:
+                _api_key    = os.getenv('ALPACA_API_KEY')
+                _api_secret = os.getenv('ALPACA_SECRET_KEY')
+            client = TradingClient(_api_key, _api_secret, paper=_paper)
             self.trading_client = client
             result = run_preflight(client, require_options=True)
             if not result.ok:
@@ -195,7 +207,14 @@ class OptionsDaemon:
         except Exception as e:
             logging.error(f"❌ Options performance analysis failed: {e}")
 
-        # Step 3: Live-trading readiness check (only meaningful in paper mode)
+        # Step 3: Send daily buy summary email
+        try:
+            from alerts import send_daily_buy_summary
+            send_daily_buy_summary('OptionsAgent')
+        except Exception as e:
+            logging.warning(f"⚠️ Daily buy summary email failed: {e}")
+
+        # Step 4: Live-trading readiness check (only meaningful in paper mode)
         if os.getenv('PAPER_TRADING', 'true').lower() != 'false':
             try:
                 import db as _db
@@ -389,13 +408,16 @@ class OptionsDaemon:
                 current_date = now.date()
                 current_week = now.isocalendar()[1]
 
-                # Off-cycle fine-tune triggered by SIGUSR1
+                # Off-cycle fine-tune triggered by SIGUSR1 (paper bot only)
                 if self._finetune_requested:
                     self._finetune_requested = False
-                    finetune_done_today = False
-                    logging.info("🔔 Running off-cycle fine-tune (SIGUSR1)...")
-                    self.run_finetuning()
-                    finetune_done_today = True
+                    if _LIVE_ONLY:
+                        logging.info("ℹ️  SIGUSR1 ignored in LIVE-ONLY mode — fine-tuning runs on the paper bot")
+                    else:
+                        finetune_done_today = False
+                        logging.info("🔔 Running off-cycle fine-tune (SIGUSR1)...")
+                        self.run_finetuning()
+                        finetune_done_today = True
 
                 # Reset daily flags at midnight — use a dedicated date tracker so
                 # the reset fires exactly once per calendar day regardless of whether
@@ -413,23 +435,27 @@ class OptionsDaemon:
                 logging.info(f"📅 Current time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
                 _write_heartbeat('running', self.is_market_open())
                 
-                # Weekend deep analysis on Saturday at 10:00 AM
-                if (now.weekday() == 5  # Saturday
+                # Weekend deep analysis on Saturday at 10:00 AM (paper bot only)
+                if (not _LIVE_ONLY
+                        and now.weekday() == 5  # Saturday
                         and not weekend_strategist_done_this_week
                         and current_time >= self.weekend_strategist_time):
                     self.run_weekend_strategist()
                     weekend_strategist_done_this_week = True
                     last_weekend_week = current_week
 
-                # Performance analysis at 5:30 PM, followed by online training check
-                if not analysis_done_today and current_time >= self.analysis_time:
+                # Performance analysis at 5:30 PM, followed by online training check (paper bot only)
+                if (not _LIVE_ONLY
+                        and not analysis_done_today
+                        and current_time >= self.analysis_time):
                     self.run_performance_analysis()
                     self.run_online_training()
                     analysis_done_today = True
-                
+
                 # Fine-tuning at 2:00 AM — never run during market hours to avoid
-                # OOM from simultaneous inference + training on the same GPU.
-                if (not finetune_done_today
+                # OOM from simultaneous inference + training on the same GPU. (paper bot only)
+                if (not _LIVE_ONLY
+                        and not finetune_done_today
                         and current_time >= self.finetune_time
                         and not self.is_market_open()):
                     self.run_finetuning()
