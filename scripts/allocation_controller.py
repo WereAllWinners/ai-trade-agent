@@ -251,7 +251,7 @@ class AllocationController:
         from datetime import datetime as _dt, timezone as _tz
 
         self.refresh()
-        m = self._cached_metrics or {}
+        m = dict(self._cached_metrics or {})
 
         # Equity from Alpaca
         equity = 0.0
@@ -263,6 +263,7 @@ class AllocationController:
 
         # Days of paper trading — earliest outcome timestamp
         paper_days = 0
+        rows = []
         try:
             rows = self._db.get_recent_trades(limit=10_000)
             if rows:
@@ -276,6 +277,26 @@ class AllocationController:
                     paper_days = (_dt.now(_tz.utc) - earliest_dt).days
         except Exception as e:
             logging.warning(f"live_readiness: could not compute paper_days: {e}")
+
+        # Recompute max drawdown using portfolio-level dollar P&L impact.
+        # The default _compute_metrics uses per-contract pnl_pct (e.g. -80% on an
+        # options contract), which compounds into a catastrophic-looking equity curve
+        # even when each position is only 1-3% of the portfolio. Instead, divide each
+        # trade's realized_pnl by current equity to get the true portfolio-level return.
+        if equity > 0 and rows:
+            cumulative = 0.0
+            peak = 0.0
+            portfolio_max_dd = 0.0
+            for r in reversed(rows):  # oldest first
+                pnl = r.get('realized_pnl') or 0.0
+                try:
+                    cumulative += float(pnl)
+                except (TypeError, ValueError):
+                    pass
+                peak = max(peak, cumulative)
+                if peak > 0:
+                    portfolio_max_dd = max(portfolio_max_dd, (peak - cumulative) / equity)
+            m['max_dd'] = round(portfolio_max_dd, 4)
 
         unmet: list[str] = []
         if equity < min_equity:

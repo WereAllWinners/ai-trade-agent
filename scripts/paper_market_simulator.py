@@ -65,12 +65,36 @@ _NONFILL_PROB_LIQUID   = 0.005   # 0.5% — essentially never on liquid names
 _NONFILL_PROB_ILLIQUID = 0.025   # 2.5% — fast market / halt risk on thin names
 
 # ── Options-specific constants ────────────────────────────────────────────────
-# Options spreads are much wider than equities.
-_OPTIONS_SPREAD_BPS_LIQUID   = 50    # 0.50% — high-OI chains (SPY, QQQ, AAPL)
-_OPTIONS_SPREAD_BPS_ILLIQUID = 150   # 1.50% — low-OI contracts
-_OPTIONS_ADV_LIQUID          = 500   # contracts/day threshold
+# Options spreads are dollar-based, not percentage-based.
+# Real markets fill buys at the ask and sells at the bid.  The half-spread
+# (mid → bid/ask distance) has a hard floor driven by CBOE tick-size rules
+# ($0.05 increments for options <$3, $0.10 for options >$3) plus typical
+# market-maker padding.  Cheap options are the most punishing because the
+# spread is a large percentage of the premium.
+#
+# Liquid = high-OI chains (SPY, QQQ, AAPL, MSFT, TSLA, etc.)
+# Illiquid = low-OI or narrow chains
+_OPTIONS_ADV_LIQUID          = 500   # contracts/day threshold for liquid tier
 _OPTIONS_PARTIAL_FILL_PROB   = 0.30
 _OPTIONS_NONFILL_PROB        = 0.05
+
+# Half-spread lookup table: (max_mid_price, liquid_half_spread, illiquid_half_spread)
+# Half-spread is per share (multiply × 100 for per-contract dollar cost).
+# Buying costs mid + half_spread; selling yields mid - half_spread.
+_OPTIONS_HALF_SPREAD_TABLE = [
+    # (mid_price ceiling, liquid $/sh,  illiquid $/sh)
+    (0.20,  0.05,  0.10),   # sub-$0.20: 1 tick floor / 2-tick illiquid
+    (0.50,  0.05,  0.12),   # $0.20–0.50
+    (1.00,  0.08,  0.18),   # $0.50–1.00
+    (2.00,  0.10,  0.25),   # $1.00–2.00
+    (5.00,  0.15,  0.40),   # $2.00–5.00
+    (10.00, 0.20,  0.55),   # $5.00–10.00
+]
+# >$10 mid: use percentage floor (2% liquid, 4% illiquid) with $0.25/$0.60 minimum
+_OPTIONS_HALF_SPREAD_PCT_LIQUID   = 0.020
+_OPTIONS_HALF_SPREAD_PCT_ILLIQUID = 0.040
+_OPTIONS_HALF_SPREAD_MIN_LIQUID   = 0.25
+_OPTIONS_HALF_SPREAD_MIN_ILLIQUID = 0.60
 
 
 @dataclass
@@ -160,18 +184,35 @@ class PaperMarketSimulator:
         open_interest: int,
         daily_volume:  int,
     ) -> SimulatedFill:
-        """Simulate an options contract fill."""
+        """
+        Simulate an options contract fill using a dollar-floor half-spread model.
+
+        Buys fill at mid + half_spread (the ask side).
+        Sells fill at mid - half_spread (the bid side).
+        Half-spread is determined by mid_price tier and liquidity, not a flat bps %.
+        This accurately models the real cost of crossing the bid-ask on options,
+        which is severe for cheap contracts (e.g. a $0.50 option may have a $0.10
+        half-spread — 20% — vs the old 50bps = 0.25% model).
+        """
         if not self.paper:
             return SimulatedFill(mid_price, contracts, contracts, False, True, 0.0, 'live mode — no simulation')
 
-        liquid    = (open_interest >= _OPTIONS_ADV_LIQUID or daily_volume >= _OPTIONS_ADV_LIQUID)
-        spread_bps = _OPTIONS_SPREAD_BPS_LIQUID if liquid else _OPTIONS_SPREAD_BPS_ILLIQUID
-        fill_price = self._apply_slippage(side, mid_price, spread_bps)
+        liquid      = (open_interest >= _OPTIONS_ADV_LIQUID or daily_volume >= _OPTIONS_ADV_LIQUID)
+        half_spread = self._options_half_spread(mid_price, liquid)
+
+        # Fill at ask (buy) or bid (sell)
+        if side == 'buy':
+            fill_price = round(mid_price + half_spread, 4)
+        else:
+            fill_price = round(max(0.01, mid_price - half_spread), 4)
+
+        # Express slippage as bps for the SimulatedFill record
+        slip_bps = (half_spread / mid_price * 10_000) if mid_price > 0 else 0
 
         # Non-fill
         if random.random() < _OPTIONS_NONFILL_PROB:
             return SimulatedFill(
-                fill_price, 0, contracts, False, False, spread_bps,
+                fill_price, 0, contracts, False, False, slip_bps,
                 f"Options non-fill simulated (5% probability)"
             )
 
@@ -183,12 +224,14 @@ class PaperMarketSimulator:
             fill_qty = max(1, math.floor(contracts * fraction))
             partial  = fill_qty < contracts
 
+        tier_label = 'Liquid' if liquid else 'Illiquid'
+        drag_per_contract = round(half_spread * 100, 2)
         note = (
-            f"{'Liquid' if liquid else 'Illiquid'} options — "
-            f"spread {spread_bps}bps applied"
-            + (f", partial fill {fill_qty}/{contracts} contracts" if partial else "")
+            f"{tier_label} options — half-spread ${half_spread:.4f}/sh "
+            f"(${drag_per_contract:.2f}/contract, {slip_bps:.0f}bps)"
+            + (f" — partial fill {fill_qty}/{contracts} contracts" if partial else "")
         )
-        return SimulatedFill(fill_price, fill_qty, contracts, partial, True, spread_bps, note)
+        return SimulatedFill(fill_price, fill_qty, contracts, partial, True, slip_bps, note)
 
     def log_fill(self, symbol: str, fill: SimulatedFill) -> None:
         """Log the simulation result at the appropriate level."""
@@ -247,6 +290,21 @@ class PaperMarketSimulator:
             return round(price * (1 + factor), 4)
         else:
             return round(price * (1 - factor), 4)
+
+    @staticmethod
+    def _options_half_spread(mid_price: float, liquid: bool) -> float:
+        """
+        Return the half-spread ($/share) for an options contract at the given mid price.
+        Half-spread is the distance from mid to bid (sell side) or ask (buy side).
+        Multiply by 100 to get the per-contract dollar cost of crossing the spread.
+        """
+        for ceiling, liq_spread, illiq_spread in _OPTIONS_HALF_SPREAD_TABLE:
+            if mid_price <= ceiling:
+                return liq_spread if liquid else illiq_spread
+        # Above $10: percentage-based with a dollar floor
+        if liquid:
+            return max(_OPTIONS_HALF_SPREAD_MIN_LIQUID,   mid_price * _OPTIONS_HALF_SPREAD_PCT_LIQUID)
+        return max(_OPTIONS_HALF_SPREAD_MIN_ILLIQUID, mid_price * _OPTIONS_HALF_SPREAD_PCT_ILLIQUID)
 
     @staticmethod
     def _stock_partial_fill(
