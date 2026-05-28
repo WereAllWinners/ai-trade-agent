@@ -202,8 +202,8 @@ def _write_rotation_log(sell_sym, buy_sym, sell_oid, buy_oid, outcome):
 
 
 def _settled_cash(account) -> float:
-    """Return actual cash balance from Alpaca."""
-    return float(account.cash)
+    """Return fully settled cash (non_marginable_buying_power), excluding T+1 unsettled proceeds."""
+    return float(account.non_marginable_buying_power)
 
 
 def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) -> dict:

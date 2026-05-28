@@ -61,6 +61,7 @@ def _make_agent():
     agent.session_id          = 'test_session'
     agent._decision_log       = Path('/tmp/test_options_decisions.jsonl')
     agent._params_file        = Path('/tmp/non_existent_params.json')
+    agent._prev_equity        = None
     return agent
 
 

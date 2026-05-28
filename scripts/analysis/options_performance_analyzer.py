@@ -28,6 +28,8 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
+_RISK_FREE_ANNUAL = 0.05  # used for Sharpe calculations throughout
+
 
 class OptionsPerformanceAnalyzer:
     def __init__(self):
@@ -99,6 +101,47 @@ class OptionsPerformanceAnalyzer:
             return []
 
     # ------------------------------------------------------------------
+    # Equity-curve Sharpe (portfolio-level, accounts for position sizing)
+    # ------------------------------------------------------------------
+
+    def get_equity_curve(self, days_back=30):
+        """Fetch daily equity snapshots from Alpaca portfolio history."""
+        try:
+            history = self.trading_client.get_portfolio_history(
+                period=f"{min(days_back, 365)}D",
+                timeframe="1D",
+            )
+            return [(ts, eq) for ts, eq in zip(history.timestamp, history.equity)
+                    if eq is not None]
+        except Exception as e:
+            logging.warning("Could not fetch portfolio history: %s", e)
+            return []
+
+    def _equity_curve_sharpe(self, days_back=30):
+        """
+        Annualised Sharpe from the daily portfolio equity curve.
+        Returns None when insufficient data is available.
+        This is the portfolio-level Sharpe — it correctly reflects the 1–3%
+        position-sizing used by the options agent.
+        """
+        curve = self.get_equity_curve(days_back)
+        equities = [eq for _, eq in curve if eq and eq > 0]
+        if len(equities) < 5:
+            return None
+        daily_returns = [
+            (equities[i] - equities[i - 1]) / equities[i - 1]
+            for i in range(1, len(equities))
+        ]
+        n = len(daily_returns)
+        mean_r = sum(daily_returns) / n
+        variance = sum((r - mean_r) ** 2 for r in daily_returns) / max(n - 1, 1)
+        std_dev = math.sqrt(variance)
+        if std_dev == 0:
+            return None
+        rf_daily = (1 + _RISK_FREE_ANNUAL) ** (1 / 252) - 1
+        return round((mean_r - rf_daily) / std_dev * math.sqrt(252), 3)
+
+    # ------------------------------------------------------------------
     # Metrics calculation
     # ------------------------------------------------------------------
 
@@ -131,13 +174,23 @@ class OptionsPerformanceAnalyzer:
         avg_loss_pct = float(np.mean([o['pnl_pct'] for o in losers]))  if losers  else 0.0
         total_pnl    = sum(pnl_dollars)
 
-        # Annualised Sharpe — same methodology as stock performance_analyzer
-        avg_hold_hours = float(np.mean([o['hold_hours'] for o in outcomes]))
-        avg_hold_days  = max(avg_hold_hours / 6.5, 0.1)
+        # -----------------------------------------------------------------
+        # Sharpe ratio — two methods, portfolio-level preferred
+        # -----------------------------------------------------------------
+        avg_hold_hours  = float(np.mean([o['hold_hours'] for o in outcomes]))
+        avg_hold_days   = max(avg_hold_hours / 6.5, 0.5)  # floor at half a trading day
         trades_per_year = 252 / avg_hold_days
+
         mean_r = float(np.mean(pnl_pcts))
-        std_r  = float(np.std(pnl_pcts))
-        sharpe = (mean_r / std_r) * math.sqrt(trades_per_year) if std_r > 0 else 0.0
+        std_r  = float(np.std(pnl_pcts, ddof=1)) if len(pnl_pcts) > 1 else 0.0
+        rf_per_trade = (1 + _RISK_FREE_ANNUAL) ** (avg_hold_days / 252) - 1
+        sharpe_per_trade = (
+            (mean_r - rf_per_trade) / std_r * math.sqrt(trades_per_year)
+            if std_r > 0 else 0.0
+        )
+
+        sharpe_equity = self._equity_curve_sharpe(days_back)
+        sharpe = sharpe_equity if sharpe_equity is not None else sharpe_per_trade
 
         # Max consecutive losses
         max_consec = consec = 0
@@ -172,6 +225,8 @@ class OptionsPerformanceAnalyzer:
             'expectancy_per_trade':   round(expectancy, 4),
             'profit_factor':          round(profit_factor, 3),
             'sharpe_ratio':           round(sharpe, 3),
+            'sharpe_method':          'equity_curve' if sharpe_equity is not None else 'per_trade_corrected',
+            'sharpe_per_trade':       round(sharpe_per_trade, 3),
             'total_realized_pnl':     round(total_pnl, 2),
             'gross_profit':           round(gross_profit, 2),
             'gross_loss':             round(gross_loss, 2),

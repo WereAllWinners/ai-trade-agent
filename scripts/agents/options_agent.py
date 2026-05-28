@@ -63,8 +63,8 @@ def _json_default(obj):
 
 
 def _settled_cash(account) -> float:
-    """Return actual cash balance from Alpaca."""
-    return float(account.cash)
+    """Return fully settled cash (non_marginable_buying_power), excluding T+1 unsettled proceeds."""
+    return float(account.non_marginable_buying_power)
 
 
 def _load_macro_context_block() -> str:

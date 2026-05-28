@@ -181,16 +181,24 @@ class AllocationController:
         winners = sum(1 for p in pnl_pcts if p > 0)
         win_rate = winners / n
 
-        # Per-trade mean and std
+        # Per-trade mean and std (sample std to avoid bias with finite samples)
         mean_pnl = sum(pnl_pcts) / n
         variance = sum((p - mean_pnl) ** 2 for p in pnl_pcts) / max(n - 1, 1)
         std_pnl = math.sqrt(variance) if variance > 0 else 1e-9
 
-        # Annualise assuming ~252 trades/year (conservative)
-        trades_per_year = 252
+        # Annualise using actual average hold time (floor at 0.5 trading days)
+        hold_hours_list = [float(t.get('hold_hours') or 6.5) for t in trades if t.get('hold_hours')]
+        avg_hold_days = max(
+            (sum(hold_hours_list) / len(hold_hours_list)) / 6.5, 0.5
+        ) if hold_hours_list else 1.0
+        trades_per_year = 252 / avg_hold_days
+        rf_per_trade = (1 + _RISK_FREE_RATE) ** (avg_hold_days / 252) - 1
         annualised_return = mean_pnl * trades_per_year
         annualised_std = std_pnl * math.sqrt(trades_per_year)
-        sharpe = (annualised_return - _RISK_FREE_RATE) / annualised_std if annualised_std > 0 else 0.0
+        sharpe = (
+            (mean_pnl - rf_per_trade) / std_pnl * math.sqrt(trades_per_year)
+            if std_pnl > 0 else 0.0
+        )
 
         # Max draw-down on cumulative equity curve (starting at 1.0)
         equity = 1.0

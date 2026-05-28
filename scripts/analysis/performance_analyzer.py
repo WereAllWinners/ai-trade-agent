@@ -1,21 +1,31 @@
 import json
 import math
+import os
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from pathlib import Path
 import logging
 from collections import defaultdict
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 
+_RISK_FREE_ANNUAL = 0.05  # used for Sharpe calculations throughout
+
 class PerformanceAnalyzer:
-    def __init__(self, log_file='logs/trade_log.jsonl'):
+    def __init__(self, log_file='logs/trade_log.jsonl', paper=None):
         self.log_file = log_file
         self.outcomes_file = str(Path(log_file).parent / 'trade_outcomes.jsonl')
         self.trades = []
         self.insights = {}
         self.pnl_metrics = {}
+        if paper is None:
+            paper = os.getenv('PAPER_TRADING', 'true').lower() != 'false'
+        self._paper = paper
+        self._trading_client = None  # lazy-initialised on first equity-curve fetch
     
     def load_trades(self, days_back=7):
         """Load trades from the last N days."""
@@ -61,6 +71,57 @@ class PerformanceAnalyzer:
             logging.error(f"Error loading outcomes: {e}")
         return outcomes
 
+    # ------------------------------------------------------------------
+    # Equity-curve Sharpe (portfolio-level, accounts for position sizing)
+    # ------------------------------------------------------------------
+
+    def _get_trading_client(self):
+        if self._trading_client is None:
+            from alpaca.trading.client import TradingClient
+            self._trading_client = TradingClient(
+                os.getenv('ALPACA_API_KEY'),
+                os.getenv('ALPACA_SECRET_KEY'),
+                paper=self._paper,
+            )
+        return self._trading_client
+
+    def get_equity_curve(self, days_back=30):
+        """Fetch daily equity snapshots from Alpaca portfolio history."""
+        try:
+            history = self._get_trading_client().get_portfolio_history(
+                period=f"{min(days_back, 365)}D",
+                timeframe="1D",
+            )
+            return [(ts, eq) for ts, eq in zip(history.timestamp, history.equity)
+                    if eq is not None]
+        except Exception as e:
+            logging.warning("Could not fetch portfolio history: %s", e)
+            return []
+
+    def _equity_curve_sharpe(self, days_back=30):
+        """
+        Annualised Sharpe from the daily portfolio equity curve.
+        Returns None when insufficient data is available.
+        This is the portfolio-level Sharpe — it correctly reflects the 1–5%
+        position-sizing used by the agent (unlike the per-trade formula).
+        """
+        curve = self.get_equity_curve(days_back)
+        equities = [eq for _, eq in curve if eq and eq > 0]
+        if len(equities) < 5:
+            return None
+        daily_returns = [
+            (equities[i] - equities[i - 1]) / equities[i - 1]
+            for i in range(1, len(equities))
+        ]
+        n = len(daily_returns)
+        mean_r = sum(daily_returns) / n
+        variance = sum((r - mean_r) ** 2 for r in daily_returns) / max(n - 1, 1)
+        std_dev = math.sqrt(variance)
+        if std_dev == 0:
+            return None
+        rf_daily = (1 + _RISK_FREE_ANNUAL) ** (1 / 252) - 1
+        return round((mean_r - rf_daily) / std_dev * math.sqrt(252), 3)
+
     def analyze_pnl_metrics(self, days_back=30):
         """
         Compute real trading metrics from closed trade outcomes.
@@ -90,14 +151,32 @@ class PerformanceAnalyzer:
         avg_loss_pct = float(np.mean([o['pnl_pct'] for o in losers]))  if losers  else 0.0
         total_pnl    = sum(pnl_dollars)
 
-        # Annualised Sharpe: scale by sqrt(estimated trades per year)
-        # based on average hold duration so it's comparable to the backtester
-        avg_hold_hours = float(np.mean([o['hold_hours'] for o in outcomes]))
-        avg_hold_days  = max(avg_hold_hours / 6.5, 0.1)   # 6.5 trading hours/day
+        # -----------------------------------------------------------------
+        # Sharpe ratio — two methods, portfolio-level preferred
+        # -----------------------------------------------------------------
+        avg_hold_hours  = float(np.mean([o['hold_hours'] for o in outcomes]))
+        # Floor at 0.5 trading days to prevent extreme annualization factors
+        # from very short exits (stopped out within minutes).
+        avg_hold_days   = max(avg_hold_hours / 6.5, 0.5)
         trades_per_year = 252 / avg_hold_days
+
         mean_r = float(np.mean(pnl_pcts))
-        std_r  = float(np.std(pnl_pcts))
-        sharpe = (mean_r / std_r) * math.sqrt(trades_per_year) if std_r > 0 else 0.0
+        # Sample std (ddof=1) — unbiased for finite samples
+        std_r  = float(np.std(pnl_pcts, ddof=1)) if len(pnl_pcts) > 1 else 0.0
+        # Risk-free rate scaled to the average hold period
+        rf_per_trade = (1 + _RISK_FREE_ANNUAL) ** (avg_hold_days / 252) - 1
+        sharpe_per_trade = (
+            (mean_r - rf_per_trade) / std_r * math.sqrt(trades_per_year)
+            if std_r > 0 else 0.0
+        )
+
+        # Preferred: portfolio-level Sharpe from the daily equity curve.
+        # This correctly reflects the 1–5% position sizing; the per-trade
+        # formula does not.  Falls back to the corrected per-trade value
+        # if Alpaca portfolio history is unavailable (e.g., paper account
+        # < 5 days old or API unreachable).
+        sharpe_equity = self._equity_curve_sharpe(days_back)
+        sharpe = sharpe_equity if sharpe_equity is not None else sharpe_per_trade
 
         # Max consecutive losses
         max_consec = consec = 0
@@ -127,7 +206,13 @@ class PerformanceAnalyzer:
             'avg_loss_pct':           round(avg_loss_pct, 4),
             'expectancy_per_trade':   round(expectancy, 4),
             'profit_factor':          round(profit_factor, 3),
+            # Primary Sharpe — portfolio-level from equity curve when available,
+            # otherwise corrected per-trade estimate.
             'sharpe_ratio':           round(sharpe, 3),
+            'sharpe_method':          'equity_curve' if sharpe_equity is not None else 'per_trade_corrected',
+            # Diagnostic: corrected per-trade Sharpe (inflated vs portfolio-level;
+            # shown so you can see both numbers side by side).
+            'sharpe_per_trade':       round(sharpe_per_trade, 3),
             'total_realized_pnl':     round(total_pnl, 2),
             'gross_profit':           round(gross_profit, 2),
             'gross_loss':             round(gross_loss, 2),
@@ -289,8 +374,12 @@ class PerformanceAnalyzer:
                   f"(target ≥ {targets.get('win_rate_target', 0.55):.0%})")
             print(f"Profit Factor:    {m['profit_factor']:.2f}  "
                   f"(target ≥ {targets.get('profit_factor_target', 1.4):.1f})")
+            sharpe_method = m.get('sharpe_method', 'unknown')
             print(f"Sharpe Ratio:     {m['sharpe_ratio']:.2f}  "
-                  f"(target ≥ {targets.get('sharpe_target', 0.8):.1f})")
+                  f"(target ≥ {targets.get('sharpe_target', 0.8):.1f})  [{sharpe_method}]")
+            if 'sharpe_per_trade' in m and sharpe_method != 'per_trade_corrected':
+                print(f"  ↳ per-trade est: {m['sharpe_per_trade']:.2f}  "
+                      f"(diagnostic only — inflated vs portfolio-level)")
             print(f"Avg Win:          {m['avg_win_pct']:+.2%}    "
                   f"Avg Loss: {m['avg_loss_pct']:+.2%}")
             print(f"Expectancy/Trade: {m['expectancy_per_trade']:+.2%}")

@@ -29,7 +29,6 @@ def _make_options_agent():
     with patch('options_agent.TradingClient'), \
          patch('options_agent.OptionHistoricalDataClient'), \
          patch('options_agent.load_dotenv'), \
-         patch('options_agent.load_model_once'), \
          patch('options_agent.PortfolioOverseer'), \
          patch('options_agent.AllocationController'):
         from options_agent import OptionsAgent
@@ -125,6 +124,7 @@ class TestOptionsGetAvailableCapital:
         mock_account = MagicMock()
         mock_account.equity = str(equity)
         mock_account.cash   = str(cash)
+        mock_account.non_marginable_buying_power = str(cash)
         agent.trading_client.get_account.return_value = mock_account
         mock_position = MagicMock()
         mock_position.market_value = str(options_value)
@@ -198,6 +198,7 @@ class TestOptionsLiveCashCheck:
             # Set live cash for the pre-submit check
             mock_account = MagicMock()
             mock_account.cash = str(live_cash)
+            mock_account.non_marginable_buying_power = str(live_cash)
             agent.trading_client.get_account.return_value = mock_account
 
             mock_order = MagicMock(); mock_order.id = 'order-1'

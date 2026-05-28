@@ -42,7 +42,6 @@ def _make_options_agent(tmp_db=None):
     with patch('options_agent.TradingClient'), \
          patch('options_agent.OptionHistoricalDataClient'), \
          patch('options_agent.load_dotenv'), \
-         patch('options_agent.load_model_once'), \
          patch('options_agent.PortfolioOverseer'), \
          patch('options_agent.AllocationController'), \
          patch('options_agent._db') as mock_db:

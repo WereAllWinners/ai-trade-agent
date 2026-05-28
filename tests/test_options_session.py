@@ -201,8 +201,24 @@ class TestHappyPath(unittest.TestCase):
                   return_value='BUY_CALL. Confidence: 0.85.'),
             patch('options_agent.parse_decision',
                   return_value={'decision': 'buy', 'confidence': 0.85, 'reasoning': 'bullish'}),
+            patch('options_agent.economic_calendar.get_todays_high_impact_events',
+                  return_value=[]),
+            patch('options_agent.economic_calendar.should_halt_trading',
+                  return_value=(False, '')),
+            patch('options_agent.economic_calendar.get_earnings_today',
+                  return_value=[]),
+            patch('options_agent.economic_calendar.format_macro_guard_block',
+                  return_value=''),
+            patch('options_agent._db') as mock_db,
             patch('builtins.open', unittest.mock.mock_open()),
         ):
+            mock_db.load_daily_start_equity.return_value = None
+            mock_db.save_daily_start_equity.return_value = None
+            mock_db.cleanup_stale_reservations.return_value = None
+            mock_db.get_total_reserved.return_value = 0.0
+            mock_db.reserve_cash.return_value = 1
+            mock_db.release_cash.return_value = None
+            mock_db.insert_trade.return_value = None
             self.agent.run_options_session()
 
     def test_trade_executed(self):

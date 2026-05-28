@@ -423,7 +423,8 @@ def get_recent_trades(limit: int = 100, bot: str = None,
     rows with only the fields AllocationController needs (pnl_pct may be None).
     """
     sql_outcomes = """
-        SELECT symbol, pnl_pct, realized_pnl, entry_timestamp AS timestamp
+        SELECT symbol, pnl_pct, realized_pnl, hold_hours,
+               entry_timestamp AS timestamp
         FROM outcomes
         ORDER BY entry_timestamp DESC
         LIMIT ?

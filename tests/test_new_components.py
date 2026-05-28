@@ -383,14 +383,14 @@ class TestInferenceClient:
         assert info['model'] == 'Qwen/test'
         assert 'url' in info
 
-    def test_vllm_falls_back_to_ollama_on_error(self):
-        """When vLLM request fails, _generate_vllm falls back to Ollama."""
+    def test_vllm_raises_after_exhausted_retries(self):
+        """When all vLLM requests fail, _generate_vllm raises RuntimeError after 3 attempts."""
         import inference_client
-        with patch('inference_client._generate_ollama', return_value='hold') as mock_ollama, \
-             patch('inference_client.INFERENCE_BACKEND', 'vllm'), \
+        import pytest
+        with patch('inference_client.INFERENCE_BACKEND', 'vllm'), \
              patch('inference_client.VLLM_BASE_URL', 'http://localhost:8000/v1'):
             import requests
-            with patch('requests.post', side_effect=Exception("connection refused")):
-                result = inference_client._generate_vllm('prompt', 10, 0.7)
-        mock_ollama.assert_called_once()
-        assert result == 'hold'
+            with patch('requests.post', side_effect=Exception("connection refused")), \
+                 patch('time.sleep'):
+                with pytest.raises(RuntimeError, match="vLLM inference failed after 3 attempts"):
+                    inference_client._generate_vllm('prompt', 10, 0.7)
