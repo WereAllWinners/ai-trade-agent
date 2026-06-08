@@ -330,7 +330,7 @@ class OptionsAgent:
         except Exception as e:
             logging.warning(f"⚠️  Could not write options decision log: {e}")
         try:
-            _db.insert_decision(record, source='paper' if self._paper else 'live')
+            _db.insert_decision(record, source='paper' if getattr(self, '_paper', True) else 'live')
         except Exception as e:
             logging.warning(f"⚠️  Could not write options decision to DB: {e}")
 
@@ -874,7 +874,7 @@ Reasoning: <one sentence explaining the key signal>"""
             with open('logs/options_trade_log.jsonl', 'a') as f:
                 f.write(json.dumps(trade_log, default=_json_default) + '\n')
             try:
-                _db.insert_trade(trade_log, bot='options', source='paper' if self._paper else 'live')
+                _db.insert_trade(trade_log, bot='options', source='paper' if getattr(self, '_paper', True) else 'live')
             except Exception as e:
                 logging.warning(f"⚠️  Could not write options trade to DB: {e}")
             
@@ -1134,7 +1134,7 @@ Reasoning: <one sentence explaining the key signal>"""
 
         # Gate: stay on paper until account reaches OPTIONS_LIVE_THRESHOLD.
         # Allows the stock bot to grow the account before options capital is risked.
-        if not self._paper and not _acfg.options_live_allowed(equity):
+        if not getattr(self, '_paper', True) and not _acfg.options_live_allowed(equity):
             logging.warning(
                 f"⚠️  OPTIONS PAPER FORCED: equity ${equity:,.0f} is below "
                 f"the ${_acfg.OPTIONS_LIVE_THRESHOLD:,.0f} options threshold — "
@@ -1172,13 +1172,13 @@ Reasoning: <one sentence explaining the key signal>"""
         # (equity was already fetched at session start above)
         try:
             if self.daily_start_equity is None:
-                saved = _db.load_daily_start_equity('options', source='paper' if self._paper else 'live')
+                saved = _db.load_daily_start_equity('options', source='paper' if getattr(self, '_paper', True) else 'live')
                 if saved is not None:
                     self.daily_start_equity = saved
                     logging.info(f"📌 Restored daily starting equity from DB: ${saved:,.2f}")
                 else:
                     self.daily_start_equity = equity
-                    _db.save_daily_start_equity('options', equity, source='paper' if self._paper else 'live')
+                    _db.save_daily_start_equity('options', equity, source='paper' if getattr(self, '_paper', True) else 'live')
                     logging.info(f"📌 Daily starting equity set: ${self.daily_start_equity:,.2f}")
             daily_pnl_pct = (equity - self.daily_start_equity) / self.daily_start_equity
             max_loss = self.params['max_daily_loss_pct']

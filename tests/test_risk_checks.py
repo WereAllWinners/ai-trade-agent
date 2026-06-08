@@ -122,7 +122,7 @@ class TestAutonomousAgentRisk:
 
         # Provide enough cash for the buy
         mock_account = MagicMock()
-        mock_account.cash = '10000'
+        mock_account.cash = '10500'
         agent.trading_client.get_account.return_value = mock_account
 
         decision = {'decision': 'buy', 'confidence': 0.80, 'reasoning': 'test', 'current_price': 100.0}
