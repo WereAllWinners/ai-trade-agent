@@ -150,7 +150,7 @@ class TradingDaemon:
             logging.info("📈 STARTING TRADING SESSION")
             logging.info("======================================================================")
             logging.info("🔄 Initializing trading agent...")
-            
+
             result = subprocess.run(
                 [sys.executable, str(_SCRIPTS_DIR / 'agents' / 'autonomous_agent.py')],
                 timeout=14400  # 4 hours — 35 stocks × ~6 min/inference
@@ -344,6 +344,10 @@ class TradingDaemon:
 
         except Exception as e:
             logging.error(f"❌ Fine-tuning failed: {e}")
+        finally:
+            # Restart vLLM here, after finetune_model.py and all its children (training +
+            # eval subprocesses) have fully exited and released their GPU memory.
+            inference_client.start_after_finetuning()
     
     def sleep_until_next_event(self):
         """Sleep until next scheduled event."""

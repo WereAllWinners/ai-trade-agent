@@ -66,16 +66,48 @@ def warmup() -> None:
         _warmup_ollama()
 
 
+def start_after_finetuning() -> None:
+    """
+    Restart the inference server after fine-tuning so it picks up the new merged model.
+    Called by the daemon AFTER the finetune_model subprocess (and all its children) have
+    fully exited, ensuring their GPU memory is released before vLLM loads.
+    """
+    if INFERENCE_BACKEND == 'vllm':
+        import time as _time
+        # Wait for the CUDA driver to consolidate memory freed by the fine-tuning
+        # subprocess. Without this delay, vLLM starts on fragmented memory and the
+        # CUDA graph profiler hits NVRM OOM (_memdescAllocInternal), which leaves the
+        # GPU driver in an unstable state and causes a hard system crash hours later.
+        logging.info("⏳ Waiting 90s for GPU memory to drain before restarting vLLM…")
+        _time.sleep(90)
+        _restart_vllm()
+
+
+def _restart_vllm() -> None:
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['sudo', 'systemctl', 'restart', 'ai-inference-server.service'],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            logging.info("🔄 ai-inference-server restarting (new merged model loads in ~2-3 min)")
+        else:
+            logging.warning(f"⚠️  systemctl restart returned {result.returncode}: {result.stderr.strip()}")
+    except Exception as e:
+        logging.warning(f"⚠️  Could not restart vLLM server: {e}")
+
+
 def stop_for_finetuning() -> None:
     """
     Release GPU VRAM before a fine-tuning job loads the base model.
-    Ollama only — vLLM serves continuously and is not stopped for fine-tuning.
-    (Fine-tuning uses a separate process with different model weights.)
+    Fine-tuning Qwen 32B needs ~130 GB; vLLM holding the model concurrently
+    overflows the GB10's 128 GB and causes hard NVRM OOM crashes.
     """
-    if INFERENCE_BACKEND == 'ollama':
-        _stop_ollama()
+    if INFERENCE_BACKEND == 'vllm':
+        _stop_vllm()
     else:
-        logging.debug("inference_client: vLLM backend — skipping model unload (fine-tuning is separate)")
+        _stop_ollama()
 
 
 def backend_info() -> dict:
@@ -133,6 +165,21 @@ def _stop_ollama() -> None:
         logging.debug("ollama CLI not found — skipping model unload")
     except Exception as e:
         logging.warning(f"⚠️  Could not unload Ollama model: {e}")
+
+
+def _stop_vllm() -> None:
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['sudo', 'systemctl', 'stop', 'ai-inference-server.service'],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            logging.info("🛑 vLLM inference server stopped (pre-finetune, frees ~20 GB VRAM)")
+        else:
+            logging.warning(f"⚠️  systemctl stop returned {result.returncode}: {result.stderr.strip()}")
+    except Exception as e:
+        logging.warning(f"⚠️  Could not stop vLLM server: {e}")
 
 
 # ---------------------------------------------------------------------------

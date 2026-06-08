@@ -35,7 +35,7 @@ from allocation_controller import AllocationController
 import account_config as _acfg
 
 _DEBATE_CONFIDENCE_THRESHOLD = 0.90   # Only debate very high-conviction trades
-_MIN_CASH_RESERVE = 500.0             # Never spend the account's last $500 of cash
+_MIN_CASH_RESERVE = float(os.getenv('MIN_CASH_RESERVE', '500'))  # Never spend the account's last N dollars of cash
 _DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'  # log orders but never submit
 _PDT_DAY_TRADE_LIMIT = 3              # Max same-day round trips before PDT block kicks in
 _EXPLORATION_SHARPE_THRESHOLD = 1.0   # Inject novel symbols when recent Sharpe is below this
@@ -255,21 +255,16 @@ class AutonomousAgent:
             paper=_paper
         )
 
-        # PDT gate: stock bot must stay on the paper endpoint until equity >= $25,000.
-        # If PAPER_TRADING=false was set prematurely, re-create the client as paper and warn.
+        # Live trading at sub-$25k is allowed in PDT-safe mode.
+        # Small-account params (max 2 trades/day, no same-day close) are applied
+        # each session via run_trading_session() once equity is fetched.
         if not _paper:
             _equity = _acfg.fetch_equity(self.trading_client)
-            if not _acfg.stock_live_allowed(_equity):
+            if _equity < _acfg.OPTIONS_LIVE_THRESHOLD:
                 logging.warning(
-                    f"⚠️  PAPER TRADING FORCED: account equity ${_equity:,.0f} is below "
-                    f"the ${_acfg.LIVE_EQUITY_THRESHOLD:,.0f} PDT threshold. "
-                    f"Stock bot will run on the paper endpoint until the threshold is cleared."
-                )
-                _paper = True
-                self.trading_client = TradingClient(
-                    os.getenv('ALPACA_API_KEY'),
-                    os.getenv('ALPACA_SECRET_KEY'),
-                    paper=True,
+                    f"⚠️  SMALL ACCOUNT (${_equity:,.0f}): PDT-safe mode active — "
+                    f"max 2 trades/day, no same-day closes. "
+                    f"Options bot unlocks at ${_acfg.OPTIONS_LIVE_THRESHOLD:,.0f}."
                 )
 
         from utils.alpaca_retry import retry_on_rate_limit
@@ -392,7 +387,7 @@ class AutonomousAgent:
         except Exception as e:
             logging.warning(f"⚠️  Could not write decision log: {e}")
         try:
-            _db.insert_decision(record)
+            _db.insert_decision(record, source='paper' if self._paper else 'live')
         except Exception as e:
             logging.warning(f"⚠️  Could not write decision to DB: {e}")
 
@@ -413,6 +408,20 @@ class AutonomousAgent:
             return int(row[0]) if row else 0
         except Exception:
             return 0
+
+    def _bought_today(self, symbol: str) -> bool:
+        """True if a filled BUY for this symbol was placed today (same-day PDT guard)."""
+        today = datetime.now().date().isoformat()
+        try:
+            with _db.get_conn() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM trades WHERE bot='stock' AND action='buy' "
+                    "AND symbol=? AND timestamp LIKE ?",
+                    [symbol, f"{today}%"]
+                ).fetchone()
+            return bool(row and int(row[0]) > 0)
+        except Exception:
+            return False
 
     def check_cooldown(self, symbol):
         """Check if symbol is on cooldown."""
@@ -552,7 +561,14 @@ class AutonomousAgent:
                 if position is None:
                     logging.warning(f"⚠️  Skipping SELL {symbol}: no open position held")
                     return False
-                shares = int(float(position.qty))
+                # PDT guard: in small-account mode never close a position opened today
+                if self.params.get('no_same_day_close') and self._bought_today(symbol):
+                    logging.info(
+                        f"⏳ Skipping SELL {symbol}: opened today — "
+                        f"no_same_day_close is active (PDT-safe mode)"
+                    )
+                    return False
+                shares = float(position.qty)
                 avg_entry_price = float(position.avg_entry_price)
             else:
                 # Proactive PDT check — count today's round trips before another buy
@@ -593,7 +609,8 @@ class AutonomousAgent:
                 # Use allocation-controller tier to determine position size
                 alloc_pct = self.alloc_controller.get_position_size_pct()
                 position_value = spendable * alloc_pct
-                shares = int(position_value / current_price)
+                # Fractional shares — round to 9 decimal places (Alpaca's max precision)
+                shares = round(position_value / current_price, 9)
 
                 # Portfolio concentration guard
                 allowed, veto_reason = self.overseer.is_buy_allowed(symbol, position_value, equity)
@@ -604,8 +621,8 @@ class AutonomousAgent:
                 # Atomically reserve this cash so the options bot can't double-spend it
                 reservation_id = _db.reserve_cash('stock', position_value)
 
-            if shares == 0:
-                logging.warning(f"⚠️  Position too small for {symbol}")
+            if position_value < 1.0 or shares <= 0:
+                logging.warning(f"⚠️  Position too small for {symbol} (${position_value:.2f})")
                 return False
 
             # Paper-trading realism: simulate slippage, partial fills, non-fills
@@ -633,21 +650,34 @@ class AutonomousAgent:
                 logging.warning(f"⚠️  Partial fill resulted in 0 shares for {symbol}")
                 return False
 
-            # Bracket order at the simulated fill price with broker-native
-            # stop-loss and take-profit child orders. Alpaca manages the exits
-            # automatically so we don't rely on the LLM to re-examine positions.
+            # Alpaca does not allow bracket orders on fractional quantities.
+            # For fractional shares, submit a simple market order — the agent
+            # monitors positions every 30 min and issues SELL decisions for exits.
+            # For whole-share positions, use a bracket order for automatic exits.
             stop_price   = round(fill_price * (1 + self.params['stop_loss']), 2)
             target_price = round(fill_price * (1 + self.params['take_profit']), 2)
-            order = LimitOrderRequest(
-                symbol=symbol,
-                qty=shares,
-                side=side,
-                limit_price=round(fill_price, 2),
-                time_in_force=TimeInForce.DAY,
-                order_class=OrderClass.BRACKET,
-                stop_loss=StopLossRequest(stop_price=stop_price),
-                take_profit=TakeProfitRequest(limit_price=target_price),
-            )
+            if shares != int(shares):
+                order = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=round(shares, 9),
+                    side=side,
+                    time_in_force=TimeInForce.DAY,
+                )
+                logging.info(
+                    f"📋 Fractional order — no bracket (stop ${stop_price:.2f} / "
+                    f"target ${target_price:.2f} tracked by agent)"
+                )
+            else:
+                order = LimitOrderRequest(
+                    symbol=symbol,
+                    qty=int(shares),
+                    side=side,
+                    limit_price=round(fill_price, 2),
+                    time_in_force=TimeInForce.DAY,
+                    order_class=OrderClass.BRACKET,
+                    stop_loss=StopLossRequest(stop_price=stop_price),
+                    take_profit=TakeProfitRequest(limit_price=target_price),
+                )
 
             # DRY RUN: log the order without submitting it
             if _DRY_RUN:
@@ -678,7 +708,7 @@ class AutonomousAgent:
             with open('logs/trade_log.jsonl', 'a') as f:
                 f.write(json.dumps(trade_log) + '\n')
             try:
-                _db.insert_trade(trade_log, bot='stock')
+                _db.insert_trade(trade_log, bot='stock', source='paper' if self._paper else 'live')
             except Exception as e:
                 logging.warning(f"⚠️  Could not write trade to DB: {e}")
 
@@ -981,6 +1011,13 @@ class AutonomousAgent:
             f"Settled: ${settled:,.2f} (T+1 pending: ${cash - settled:,.2f})"
         )
 
+        # Apply account-tier params and fire upgrade alert when equity crosses thresholds.
+        stock_overrides = _acfg.get_stock_params(equity)
+        if stock_overrides:
+            self.params.update(stock_overrides)
+        _acfg.check_for_upgrade(equity, getattr(self, '_prev_equity', None))
+        self._prev_equity = equity
+
         # Hard gate: refuse all buys if cash is at or below the minimum reserve
         if cash <= _MIN_CASH_RESERVE:
             logging.warning(
@@ -992,13 +1029,13 @@ class AutonomousAgent:
         # Record starting equity for circuit breaker — restore from DB first so
         # a daemon restart mid-day doesn't reset the baseline to current equity.
         if self.daily_start_equity is None:
-            saved = _db.load_daily_start_equity('stock')
+            saved = _db.load_daily_start_equity('stock', source='paper' if self._paper else 'live')
             if saved is not None:
                 self.daily_start_equity = saved
                 logging.info(f"📌 Restored daily starting equity from DB: ${saved:,.2f}")
             else:
                 self.daily_start_equity = equity
-                _db.save_daily_start_equity('stock', equity)
+                _db.save_daily_start_equity('stock', equity, source='paper' if self._paper else 'live')
                 logging.info(f"📌 Daily starting equity set: ${self.daily_start_equity:,.2f}")
 
         # Circuit breaker: stop trading if daily loss exceeds threshold

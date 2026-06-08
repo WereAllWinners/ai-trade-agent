@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import GetPortfolioHistoryRequest
 
 load_dotenv()
 
@@ -107,10 +108,11 @@ class OptionsPerformanceAnalyzer:
     def get_equity_curve(self, days_back=30):
         """Fetch daily equity snapshots from Alpaca portfolio history."""
         try:
-            history = self.trading_client.get_portfolio_history(
+            req = GetPortfolioHistoryRequest(
                 period=f"{min(days_back, 365)}D",
                 timeframe="1D",
             )
+            history = self.trading_client.get_portfolio_history(req)
             return [(ts, eq) for ts, eq in zip(history.timestamp, history.equity)
                     if eq is not None]
         except Exception as e:

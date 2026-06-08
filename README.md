@@ -1,737 +1,481 @@
-# AI Trade Agent 🤖📈
+# AI Trade Agent
 
-Autonomous AI-powered trading system with dual agents for stocks and options, featuring self-improving capabilities through daily model fine-tuning.
+Autonomous AI-powered trading system with dual agents for stocks and options, featuring self-improving capabilities through daily model fine-tuning. Runs 24/7 on an NVIDIA GB10 Grace Blackwell (128 GB unified memory).
 
-## 🌟 Features
+## Architecture Overview
 
-- **Dual-Agent System**: Separate bots for stock trading and options trading
-- **Autonomous Discovery**: Automatically finds trading opportunities using technical analysis
-- **AI-Powered Decisions**: Uses fine-tuned Qwen 2.5 32B LLM for trade analysis
-- **Self-Improving**: Daily performance analysis and model fine-tuning
-- **Weekend Deep Research**: Comprehensive market analysis and model updates on Saturdays
-- **Risk Management**: Strict position sizing, stop losses, and portfolio limits
-- **24/7 Operation**: Runs continuously with systemd services
-- **World-Class Learning**: Learns from congressional trades, 13F filings, and proven strategies
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Shared vLLM Server                         │
+│           Qwen 2.5 32B (BF16 merged + 4-bit quantized)          │
+│           Serves all agents over OpenAI-compatible API          │
+└───────────────────────┬─────────────────────────────────────────┘
+                        │
+          ┌─────────────┼─────────────┐─────────────┐
+          ▼             ▼             ▼              ▼
+   Stock Bot       Options Bot    Stock Bot       Options Bot
+   (paper)         (paper)        (live)          (live*)
+   training        training       exec only       exec only
+   fine-tunes      fine-tunes     no training     no training
 
-## 📊 System Architecture
+  * live options bot gated behind $5,000 equity threshold
+```
 
-### Stock Trading Bot
-- **Trading Frequency**: Every 30 minutes during market hours (9:30 AM - 4:00 PM EST)
-- **Position Sizing**: Max 5% of portfolio per position
-- **Daily Trade Limit**: 10 trades maximum
-- **Risk Controls**: 
-  - Stop loss: -7%
-  - Take profit: +15%
-  - Min confidence: 60%
-- **Schedule**:
-  - 5:00 PM EST: Daily performance analysis
-  - 8:00 PM EST: Model fine-tuning
+The system runs **four trading agents** sharing one vLLM inference server:
+- Paper agents trade unlimited, generate training data, and drive daily fine-tuning
+- Live agents execute only — no fine-tuning, no analysis, no weekend strategist
+- All trade data is tagged `source=paper|live` and `bot=stock|options` in SQLite
 
-### Options Trading Bot
-- **Trading Frequency**: Every 60 minutes during market hours
-- **Portfolio Allocation**: 10-15% of total portfolio
-- **Position Sizing**: Max 3% per options position
-- **Daily Trade Limit**: 5 options trades maximum
-- **Risk Controls**:
-  - Stop loss: -50%
-  - Take profit: +50%
-  - Min confidence: 75%
-  - DTE range: 7-45 days
-  - Target delta: 0.30
-- **Schedule**:
-  - 5:30 PM EST: Daily performance analysis
-  - 9:00 PM EST: Model fine-tuning
+## Features
 
-### Weekend Strategy (Saturday 10:00 AM EST)
-1. 🔬 Deep market research and trend analysis
-2. 📊 Collect world-class training data (congressional trades, 13F filings, proven strategies)
-3. 🎓 Fine-tune model with new insights (2 epochs, ~45 minutes)
-4. ✅ Model ready and optimized before Monday market open!
+- **Dual-Agent System**: Separate stock and options bots, each with paper and live instances
+- **Shared vLLM Inference**: One Qwen 2.5 32B instance serves all four agents (3-5× faster than per-process inference)
+- **Self-Improving Loop**: Daily fine-tuning → eval → A/B promotion → model merge → vLLM reload
+- **PDT-Safe Small Account Mode**: Stock bot trades live at any equity; protects against day-trade violations via `no_same_day_close` and conservative position sizing
+- **Fractional Share Trading**: $39 position sizes work on stocks priced above $39 via Alpaca fractional shares
+- **Equity-Gated Live Options**: Options bot stays on paper until account reaches $5,000
+- **Portfolio Overseer**: Sector caps (30% max), max correlated positions (4)
+- **Allocation Tiers**: Tier 1/2/3 sizing (1%/3%/5%) unlocked by trade count, Sharpe, and drawdown thresholds
+- **Economic Calendar Guard**: Halts trading ±30–60 min around FOMC, NFP, and CPI releases
+- **Unusual Options Flow**: Scanner detects institutional positioning signals
+- **Congressional Trade Tracking**: Monitors politician disclosures for sentiment signals
+- **LLM News Sentiment**: Real-time news scoring via the same Qwen 32B model
+- **24/7 Operation**: systemd services with auto-restart and full journald logging
+- **Health Endpoint**: `/health` /`status` `/metrics` (Prometheus) on port 8765
+- **Email Alerts**: Circuit breaker, trade execution, account upgrade thresholds
 
-## 🚀 Quick Start
+## Project Structure
 
-### Prerequisites
+```
+ai-trade-agent/
+├── scripts/
+│   ├── agents/
+│   │   ├── autonomous_agent.py       # Stock trading logic (paper + live)
+│   │   └── options_agent.py          # Options trading logic (paper + live)
+│   ├── analysis/
+│   │   ├── backtester.py             # Historical backtesting
+│   │   ├── outcome_tracker.py        # Stock trade outcome recording
+│   │   ├── options_outcome_tracker.py
+│   │   ├── performance_analyzer.py   # Daily stock P&L analysis
+│   │   ├── options_performance_analyzer.py
+│   │   ├── weekend_strategist.py     # Saturday deep research (stocks)
+│   │   ├── options_weekend_strategist.py
+│   │   └── weekly_report.py          # Saturday summary email
+│   ├── data/
+│   │   ├── stock_discovery.py        # Candidate scanner (technicals)
+│   │   ├── news_fetcher.py           # News with LLM sentiment
+│   │   ├── congressional_tracker.py  # Politician trade disclosures
+│   │   ├── unusual_flow_scanner.py   # Options flow anomaly detection
+│   │   ├── market_researcher.py      # Macro / sector context
+│   │   ├── economic_calendar.py      # FOMC/NFP/CPI guard
+│   │   └── data_utils.py
+│   ├── training/
+│   │   ├── finetune_model.py         # SFT + DPO daily fine-tuning
+│   │   ├── training_data_builder.py  # Builds training_data.json from SQLite
+│   │   ├── eval_model.py             # A/B evaluation before promotion
+│   │   ├── model_promoter.py         # Merges LoRA → BF16, updates symlinks
+│   │   └── online_trainer.py        # In-process online learning
+│   ├── tools/
+│   │   ├── close_all_positions.py    # Emergency: close everything
+│   │   ├── liquidate_to_cash.py      # Liquidate to cash
+│   │   ├── fix_pdt.py                # PDT flag remediation
+│   │   ├── cover_cash_deficit.py     # Cash deficit helper
+│   │   └── morning_model_check.py    # Pre-market model health check
+│   ├── trading_daemon.py             # Stock agent orchestration loop (24/7)
+│   ├── options_daemon.py             # Options agent orchestration loop (24/7)
+│   ├── inference_client.py           # vLLM / Ollama abstraction
+│   ├── model_inference_lora.py       # Direct LoRA inference (fallback)
+│   ├── db.py                         # SQLite schema + queries (WAL mode)
+│   ├── account_config.py             # Equity-based param tiers + upgrade alerts
+│   ├── portfolio_overseer.py         # Sector caps, correlation guards
+│   ├── allocation_controller.py      # Tier 1→3 position sizing
+│   ├── alerts.py                     # Email + JSONL alert dispatch
+│   ├── health_server.py              # HTTP /health /status /metrics
+│   └── start_vllm_server.sh          # vLLM startup script (called by systemd)
+├── finetune/
+│   ├── fine_tune_llm.py              # Manual fine-tune entry point
+│   ├── data_collection.py            # Pre-training data collector
+│   ├── data/finance_tuning/
+│   │   ├── training_data.json
+│   │   └── validation_report.json
+│   └── finance_qwen_32b_lora_*/      # Timestamped LoRA checkpoints
+│   └── finance_qwen_32b_merged_*/    # Merged BF16 models (vLLM-ready)
+│   └── finance_qwen_32b_merged_latest -> ...  # Symlink vLLM always reads
+├── services/
+│   ├── ai-inference-server.service   # Shared vLLM server
+│   ├── ai-trading-bot.service        # Paper stock bot
+│   ├── ai-options-bot.service        # Paper options bot
+│   ├── ai-trading-bot-live.service   # Live stock bot
+│   ├── ai-options-bot-live.service   # Live options bot (equity-gated)
+│   └── ai-health-server.service      # Health + metrics server
+├── tests/                            # pytest suite
+├── logs/                             # Runtime: trading.db, *.jsonl (gitignored)
+├── .env                              # Paper trading credentials (gitignored)
+├── .env.live                         # Live trading credentials (gitignored)
+├── .env.example                      # Template
+└── requirements.txt
+```
 
-- **Hardware**: 
-  - CUDA-capable GPU with 8GB+ VRAM (recommended: 32GB+ for Qwen 32B)
-  - 64GB+ RAM
-  - 100GB+ free disk space (for model files and data)
-- **Software**:
-  - Python 3.10 or higher
-  - CUDA 12.1+ (for GPU acceleration)
-  - Linux (Ubuntu 22.04+ recommended)
-- **API**: Alpaca trading account (paper or live)
+## Hardware Requirements
 
-### Installation
+This system is designed for and tested on an **NVIDIA GB10 Grace Blackwell** (NVIDIA ZGX Nano):
 
-1. **Clone the repository:**
+| Resource | Minimum | Recommended |
+|---|---|---|
+| GPU VRAM | 40 GB | 128 GB unified |
+| RAM | 64 GB | 128 GB unified |
+| Disk | 150 GB | 500 GB+ |
+| OS | Ubuntu 22.04 | Ubuntu 24.04 |
+
+**Why 128 GB?** Qwen 32B fine-tuning needs ~130 GB. The GB10's unified CPU/GPU memory pool handles this. vLLM is stopped before fine-tuning begins and restarted after — they never run concurrently.
+
+Smaller GPUs can run the system but must lower `--gpu-memory-utilization` and may need a smaller base model (e.g., Qwen 7B).
+
+## Quick Start
+
+### 1. Install dependencies
+
 ```bash
 git clone https://github.com/WereAllWinners/ai-trade-agent.git
 cd ai-trade-agent
-```
-
-2. **Create and activate conda environment (recommended):**
-```bash
-conda create -n trading python=3.12
-conda activate trading
-```
-
-3. **Install dependencies:**
-```bash
+python -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
+```
+
+For fine-tuning (unsloth + bitsandbytes):
+```bash
 pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
 ```
 
-4. **Set up environment variables:**
+### 2. Set up environment
+
 ```bash
 cp .env.example .env
-nano .env  # Edit with your API keys
+# Edit .env with your Alpaca paper credentials and model paths
 ```
 
-Your `.env` file should look like:
+Key variables in `.env`:
 ```env
-ALPACA_API_KEY=your_paper_api_key_here
-ALPACA_SECRET_KEY=your_paper_secret_key_here
-
-# IMPORTANT: Keep true until you have 1-3 months of validated paper trading
+ALPACA_API_KEY=your_paper_api_key
+ALPACA_SECRET_KEY=your_paper_secret_key
 PAPER_TRADING=true
 
-# Optional overrides
-# BASE_MODEL=Qwen/Qwen2.5-32B-Instruct
-# LORA_ADAPTER_PATH=/absolute/path/to/lora/adapter
-```
+INFERENCE_BACKEND=vllm          # or ollama for lighter-weight testing
+VLLM_BASE_URL=http://localhost:8000/v1
+VLLM_MODEL=Qwen/Qwen2.5-32B-Instruct
+INFERENCE_TIMEOUT=300
 
-Get your API keys from [Alpaca Markets](https://alpaca.markets/)
+LORA_ADAPTER_PATH=finetune/finance_qwen_32b_lora_latest
 
-> **`PAPER_TRADING=true` is the default and must stay `true`** during development and validation.
-> Only set it to `false` when you are fully ready for live trading (see the Live Trading Checklist below).
+FINNHUB_API_KEY=your_key        # Economic calendar guard
+POLYGON_API_KEY=your_key        # Options flow data
 
-## 🧠 Model Setup & Fine-tuning
-
-This project uses **Qwen 2.5 32B Instruct** model, fine-tuned with LoRA (Low-Rank Adaptation) for efficient training.
-
-### Model Details
-
-- **Base Model**: `unsloth/qwen2.5-32b-instruct-bnb-4bit`
-- **Model Size**: ~20GB (4-bit quantized)
-- **Parameters**: 32 billion
-- **Architecture**: Qwen 2.5 with instruction tuning
-- **Quantization**: 4-bit via bitsandbytes (for memory efficiency)
-- **Fine-tuning Method**: LoRA adapters (~2GB)
-
-### Option 1: Automatic Download (Recommended for First-Time Users)
-
-The model will automatically download when you run fine-tuning:
-```bash
-python3 finetune/fine_tune_llm.py \
-  --data finetune/data/finance_tuning/training_data.json \
-  --epochs 3
-```
-
-The model will be cached in `~/.cache/huggingface/hub/` and reused for future runs.
-
-### Option 2: Manual Download (Recommended for Advanced Users)
-
-**Using Hugging Face CLI:**
-```bash
-# Install Hugging Face Hub
-pip install huggingface-hub[cli]
-
-# Login (optional - only needed for gated models)
-huggingface-cli login
-
-# Download the model
-huggingface-cli download unsloth/qwen2.5-32b-instruct-bnb-4bit \
-  --local-dir ~/.cache/huggingface/hub/models--unsloth--qwen2.5-32b-instruct-bnb-4bit \
-  --local-dir-use-symlinks False
-```
-
-**Using Python:**
-```python
-from huggingface_hub import snapshot_download
-
-# Download model
-model_path = snapshot_download(
-    repo_id="unsloth/qwen2.5-32b-instruct-bnb-4bit",
-    cache_dir="~/.cache/huggingface/hub",
-    resume_download=True  # Resume if interrupted
-)
-
-print(f"Model downloaded to: {model_path}")
-```
-
-**Download Progress:**
-- Total size: ~20GB
-- Time: 10-30 minutes (depending on internet speed)
-- Location: `~/.cache/huggingface/hub/models--unsloth--qwen2.5-32b-instruct-bnb-4bit/`
-
-### Verify Model Download
-```bash
-# Check if model exists
-ls -lh ~/.cache/huggingface/hub/models--unsloth--qwen2.5-32b-instruct-bnb-4bit/
-
-# Should show files like:
-# - model-00001-of-00004.safetensors
-# - model-00002-of-00004.safetensors
-# - model-00003-of-00004.safetensors
-# - model-00004-of-00004.safetensors
-# - config.json
-# - tokenizer.json
-# - etc.
-
-# Check total size
-du -sh ~/.cache/huggingface/hub/models--unsloth--qwen2.5-32b-instruct-bnb-4bit/
-# Should be ~20GB
-```
-
-### Fine-tuning the Model
-
-#### Step 1: Collect Training Data
-```bash
-# Collect financial data from multiple sources
-python3 finetune/data_collection.py
-```
-
-This creates `finetune/data/finance_tuning/training_data.json` with examples from:
-- Your Alpaca portfolio performance
-- High-volume and trending stocks
-- Technical indicators and market conditions
-- Dynamic symbol discovery
-
-**For world-class training data (congressional trades, 13F filings, proven strategies):**
-```bash
-# Edit data_collection.py to use WorldClassDataCollector
-# Then run it to get elite training data
-python3 finetune/data_collection.py
-```
-
-#### Step 2: Fine-tune the Model
-
-**Fresh Training (First Time):**
-```bash
-python3 finetune/fine_tune_llm.py \
-  --data finetune/data/finance_tuning/training_data.json \
-  --epochs 3 \
-  --batch-size 2 \
-  --learning-rate 2e-4
-```
-
-**Continue Training (Add New Knowledge to Existing Model):**
-```bash
-python3 finetune/fine_tune_llm.py \
-  --data finetune/data/finance_tuning/training_data.json \
-  --continue-from finetune/finance_qwen_32b_lora \
-  --epochs 2
-```
-
-**Fine-tuning Options:**
-```bash
---data           Path to training data JSON file (required)
---continue-from  Path to existing LoRA adapter (optional, for continued training)
---base-model     Base model to use (default: qwen2.5-32b-instruct-bnb-4bit)
---output         Output directory for LoRA adapter
---epochs         Number of training epochs (default: 3)
---batch-size     Per-device batch size (default: 2)
---learning-rate  Learning rate (default: 2e-4)
-```
-
-**Training Time**: 
-- Fresh training: ~1-2 hours (3 epochs)
-- Continue training: ~30-45 minutes (2 epochs)
-- Depends on: dataset size, GPU, batch size
-
-**Output**: LoRA adapter saved to `finetune/finance_qwen_32b_lora_[timestamp]/`
-
-#### Step 3: Verify Model
-```bash
-# Test the fine-tuned model
-python3 scripts/model_inference_lora.py
-```
-
-### Understanding the Model Architecture
-```
-┌─────────────────────────────────────────┐
-│   Qwen 2.5 32B Base Model (20GB)        │
-│   - Pre-trained on general knowledge    │
-│   - Instruction-tuned                   │
-│   - 4-bit quantized for efficiency      │
-└─────────────────────────────────────────┘
-                    ↓
-┌─────────────────────────────────────────┐
-│   LoRA Adapter (~2GB)                   │
-│   - Your custom trading knowledge       │
-│   - Portfolio performance lessons       │
-│   - Congressional trades                │
-│   - 13F filings & proven strategies     │
-└─────────────────────────────────────────┘
-                    ↓
-┌─────────────────────────────────────────┐
-│   Fine-tuned Trading Model              │
-│   - Ready for autonomous trading        │
-│   - Self-improving daily                │
-└─────────────────────────────────────────┘
-```
-
-**Why LoRA?**
-- ✅ Train in minutes instead of hours
-- ✅ Small adapter size (2GB vs 50GB full model)
-- ✅ Easy to update daily with new trading data
-- ✅ Can run on consumer GPUs
-- ✅ Multiple adapters for different strategies
-
-### Model Update Schedule
-
-**Daily (Weekdays at 8:00 PM EST):**
-- Quick fine-tuning with day's trading results
-- 1 epoch, ~15 minutes
-- Incremental learning from wins/losses
-
-**Weekly (Saturday at 10:00 AM EST):**
-- Comprehensive training with world-class data
-- 2 epochs, ~45 minutes
-- Major knowledge updates before Monday
-
-## 📁 Project Structure
-```
-ai-trade-agent/
-├── scripts/                          # Trading agents and utilities
-│   ├── autonomous_agent.py           # Stock trading logic
-│   ├── options_agent.py              # Options trading logic
-│   ├── trading_daemon.py             # Stock trading daemon (24/7)
-│   ├── options_daemon.py             # Options trading daemon (24/7)
-│   ├── model_inference_lora.py       # LLM inference with LoRA
-│   ├── performance_analyzer.py       # Stock performance analysis
-│   ├── options_performance_analyzer.py
-│   ├── stock_discovery.py            # Find trading opportunities
-│   ├── weekend_strategist.py         # Weekend deep analysis
-│   ├── finetune_model.py            # Daily fine-tuning script
-│   └── data_utils.py                # Utility functions
-├── finetune/                        # Model training system
-│   ├── data_collection.py           # Collect training data
-│   ├── fine_tune_llm.py             # Fine-tune model
-│   ├── data/                        # Training data storage
-│   │   └── finance_tuning/
-│   │       ├── training_data.json
-│   │       ├── validation_report.json
-│   │       └── portfolio_analysis.json
-│   └── finance_qwen_32b_lora/       # Fine-tuned model (not in repo)
-├── services/                        # Systemd service files
-│   ├── ai-trading-bot.service       # Stock trading service
-│   └── ai-options-bot.service       # Options trading service
-├── logs/                            # Trade history (not in repo)
-│   ├── trade_log.jsonl              # Stock trade history
-│   ├── options_trade_log.jsonl      # Options trade history
-│   ├── performance_metrics.json
-│   └── options_performance_metrics.json
-├── requirements.txt                 # Python dependencies
-├── .env.example                     # Environment variables template
-├── .gitignore                       # Git ignore rules
-└── README.md                        # This file
-```
-
-## 🎮 Running the Bots
-
-### Manual Testing
-```bash
-# Test stock discovery
-python3 scripts/stock_discovery.py
-
-# Test stock trading
-python3 scripts/autonomous_agent.py
-
-# Test options trading
-python3 scripts/options_agent.py
-
-# Test model inference
-python3 scripts/model_inference_lora.py
-
-# Test weekend analysis
-python3 scripts/weekend_strategist.py
-
-# Run backtest (no GPU required — uses rule-based signals on historical data)
-python3 scripts/backtester.py --symbols SPY QQQ AAPL MSFT NVDA --days 365
-python3 scripts/backtester.py --symbols SPY --days 730 --stop-loss -0.05 --take-profit 0.12
-
-# Run unit tests
-python3 -m pytest tests/ -v
-
-# Test alerts system (writes to logs/alerts.jsonl, sends email if configured)
-python3 scripts/alerts.py
-```
-
-### Production Deployment (Systemd)
-
-**Install services:**
-```bash
-# Copy service files
-sudo cp services/*.service /etc/systemd/system/
-sudo systemctl daemon-reload
-
-# Start bots
-sudo systemctl start ai-trading-bot.service
-sudo systemctl start ai-options-bot.service
-
-# Enable auto-start on boot
-sudo systemctl enable ai-trading-bot.service
-sudo systemctl enable ai-options-bot.service
-```
-
-**Monitor logs:**
-```bash
-# Stock trading bot
-sudo journalctl -u ai-trading-bot.service -f
-
-# Options trading bot
-sudo journalctl -u ai-options-bot.service -f
-
-# Both bots
-sudo journalctl -u ai-trading-bot.service -u ai-options-bot.service -f
-```
-
-**Control services:**
-```bash
-# Stop
-sudo systemctl stop ai-trading-bot.service
-
-# Restart
-sudo systemctl restart ai-trading-bot.service
-
-# Check status
-sudo systemctl status ai-trading-bot.service
-```
-
-## 🔔 Alerts & Health Monitoring
-
-### Alert Channels
-
-| Channel | Always active? | Config required |
-|---------|---------------|-----------------|
-| File log (`logs/alerts.jsonl`) | Yes | None |
-| Email (SMTP) | Optional | See `.env.example` |
-
-**Events that trigger alerts:**
-- `circuit_breaker` — CRITICAL — daily loss limit hit, trading halted
-- `trade_executed` — INFO — every successfully placed order
-- `trade_failed` — WARNING — order rejected or API error
-
-**Email setup (Gmail example):**
-```env
-# In .env — create an App Password at https://myaccount.google.com/apppasswords
-ALERT_EMAIL_FROM=yourbot@gmail.com
-ALERT_EMAIL_TO=you@example.com
+# Email alerts (optional — Gmail App Password)
+ALERT_EMAIL_FROM=bot@gmail.com
+ALERT_EMAIL_TO=you@gmail.com
 ALERT_SMTP_HOST=smtp.gmail.com
 ALERT_SMTP_PORT=587
-ALERT_SMTP_USER=yourbot@gmail.com
-ALERT_SMTP_PASSWORD=your_16_char_app_password
+ALERT_SMTP_USER=bot@gmail.com
+ALERT_SMTP_PASSWORD=xxxx_xxxx_xxxx_xxxx
 ```
 
-For other providers (Outlook, SendGrid, AWS SES), change `ALERT_SMTP_HOST` and `ALERT_SMTP_PORT` accordingly.  Leave all `ALERT_*` vars unset to disable email and use file-only logging.
+### 3. Initial model setup
 
-**View recent alert log:**
+**Option A — vLLM (recommended, production)**
+
+vLLM serves a merged BF16 model. After the first fine-tuning run, `model_promoter.py` merges the LoRA into the base weights and creates the `finance_qwen_32b_merged_latest` symlink that vLLM reads.
+
 ```bash
-tail -20 logs/alerts.jsonl | jq
-```
-
-### Health Check Endpoint (UptimeRobot)
-
-The health server exposes `GET /health` and reports daemon liveness based on heartbeat files written every loop iteration by each daemon.
-
-**Start the health server:**
-```bash
-# Manual
-python3 scripts/health_server.py --port 8765
-
-# Via systemd (recommended)
-sudo cp services/ai-health-server.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now ai-health-server.service
-```
-
-**Sample response:**
-```json
-{
-  "status": "ok",
-  "daemons": {
-    "stock":   { "healthy": true,  "age_seconds": 42,  "market_open": true },
-    "options": { "healthy": true,  "age_seconds": 61,  "market_open": true }
-  },
-  "recent_warnings": []
-}
-```
-
-`status` is `"ok"` | `"degraded"` (one daemon stale) | `"down"` (both stale, returns HTTP 503).
-
-**UptimeRobot configuration:**
-1. Add new monitor → **HTTP(s)**
-2. URL: `http://<your-server-ip>:8765/health`
-3. Keyword monitoring → alert if keyword `"ok"` is **not present**
-4. Check interval: every 5 minutes
-
----
-
-## 📊 Performance Tracking
-
-### View Metrics
-```bash
-# Stock performance
-cat logs/performance_metrics.json | jq
-
-# Options performance
-cat logs/options_performance_metrics.json | jq
-
-# Recent trades
-tail -20 logs/trade_log.jsonl | jq
-```
-
-### Sample Metrics Output
-```json
-{
-  "total_trades": 45,
-  "closed_trades": 38,
-  "open_trades": 7,
-  "winners": 24,
-  "losers": 14,
-  "win_rate": 0.63,
-  "avg_return": 0.042,
-  "best_trade": 0.18,
-  "worst_trade": -0.07,
-  "sharpe_ratio": 1.34,
-  "max_drawdown": -0.12
-}
-```
-
-## 🔄 Self-Improvement Loop
-
-The bots continuously learn from their own performance:
-
-1. **Trade Execution** (Market hours)
-   - Bots make trades based on AI analysis
-   - All trades logged with reasoning and confidence
-
-2. **Daily Analysis** (5:00 PM / 5:30 PM EST)
-   - Analyze day's trades
-   - Identify winners (>30% profit) and losers (<-30% loss)
-   - Extract patterns and lessons
-
-3. **Training Data Generation**
-   - Winners → Positive examples (what worked)
-   - Losers → Negative examples (what to avoid)
-   - Strong positions (>40% unrealized) → Current best practices
-
-4. **Model Fine-tuning** (8:00 PM / 9:00 PM EST)
-   - Update model with new examples
-   - Reinforce successful patterns
-   - Learn to avoid losing patterns
-   - Takes 15-30 minutes
-
-5. **Weekend Deep Learning** (Saturday 10:00 AM EST)
-   - Comprehensive market analysis
-   - Collect data from elite sources (congressional trades, 13F filings)
-   - Major model update (45 minutes)
-   - Ready for Monday market open
-
-6. **Next Day Trading**
-   - Trade with improved model
-   - Better pattern recognition
-   - Repeat cycle
-
-**Result**: The model gets smarter every day! 📈
-
-## 🛡️ Risk Management
-
-### Stock Trading Controls
-- Max 5% per position
-- Max 10 trades per day
-- Stop loss: -7%
-- Take profit: +15%
-- Min confidence: 60%
-- Max portfolio heat: 50%
-
-### Options Trading Controls
-- Max 15% portfolio allocation to options
-- Max 3% per options position
-- Max 5 trades per day
-- Stop loss: -50%
-- Take profit: +50%
-- Min confidence: 75%
-- DTE: 7-45 days
-- Target delta: 0.30
-- 1-hour cooldown per symbol
-
-## 🔧 Configuration
-
-Edit trading parameters in the respective agent files:
-
-**Stock Trading** (`scripts/autonomous_agent.py`):
-```python
-self.params = {
-    'max_position_size': 0.05,      # 5% per position
-    'min_confidence': 0.60,         # 60% minimum
-    'max_daily_trades': 10,
-    'stop_loss': -0.07,             # -7%
-    'take_profit': 0.15,            # +15%
-}
-```
-
-**Options Trading** (`scripts/options_agent.py`):
-```python
-self.params = {
-    'max_portfolio_allocation': 0.15,  # 15% max in options
-    'max_position_size': 0.03,         # 3% per position
-    'min_confidence': 0.75,            # 75% minimum
-    'max_daily_trades': 5,
-    'stop_loss': -0.50,                # -50%
-    'take_profit': 0.50,               # +50%
-    'dte_min': 7,                      # Minimum days to expiration
-    'dte_max': 45,                     # Maximum days to expiration
-    'target_delta': 0.30,              # Target option delta
-}
-```
-
-## 🐛 Troubleshooting
-
-### Issue: Model not loading
-```bash
-# Check if model directory exists
-ls -la ~/.cache/huggingface/hub/models--unsloth--qwen2.5-32b-instruct-bnb-4bit/
-
-# Check if LoRA adapter exists
-ls -la finetune/finance_qwen_32b_lora/
-
-# If empty, download base model or fine-tune
-python3 finetune/fine_tune_llm.py --data finetune/data/finance_tuning/training_data.json
-```
-
-### Issue: CUDA not available
-```bash
-# Check CUDA
-nvidia-smi
-
-# Check PyTorch CUDA
-python3 -c "import torch; print(f'CUDA: {torch.cuda.is_available()}')"
-
-# If False, reinstall PyTorch with CUDA support
-pip uninstall torch torchvision torchaudio -y
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-```
-
-### Issue: API authentication failed
-```bash
-# Verify .env file exists and has correct keys
-cat .env
-
-# Test Alpaca connection (uses PAPER_TRADING env var from .env, defaults to paper=True)
-python3 -c "
-import os
-from dotenv import load_dotenv
-from alpaca.trading.client import TradingClient
-load_dotenv()
-paper = os.getenv('PAPER_TRADING', 'true').lower() != 'false'
-client = TradingClient(os.getenv('ALPACA_API_KEY'), os.getenv('ALPACA_SECRET_KEY'), paper=paper)
-print(client.get_account())
-"
-```
-
-### Issue: Service won't start
-```bash
-# Check service status and logs
-sudo systemctl status ai-trading-bot.service
-sudo journalctl -u ai-trading-bot.service -n 100
-
-# Common fixes:
-# 1. Ensure logs directory exists
-mkdir -p logs
-
-# 2. Verify Python path in service file
-which python3
-
-# 3. Check file permissions
-chmod +x scripts/*.py
-```
-
-### Issue: Out of memory during fine-tuning
-```bash
-# Reduce batch size in fine_tune_llm.py:
-python3 finetune/fine_tune_llm.py \
+# Kick off the first fine-tune to bootstrap the merged model
+python finetune/fine_tune_llm.py \
   --data finetune/data/finance_tuning/training_data.json \
-  --batch-size 1 \
-  --epochs 2
+  --epochs 1
+# model_promoter.py runs automatically and creates the merged model + symlink
 ```
 
-## 🔴 Live Trading Checklist
+Then start the inference server:
+```bash
+sudo systemctl start ai-inference-server
+```
 
-**Do NOT set `PAPER_TRADING=false` until every item below is checked:**
+**Option B — Ollama (simpler, lower hardware requirement)**
 
-### Regulatory & Broker Requirements
-- [ ] You have **$25,000+ in equity** to avoid the Pattern Day Trader (PDT) rule (US accounts trading stocks more than 3 times in 5 days)
-- [ ] Your Alpaca account has **Options Level 2+ approval** (required for buying calls/puts)
-- [ ] You have reviewed [Alpaca's TOS for automated trading](https://alpaca.markets/docs/trading/)
-- [ ] You understand you are personally liable for any losses, errors, or regulatory violations caused by this bot
+```bash
+ollama pull qwen2.5:32b
+# Set INFERENCE_BACKEND=ollama in .env
+```
 
-### Strategy Validation (Minimum 1-3 Months Paper Trading)
-- [ ] Paper mode has run continuously for at least 30 trading days without crashes
-- [ ] Win rate, Sharpe ratio, and max drawdown are acceptable over a full market cycle
-- [ ] You have manually reviewed every trade for the first 2 weeks
-- [ ] The circuit breaker (5% daily loss limit) has been tested and works
-- [ ] Bracket orders (SL/TP) are confirmed to trigger correctly in paper mode
-- [ ] LLM decisions have been spot-checked — no obviously wrong or hallucinated trades
+### 4. Start the paper trading bots
 
-### Operational Readiness
-- [ ] Systemd services restart cleanly after crashes and reboots
-- [ ] GPU/RAM are stable under 24/7 inference load
-- [ ] You have monitoring/alerts set up (at minimum, check `journalctl` daily)
-- [ ] You have a manual kill-switch procedure: `sudo systemctl stop ai-trading-bot.service ai-options-bot.service`
+```bash
+sudo cp services/*.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ai-inference-server ai-trading-bot ai-options-bot ai-health-server
+```
 
-### Going Live
-1. Switch to a **live Alpaca account** and update `.env` with live credentials
-2. Set `PAPER_TRADING=false`
-3. Start with minimal capital (1-2% of your intended allocation)
-4. Keep manual oversight for the first 2 weeks of live trading
-5. Scale up only after consistent live performance
+Monitor:
+```bash
+sudo journalctl -u ai-trading-bot -u ai-options-bot -f
+curl http://localhost:8765/health
+```
 
----
+## Daily Workflow
 
-## ⚠️ Disclaimer
+| Time (EST) | Event |
+|---|---|
+| 9:30 AM | Market opens — agents start trading sessions |
+| Every 30 min | Stock bot: discover candidates, LLM decision, bracket order |
+| Every 60 min | Options bot: screen for calls/puts, LLM decision, order |
+| 4:00 PM | Market closes |
+| 5:00 PM | Stock bot: performance analysis + online training |
+| 5:30 PM | Options bot: performance analysis |
+| 8:00 PM | Stock bot: fine-tune (1 epoch) → eval → promote → merge → vLLM reload |
+| 9:00 PM | Options bot: fine-tune (1 epoch) → eval → promote → merge → vLLM reload |
+| Saturday 10 AM | Weekly report + deep research |
+| Saturday 11 AM | Weekend strategist + major fine-tune (2 epochs) |
+
+**vLLM restart sequence after fine-tuning:**
+1. Daemon calls `stop_for_finetuning()` → vLLM stops
+2. Fine-tuning subprocess runs (Qwen 32B loads into the freed memory)
+3. Fine-tuning exits → 90-second drain wait (CUDA memory consolidation)
+4. `model_promoter.py` merges LoRA → BF16, updates symlink
+5. Daemon calls `start_after_finetuning()` → vLLM restarts on new merged model
+
+## Risk Controls
+
+### Stock Bot
+
+| Control | Standard account (≥$5k) | Small account (<$5k) |
+|---|---|---|
+| Stop loss | -7% | -7% |
+| Take profit | +15% | +15% |
+| Min confidence | 60% | 70% |
+| Max position size | 5% | 5% |
+| Max daily trades | 10 | 10 |
+| Same-day close | Allowed | **Blocked** (PDT guard) |
+| Cooldown between buys | None | 60 min |
+| Daily loss circuit breaker | -5% | -10% |
+
+### Options Bot
+
+| Control | Standard account (≥$25k) | Small account (<$25k) |
+|---|---|---|
+| Portfolio allocation | 10–15% | Up to 70% |
+| Max position size | 3% | 20% |
+| Min confidence | 75% | 82% |
+| Max daily trades | 5 | 2 |
+| DTE range | 7–45 days | 7–30 days |
+| Target delta | 0.30 | 0.30 |
+| Stop loss | -50% | -50% |
+| Take profit | +50% | +50% |
+| Same-day close | Allowed | **Blocked** (PDT guard) |
+
+### Portfolio-Level Controls
+
+- **Sector cap**: 30% max in any single GICS sector (portfolio overseer)
+- **Correlation guard**: max 4 open positions in the same sector
+- **Allocation tiers**: position sizing unlocked progressively as the model proves itself
+
+| Tier | Min trades | Sharpe | Max DD | Position size |
+|---|---|---|---|---|
+| 1 (Exploration) | 0 | — | — | 1% |
+| 2 (Ramping) | 20 | ≥1.0 | ≤8% | 3% |
+| 3 (Production) | 50 | ≥1.5 | ≤5% | 5% |
+
+## Live Trading Setup
+
+The live and paper environments run simultaneously. Paper trading always continues — it provides training data and model improvement regardless of live status.
+
+### Equity Thresholds
+
+| Threshold | Default | Effect |
+|---|---|---|
+| `OPTIONS_LIVE_THRESHOLD` | $5,000 | Options bot switches from paper to live |
+| `LIVE_EQUITY_THRESHOLD` | $25,000 | Full allocation params unlock; stock PDT guard relaxes |
+
+The stock live bot trades at **any equity level**. PDT compliance is enforced by `no_same_day_close=True` (never sell a position opened the same day) rather than blocking buying.
+
+### Live Credentials
+
+Create `.env.live` (never commit this file):
+```env
+ALPACA_API_KEY=your_live_api_key
+ALPACA_SECRET_KEY=your_live_secret_key
+PAPER_TRADING=false
+OPTIONS_LIVE_THRESHOLD=5000
+MIN_CASH_RESERVE=75
+```
+
+### Enable Live Services
+
+```bash
+sudo systemctl enable --now ai-trading-bot-live
+# Options live bot — starts paper internally until $5k equity is reached:
+sudo systemctl enable --now ai-options-bot-live
+```
+
+The live bot reads `.env` first (shared infra: model paths, vLLM URL, email alerts) then `.env.live` overrides credentials and `PAPER_TRADING=false`.
+
+### Order Types
+
+- **Whole shares**: bracket order (limit entry + stop-loss + take-profit legs)
+- **Fractional shares**: market order only (Alpaca requirement — bracket orders reject fractional quantities)
+
+### Live Trading Checklist
+
+Before enabling the live services, verify:
+
+- [ ] Paper bot has traded for at least 30 days without crashes
+- [ ] Win rate and Sharpe ratio are acceptable over a full market cycle
+- [ ] Circuit breaker fires correctly (tested manually or observed in paper)
+- [ ] Health endpoint at `localhost:8765/health` returns `"ok"`
+- [ ] You have reviewed Alpaca's TOS for automated trading
+- [ ] You understand PDT rules: buying is unrestricted; selling a position the same day it was opened counts as a day trade
+- [ ] Emergency kill-switch procedure is documented: `sudo systemctl stop ai-trading-bot-live ai-options-bot-live`
+
+## Model Pipeline
+
+```
+Daily trading → SQLite (decisions + outcomes)
+                     ↓
+        training_data_builder.py
+        (builds training_data.json)
+                     ↓
+          fine_tune_llm.py (SFT + DPO)
+          [vLLM stopped, full GPU free]
+                     ↓
+            eval_model.py (A/B test)
+            candidate vs. current adapter
+                     ↓
+          model_promoter.py (if promoted)
+          merge LoRA → BF16 full weights
+          update finance_qwen_32b_merged_latest symlink
+                     ↓
+       vLLM restarts, loads new merged model
+       (90s drain wait before restart)
+```
+
+LoRA adapters and merged models are timestamped:
+- `finetune/finance_qwen_32b_lora_YYYYMMDD_HHMMSS/`
+- `finetune/finance_qwen_32b_merged_YYYYMMDD_HHMMSS/`
+- `finetune/finance_qwen_32b_merged_latest` → symlink vLLM reads
+
+## Managing Services
+
+```bash
+# Status
+sudo systemctl status ai-inference-server ai-trading-bot ai-options-bot
+
+# Logs (live tail)
+sudo journalctl -u ai-trading-bot -f
+sudo journalctl -u ai-trading-bot-live -f
+sudo journalctl -u ai-inference-server -f
+
+# Restart
+sudo systemctl restart ai-trading-bot
+sudo systemctl restart ai-inference-server   # reloads the merged model
+
+# Health check
+curl http://localhost:8765/health
+curl http://localhost:8765/status
+curl http://localhost:8765/metrics    # Prometheus format
+
+# Emergency stop (all trading)
+sudo systemctl stop ai-trading-bot ai-options-bot ai-trading-bot-live ai-options-bot-live
+```
+
+## Troubleshooting
+
+### System crashes / unexpected reboots
+
+The most common cause is vLLM starting immediately after fine-tuning on a fragmented CUDA memory pool. The fixes are in place:
+- 90-second drain wait in `inference_client.start_after_finetuning()`
+- `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` in `start_vllm_server.sh`
+
+If crashes continue, reduce `--gpu-memory-utilization` in `start_vllm_server.sh` (try 0.55).
+
+Check the BIOS "Restore on AC Power Loss" setting to minimize downtime after hard crashes.
+
+### vLLM connection refused
+
+```bash
+sudo systemctl status ai-inference-server
+sudo journalctl -u ai-inference-server -n 50
+# Model takes ~6-8 minutes to load after restart — agents will retry automatically
+```
+
+### Live bot reading paper account
+
+Verify `.env.live` has the correct variable names and `PAPER_TRADING=false`:
+```bash
+grep -E "ALPACA_API_KEY|ALPACA_SECRET_KEY|PAPER_TRADING" /path/to/.env.live
+```
+
+### Circuit breaker fires immediately
+
+The `daily_state` table stores the start-of-day equity per `(bot, source)` pair. If a stale paper equity is contaminating the live circuit breaker, clear it:
+```bash
+sqlite3 logs/trading.db "DELETE FROM daily_state WHERE source='live' AND trade_date=date('now');"
+sudo systemctl restart ai-trading-bot-live
+```
+
+### "Position too small" / fractional order rejected
+
+Alpaca fractional shares require simple market orders — bracket orders (stop-loss + take-profit) are rejected for non-integer quantities. The agent handles this automatically: fractional quantities use `MarketOrderRequest`, whole shares use `LimitOrderRequest` with bracket legs.
+
+### Model eval always grades F
+
+The evaluator runs while vLLM is down (fine-tuning stops it). If vLLM isn't back up when eval runs, all inference attempts fail and the grade is 0%. Both candidate and current score 0%, so the model is promoted (0% ≥ 0%). This is expected behavior during the shutdown window — the new model is still used.
+
+### Fine-tuning OOM
+
+Fine-tuning Qwen 32B at 4-bit needs ~130 GB. The vLLM server must be stopped first (the daemon does this automatically). If you trigger fine-tuning manually, stop vLLM first:
+```bash
+sudo systemctl stop ai-inference-server
+python finetune/fine_tune_llm.py --data finetune/data/finance_tuning/training_data.json --epochs 1
+sudo systemctl start ai-inference-server
+```
+
+### Run tests
+
+```bash
+pytest tests/ -v
+```
+
+## Alerts
+
+The `alerts.py` module dispatches to two channels:
+
+| Channel | Config | Events |
+|---|---|---|
+| File log (`logs/alerts.jsonl`) | Always active | All events |
+| Email (SMTP) | `ALERT_EMAIL_*` in `.env` | All events |
+
+Alert events: `circuit_breaker` (CRITICAL), `trade_executed` (INFO), `account_upgrade` (INFO — equity crossed threshold), `trade_failed` (WARNING).
+
+```bash
+# View recent alerts
+tail -20 logs/alerts.jsonl | python -m json.tool
+```
+
+## Disclaimer
 
 This is an experimental trading system. **Use at your own risk.**
 
-- ⚠️ Start with **paper trading** only (`PAPER_TRADING=true`)
-- ⚠️ Never invest more than you can afford to lose
-- ⚠️ Past performance does not guarantee future results
-- ⚠️ The author is not responsible for any financial losses
-- ⚠️ This is not financial advice
-- ⚠️ Always do your own research
-- ⚠️ Test thoroughly before using real money
-- ⚠️ Markets are inherently risky
-- ⚠️ **PDT Rule**: Day-trading US stocks more than 3 times in 5 business days requires $25,000+ account equity (Pattern Day Trader rule). Violations can result in a 90-day trading restriction.
-- ⚠️ **Options Approval**: Buying options requires Level 2 options approval from Alpaca. Apply in your Alpaca account settings before running the options bot live.
-- ⚠️ **Automated Bot TOS**: Review Alpaca's Terms of Service regarding automated trading. You are responsible for ensuring your use of this software complies with all applicable laws and broker rules.
+- Start with paper trading only (`PAPER_TRADING=true`)
+- Never invest more than you can afford to lose
+- Past paper trading performance does not guarantee live results
+- The author is not responsible for any financial losses
+- This is not financial advice
+- **PDT Rule**: Selling a US stock position the same day you bought it counts as a day trade. More than 3 day trades in 5 business days in an account under $25,000 triggers a 90-day trading restriction. The small-account mode enforces `no_same_day_close` to prevent this.
+- **Options Approval**: Buying options requires Level 2 options approval from Alpaca. Apply in your account settings before running the options bot live.
+- Review Alpaca's Terms of Service regarding automated trading before going live.
 
-## 🤝 Contributing
-
-Contributions welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Test thoroughly with paper trading
-4. Submit a pull request
-
-## 📚 Resources
+## Resources
 
 - [Alpaca API Documentation](https://docs.alpaca.markets/)
+- [vLLM Documentation](https://docs.vllm.ai/)
 - [Unsloth Fine-tuning](https://github.com/unslothai/unsloth)
-- [Qwen Model](https://huggingface.co/Qwen)
-- [Hugging Face Hub](https://huggingface.co/docs/hub)
+- [Qwen 2.5 Model](https://huggingface.co/Qwen/Qwen2.5-32B-Instruct)
 - [LoRA Paper](https://arxiv.org/abs/2106.09685)
-- [Transformers Documentation](https://huggingface.co/docs/transformers)
-
-## 🙏 Acknowledgments
-
-- Alpaca API for trading infrastructure
-- Qwen team for the base language model
-- Unsloth for efficient fine-tuning tools
-- Hugging Face for model hosting
-- yfinance for market data
-
----
-
-**Built with ❤️ by your fellow hobbyist**

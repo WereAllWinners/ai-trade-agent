@@ -1,0 +1,31 @@
+[Unit]
+Description=AI Stock Trading Bot — LIVE account (execution only, no training)
+After=network-online.target ai-trading-bot.service ai-inference-server.service
+Wants=network-online.target
+# Start after paper bot so both don't race the vLLM server warmup at startup.
+# TRADING_LIVE_ONLY=1 prevents this instance from triggering fine-tuning or analysis.
+
+[Service]
+Type=simple
+WorkingDirectory=/home/zgx/personal-projects/ai-trade-agent
+
+# Load shared .env for model paths and shared infra, then override with live creds
+EnvironmentFile=/home/zgx/personal-projects/ai-trade-agent/.env
+EnvironmentFile=/home/zgx/personal-projects/ai-trade-agent/.env.live
+
+# Pure execution engine: no fine-tuning, no analysis, no weekend strategist
+Environment=TRADING_LIVE_ONLY=1
+Environment=PAPER_TRADING=false
+
+ExecStart=/home/zgx/personal-projects/ai-trade-agent/venv/bin/python \
+    /home/zgx/personal-projects/ai-trade-agent/scripts/trading_daemon.py
+
+Restart=on-failure
+RestartSec=30s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-trading-bot-live
+
+[Install]
+WantedBy=multi-user.target

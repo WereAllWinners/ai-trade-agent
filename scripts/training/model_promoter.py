@@ -133,25 +133,11 @@ def _update_merged_symlink(merged_path: str) -> None:
 
 
 def _restart_services() -> None:
-    # For vLLM backend: restart the inference server so it loads the newly merged model.
-    # Requires a passwordless sudo rule for this one command (see CLAUDE.md setup steps).
-    # For direct/ollama backends: the .env update is sufficient — each trading session
-    # subprocess re-reads LORA_ADAPTER_PATH fresh on every load_model_once() call.
-    logging.info("ℹ️  New adapter will be loaded automatically by the next trading session")
-    if os.getenv('INFERENCE_BACKEND', '').lower() != 'vllm':
-        return
-    try:
-        result = subprocess.run(
-            ['sudo', 'systemctl', 'restart', 'ai-inference-server.service'],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0:
-            logging.info("🔄 ai-inference-server restarting (new merged model loads in ~2-3 min)")
-        else:
-            logging.warning(f"systemctl restart returned {result.returncode}: {result.stderr.strip()}")
-            logging.warning("Trading agents will keep serving the previous merged model until next restart")
-    except Exception as e:
-        logging.warning(f"Could not restart inference server: {e}")
+    # Symlinks and .env are updated above. The inference server restart is handled
+    # by the calling daemon (trading_daemon / options_daemon) via
+    # inference_client.start_after_finetuning() AFTER this subprocess exits — that
+    # guarantees all eval GPU memory is fully released before vLLM begins loading.
+    logging.info("ℹ️  Symlinks and .env updated — daemon will restart inference server")
 
 
 # ---------------------------------------------------------------------------

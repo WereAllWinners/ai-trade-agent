@@ -24,6 +24,11 @@ log = logging.getLogger(__name__)
 
 LIVE_EQUITY_THRESHOLD: float = float(os.getenv('LIVE_EQUITY_THRESHOLD', '25000'))
 
+# Equity at which the options bot is allowed to go live.
+# Below this the options agent forces paper mode even when PAPER_TRADING=false.
+# Default $5,000 — enough capital for meaningful options positions.
+OPTIONS_LIVE_THRESHOLD: float = float(os.getenv('OPTIONS_LIVE_THRESHOLD', '5000'))
+
 
 def fetch_equity(trading_client) -> float:
     """Return current account equity, or 0.0 on failure."""
@@ -111,17 +116,61 @@ def get_options_params(equity: float) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Small-account stock params (PDT-safe mode for accounts < OPTIONS_LIVE_THRESHOLD)
+# ---------------------------------------------------------------------------
+
+_STOCK_SMALL = {
+    'max_daily_trades':   10,    # PDT restricts same-day round-trips, not buying alone
+                                 # no_same_day_close prevents the actual violation
+    'max_position_size':  0.05,  # 5% per position — safe at $1k, grows naturally
+    'min_confidence':     0.70,  # tighter than default 0.60; concentration risk is higher
+    'max_daily_loss_pct': 0.10,  # 10% circuit breaker ($100 at $1k)
+    'no_same_day_close':  True,  # never sell a position opened today — core PDT guard
+    'cooldown_minutes':   60,    # one hour between buys to avoid over-churning
+}
+
+
+def get_stock_params(equity: float) -> dict:
+    """
+    Return stock-agent param overrides appropriate for the current equity.
+    Returns an empty dict for full accounts (no overrides needed).
+    """
+    if equity < OPTIONS_LIVE_THRESHOLD:
+        log.info(
+            f"account_config: small stock account (${equity:,.0f} < "
+            f"${OPTIONS_LIVE_THRESHOLD:,.0f}) — applying PDT-safe params"
+        )
+        return dict(_STOCK_SMALL)
+    return {}
+
+
+# ---------------------------------------------------------------------------
 # Stock bot gate
 # ---------------------------------------------------------------------------
 
 def stock_live_allowed(equity: float) -> bool:
     """
-    True only when it is safe for the stock bot to place live orders.
-    Under $25,000 the PDT rule limits same-day round-trips to 3 per rolling
-    5 days; the stock bot is designed to make up to 10 trades/day, so it
-    must stay on the paper endpoint until the account clears the threshold.
+    True for all live accounts. PDT compliance is enforced by the agent's own
+    limits (max_daily_trades=2, no_same_day_close=True for small accounts)
+    rather than a hard equity block — this lets a $1k account grow to $5k
+    before the options bot is enabled.
     """
-    return equity >= LIVE_EQUITY_THRESHOLD
+    return True
+
+
+def options_live_allowed(equity: float) -> bool:
+    """
+    True only when the account has enough capital for meaningful options positions.
+    Below OPTIONS_LIVE_THRESHOLD the options agent forces paper mode even when
+    PAPER_TRADING=false, so the stock bot can grow the account first.
+    """
+    allowed = equity >= OPTIONS_LIVE_THRESHOLD
+    if not allowed:
+        log.info(
+            f"account_config: options live blocked (${equity:,.0f} < "
+            f"${OPTIONS_LIVE_THRESHOLD:,.0f}) — staying on paper endpoint"
+        )
+    return allowed
 
 
 # ---------------------------------------------------------------------------

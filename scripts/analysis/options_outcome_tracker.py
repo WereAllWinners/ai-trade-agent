@@ -194,6 +194,7 @@ class OptionsOutcomeTracker:
 
                     outcomes.append({
                         'symbol': contract,           # contract symbol (DB uses 'symbol' column)
+                        'source': 'paper' if self.paper else 'live',
                         'underlying': entry.get('underlying', ''),
                         'option_type': entry.get('type', ''),
                         'strike': entry.get('strike'),
@@ -244,7 +245,7 @@ class OptionsOutcomeTracker:
                 f.write(json.dumps(outcome) + '\n')
         for outcome in new_outcomes:
             try:
-                _db.insert_outcome(outcome)
+                _db.insert_outcome(outcome, bot='options', source='paper' if self.paper else 'live')
             except Exception as e:
                 logging.warning("Could not write options outcome to DB: %s", e)
 

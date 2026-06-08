@@ -181,6 +181,7 @@ class OutcomeTracker:
 
                     outcomes.append({
                         'symbol': symbol,
+                        'source': 'paper' if self.paper else 'live',
                         'buy_order_id': entry.get('order_id'),
                         'sell_order_id': trade.get('order_id'),
                         'entry_timestamp': entry['timestamp'],
@@ -226,7 +227,7 @@ class OutcomeTracker:
                 f.write(json.dumps(outcome) + '\n')
         for outcome in new_outcomes:
             try:
-                _db.insert_outcome(outcome)
+                _db.insert_outcome(outcome, bot='stock', source='paper' if self.paper else 'live')
             except Exception as e:
                 logging.warning("Could not write outcome to DB: %s", e)
 

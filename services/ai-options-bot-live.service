@@ -1,0 +1,33 @@
+[Unit]
+Description=AI Options Trading Bot — LIVE account ($1,500 execution only, no training)
+After=network-online.target ai-options-bot.service ai-inference-server.service
+Wants=network-online.target
+# Start after the paper bot so both don't race for the inference lock at startup
+
+[Service]
+Type=simple
+WorkingDirectory=/home/zgx/personal-projects/ai-trade-agent
+
+# Load shared .env for model paths and shared infra, then override with live creds
+EnvironmentFile=/home/zgx/personal-projects/ai-trade-agent/.env
+EnvironmentFile=/home/zgx/personal-projects/ai-trade-agent/.env.live
+
+# Pure execution engine: no fine-tuning, no analysis, no weekend strategist
+Environment=OPTIONS_LIVE_ONLY=1
+Environment=PAPER_TRADING=false
+
+# Use the venv Python if present, otherwise system Python
+ExecStart=/home/zgx/personal-projects/ai-trade-agent/venv/bin/python \
+    /home/zgx/personal-projects/ai-trade-agent/scripts/options_daemon.py
+
+# Restart on crash (but not on clean exit)
+Restart=on-failure
+RestartSec=30s
+
+# Separate log identity so journalctl -u ai-options-bot-live shows only live trades
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-options-bot-live
+
+[Install]
+WantedBy=default.target

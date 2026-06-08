@@ -216,6 +216,7 @@ def build_and_store(bot: str) -> tuple[int, int]:
             'label': label,
             'metadata': {
                 'bot': bot,
+                'source': rec.get('source', 'paper'),
                 'symbol': symbol,
                 'decision': decision,
                 'confidence': round(confidence, 4),

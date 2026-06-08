@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     timestamp      TEXT    NOT NULL,
     session_id     TEXT,
     bot            TEXT    NOT NULL,   -- 'stock' | 'options'
+    source         TEXT    NOT NULL DEFAULT 'paper',  -- 'paper' | 'live'
     model          TEXT,
     symbol         TEXT    NOT NULL,
     prompt         TEXT,
@@ -98,6 +99,7 @@ CREATE TABLE IF NOT EXISTS trades (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp   TEXT NOT NULL,
     bot         TEXT NOT NULL,   -- 'stock' | 'options'
+    source      TEXT NOT NULL DEFAULT 'paper',  -- 'paper' | 'live'
     symbol      TEXT NOT NULL,
     action      TEXT NOT NULL,   -- buy | sell | buy_call | buy_put
     shares      REAL,
@@ -117,6 +119,8 @@ CREATE INDEX IF NOT EXISTS idx_trades_order_id  ON trades(order_id);
 CREATE TABLE IF NOT EXISTS outcomes (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol            TEXT NOT NULL,
+    bot               TEXT NOT NULL DEFAULT 'stock',  -- 'stock' | 'options'
+    source            TEXT NOT NULL DEFAULT 'paper',  -- 'paper' | 'live'
     buy_order_id      TEXT UNIQUE,
     sell_order_id     TEXT,
     entry_timestamp   TEXT,
@@ -139,6 +143,7 @@ CREATE INDEX IF NOT EXISTS idx_outcomes_entry_timestamp ON outcomes(entry_timest
 CREATE TABLE IF NOT EXISTS training_examples (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     bot          TEXT NOT NULL,
+    source       TEXT NOT NULL DEFAULT 'paper',  -- 'paper' | 'live'
     symbol       TEXT NOT NULL,
     prompt       TEXT NOT NULL,
     ideal_output TEXT NOT NULL,
@@ -159,8 +164,9 @@ CREATE INDEX IF NOT EXISTS idx_training_entry_date ON training_examples(entry_da
 CREATE TABLE IF NOT EXISTS daily_state (
     trade_date          TEXT NOT NULL,
     bot                 TEXT NOT NULL,   -- 'stock' | 'options'
+    source              TEXT NOT NULL DEFAULT 'paper',  -- 'paper' | 'live'
     daily_start_equity  REAL NOT NULL,
-    PRIMARY KEY (trade_date, bot)
+    PRIMARY KEY (trade_date, bot, source)
 );
 
 CREATE TABLE IF NOT EXISTS unreconciled_orders (
@@ -176,11 +182,41 @@ CREATE TABLE IF NOT EXISTS unreconciled_orders (
 """
 
 
+def _migrate(conn) -> None:
+    """Add columns introduced after initial schema creation."""
+    for table in ('decisions', 'trades', 'outcomes', 'training_examples'):
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if 'source' not in existing:
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN source TEXT NOT NULL DEFAULT 'paper'"
+            )
+            logging.info("db: migrated %s — added source column", table)
+
+    # Add source column to daily_state so paper and live circuit breakers don't share baseline
+    ds_cols = {row[1] for row in conn.execute("PRAGMA table_info(daily_state)")}
+    if 'source' not in ds_cols:
+        conn.execute("ALTER TABLE daily_state ADD COLUMN source TEXT NOT NULL DEFAULT 'paper'")
+        logging.info("db: migrated daily_state — added source column")
+
+    # Add bot column to outcomes (options outcomes were merged without a bot label)
+    outcomes_cols = {row[1] for row in conn.execute("PRAGMA table_info(outcomes)")}
+    if 'bot' not in outcomes_cols:
+        conn.execute("ALTER TABLE outcomes ADD COLUMN bot TEXT NOT NULL DEFAULT 'stock'")
+        # Backfill: options contract symbols contain 'C0' or 'P0' followed by digits
+        conn.execute("""
+            UPDATE outcomes SET bot = 'options'
+            WHERE symbol GLOB '*C0*' OR symbol GLOB '*P0*'
+        """)
+        updated = conn.execute("SELECT COUNT(*) FROM outcomes WHERE bot='options'").fetchone()[0]
+        logging.info("db: migrated outcomes — added bot column, tagged %d options rows", updated)
+
+
 def init_db(db_path: Path = DB_PATH) -> None:
-    """Create tables and indexes if they don't exist yet."""
+    """Create tables and indexes if they don't exist yet, then run migrations."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with get_conn(db_path) as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
     logging.debug("Database initialised at %s", db_path)
 
 
@@ -188,20 +224,21 @@ def init_db(db_path: Path = DB_PATH) -> None:
 # Insert helpers
 # ---------------------------------------------------------------------------
 
-def insert_decision(rec: dict, db_path: Path = DB_PATH) -> None:
+def insert_decision(rec: dict, source: str = 'paper', db_path: Path = DB_PATH) -> None:
     """Insert one decision record (from decision_log.jsonl format)."""
     sql = """
         INSERT OR IGNORE INTO decisions
-            (timestamp, session_id, bot, model, symbol, prompt, raw_response,
+            (timestamp, session_id, bot, source, model, symbol, prompt, raw_response,
              decision, confidence, reasoning, executed, indicators, market_context, debate)
         VALUES
-            (:timestamp, :session_id, :bot, :model, :symbol, :prompt, :raw_response,
+            (:timestamp, :session_id, :bot, :source, :model, :symbol, :prompt, :raw_response,
              :decision, :confidence, :reasoning, :executed, :indicators, :market_context, :debate)
     """
     row = {
         'timestamp':      rec.get('timestamp'),
         'session_id':     rec.get('session_id'),
         'bot':            rec.get('bot', 'stock'),
+        'source':         rec.get('source', source),
         'model':          rec.get('model'),
         'symbol':         rec.get('symbol'),
         'prompt':         rec.get('prompt'),
@@ -218,19 +255,21 @@ def insert_decision(rec: dict, db_path: Path = DB_PATH) -> None:
         conn.execute(sql, row)
 
 
-def insert_trade(rec: dict, bot: str = 'stock', db_path: Path = DB_PATH) -> None:
+def insert_trade(rec: dict, bot: str = 'stock', source: str = 'paper',
+                 db_path: Path = DB_PATH) -> None:
     """Insert one trade record (from trade_log.jsonl format)."""
     sql = """
         INSERT OR IGNORE INTO trades
-            (timestamp, bot, symbol, action, shares, confidence, reasoning,
+            (timestamp, bot, source, symbol, action, shares, confidence, reasoning,
              order_id, contract, exit_pl_pct, exit_reason)
         VALUES
-            (:timestamp, :bot, :symbol, :action, :shares, :confidence, :reasoning,
+            (:timestamp, :bot, :source, :symbol, :action, :shares, :confidence, :reasoning,
              :order_id, :contract, :exit_pl_pct, :exit_reason)
     """
     row = {
         'timestamp':   rec.get('timestamp'),
         'bot':         bot,
+        'source':      source,
         'symbol':      rec.get('symbol'),
         'action':      rec.get('action'),
         'shares':      rec.get('shares') or rec.get('quantity'),
@@ -245,39 +284,42 @@ def insert_trade(rec: dict, bot: str = 'stock', db_path: Path = DB_PATH) -> None
         conn.execute(sql, row)
 
 
-def insert_outcome(rec: dict, db_path: Path = DB_PATH) -> None:
+def insert_outcome(rec: dict, bot: str = 'stock', source: str = 'paper',
+                   db_path: Path = DB_PATH) -> None:
     """Insert one outcome record (from trade_outcomes.jsonl format)."""
     sql = """
         INSERT OR IGNORE INTO outcomes
-            (symbol, buy_order_id, sell_order_id, entry_timestamp, exit_timestamp,
+            (symbol, bot, source, buy_order_id, sell_order_id, entry_timestamp, exit_timestamp,
              entry_price, exit_price, shares, realized_pnl, pnl_pct, hold_hours,
              entry_confidence, entry_reasoning, won)
         VALUES
-            (:symbol, :buy_order_id, :sell_order_id, :entry_timestamp, :exit_timestamp,
+            (:symbol, :bot, :source, :buy_order_id, :sell_order_id, :entry_timestamp, :exit_timestamp,
              :entry_price, :exit_price, :shares, :realized_pnl, :pnl_pct, :hold_hours,
              :entry_confidence, :entry_reasoning, :won)
     """
-    row = {**rec, 'won': 1 if rec.get('won') else 0}
+    row = {**rec, 'won': 1 if rec.get('won') else 0,
+           'bot': rec.get('bot', bot), 'source': rec.get('source', source)}
     with get_conn(db_path) as conn:
         conn.execute(sql, row)
 
 
-def insert_training_example(rec: dict, db_path: Path = DB_PATH) -> bool:
+def insert_training_example(rec: dict, source: str = 'paper', db_path: Path = DB_PATH) -> bool:
     """
     Insert one training example. Returns True if inserted, False if duplicate.
     Deduplication is enforced by the UNIQUE constraint on prompt_hash.
     """
     sql = """
         INSERT OR IGNORE INTO training_examples
-            (bot, symbol, prompt, ideal_output, label, confidence, pnl_pct,
+            (bot, source, symbol, prompt, ideal_output, label, confidence, pnl_pct,
              entry_date, session_id, prompt_hash, generated_at)
         VALUES
-            (:bot, :symbol, :prompt, :ideal_output, :label, :confidence, :pnl_pct,
+            (:bot, :source, :symbol, :prompt, :ideal_output, :label, :confidence, :pnl_pct,
              :entry_date, :session_id, :prompt_hash, :generated_at)
     """
     meta = rec.get('metadata', {})
     row = {
         'bot':          meta.get('bot', rec.get('bot', '')),
+        'source':       meta.get('source', rec.get('source', source)),
         'symbol':       meta.get('symbol', ''),
         'prompt':       rec.get('input', rec.get('prompt', '')),
         'ideal_output': rec.get('output', rec.get('ideal_output', '')),
@@ -299,13 +341,16 @@ def insert_training_example(rec: dict, db_path: Path = DB_PATH) -> bool:
 # ---------------------------------------------------------------------------
 
 def get_executed_decisions(bot: str = None, min_confidence: float = 0.0,
-                           db_path: Path = DB_PATH) -> list[dict]:
-    """Return executed decisions optionally filtered by bot and confidence."""
+                           source: str = None, db_path: Path = DB_PATH) -> list[dict]:
+    """Return executed decisions optionally filtered by bot, confidence, and source."""
     sql = "SELECT * FROM decisions WHERE executed = 1 AND confidence >= ?"
     params: list = [min_confidence]
     if bot:
         sql += " AND bot = ?"
         params.append(bot)
+    if source:
+        sql += " AND source = ?"
+        params.append(source)
     sql += " ORDER BY timestamp"
     with get_conn(db_path) as conn:
         rows = conn.execute(sql, params).fetchall()
@@ -327,8 +372,8 @@ def get_outcome_by_entry(symbol: str, entry_date: str,
 
 
 def get_training_examples(bot: str = None, label: str = None,
-                           db_path: Path = DB_PATH) -> list[dict]:
-    """Return training examples optionally filtered by bot and/or label."""
+                           source: str = None, db_path: Path = DB_PATH) -> list[dict]:
+    """Return training examples optionally filtered by bot, label, and/or source."""
     sql = "SELECT * FROM training_examples WHERE 1=1"
     params: list = []
     if bot:
@@ -337,6 +382,9 @@ def get_training_examples(bot: str = None, label: str = None,
     if label:
         sql += " AND label = ?"
         params.append(label)
+    if source:
+        sql += " AND source = ?"
+        params.append(source)
     sql += " ORDER BY generated_at"
     with get_conn(db_path) as conn:
         rows = conn.execute(sql, params).fetchall()
@@ -471,23 +519,25 @@ def get_existing_prompt_hashes(db_path: Path = DB_PATH) -> set[str]:
 # Daily circuit-breaker state
 # ---------------------------------------------------------------------------
 
-def save_daily_start_equity(bot: str, equity: float, db_path: Path = DB_PATH) -> None:
+def save_daily_start_equity(bot: str, equity: float, source: str = 'paper',
+                            db_path: Path = DB_PATH) -> None:
     """Persist today's opening equity so the circuit breaker survives daemon restarts."""
     today = datetime.now().date().isoformat()
     with get_conn(db_path) as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO daily_state (trade_date, bot, daily_start_equity) VALUES (?, ?, ?)",
-            (today, bot, equity),
+            "INSERT OR REPLACE INTO daily_state (trade_date, bot, source, daily_start_equity) VALUES (?, ?, ?, ?)",
+            (today, bot, source, equity),
         )
 
 
-def load_daily_start_equity(bot: str, db_path: Path = DB_PATH) -> float | None:
-    """Return today's saved opening equity for *bot*, or None if not yet recorded."""
+def load_daily_start_equity(bot: str, source: str = 'paper',
+                            db_path: Path = DB_PATH) -> float | None:
+    """Return today's saved opening equity for *bot* and *source*, or None if not yet recorded."""
     today = datetime.now().date().isoformat()
     with get_conn(db_path) as conn:
         row = conn.execute(
-            "SELECT daily_start_equity FROM daily_state WHERE trade_date = ? AND bot = ?",
-            (today, bot),
+            "SELECT daily_start_equity FROM daily_state WHERE trade_date = ? AND bot = ? AND source = ?",
+            (today, bot, source),
         ).fetchone()
     return float(row['daily_start_equity']) if row else None
 
