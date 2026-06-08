@@ -39,6 +39,11 @@ The system runs **four trading agents** sharing one vLLM inference server:
 - **Portfolio Overseer**: Sector caps (30% max), max correlated positions (4)
 - **Allocation Tiers**: Tier 1/2/3 sizing (1%/3%/5%) unlocked by trade count, Sharpe, and drawdown thresholds
 - **Economic Calendar Guard**: Halts trading ±30–60 min around FOMC, NFP, and CPI releases
+- **Earnings Hard-Block**: Code-level BUY block (not just a prompt warning) on earnings day for both stock and options agents — SELL always allowed
+- **Enhanced Technical Context**: LLM decision prompt includes 50 MA, 200 MA, ATR(14), 5-day return, and 20-day return fetched from daily bars; fetched once and reused across the session
+- **Fresh Daily Discovery**: First trading session of each calendar day always runs a fresh candidate scan regardless of cache TTL
+- **Weekend Strategy Evolution**: Saturday `StrategyEvolver` backtests existing strategies against a 60-stock universe, mutates winners (±10% param perturbation), keeps the top 8 by Sharpe, and generates synthetic training examples from the results
+- **Curated Knowledge Base**: Hand-curated JSONL examples covering day-trading patterns, risk management rules, and market-regime context are injected into the fine-tuning pool every Saturday
 - **Unusual Options Flow**: Scanner detects institutional positioning signals
 - **Congressional Trade Tracking**: Monitors politician disclosures for sentiment signals
 - **LLM News Sentiment**: Real-time news scoring via the same Qwen 32B model
@@ -62,7 +67,10 @@ ai-trade-agent/
 │   │   ├── options_performance_analyzer.py
 │   │   ├── weekend_strategist.py     # Saturday deep research (stocks)
 │   │   ├── options_weekend_strategist.py
+│   │   ├── strategy_evolver.py       # Saturday strategy evolution + training enrichment
 │   │   └── weekly_report.py          # Saturday summary email
+│   ├── utils/
+│   │   └── indicators.py             # Shared MA/ATR/return calculations (daily bars)
 │   ├── data/
 │   │   ├── stock_discovery.py        # Candidate scanner (technicals)
 │   │   ├── news_fetcher.py           # News with LLM sentiment
@@ -110,7 +118,11 @@ ai-trade-agent/
 │   ├── ai-trading-bot-live.service   # Live stock bot
 │   ├── ai-options-bot-live.service   # Live options bot (equity-gated)
 │   └── ai-health-server.service      # Health + metrics server
-├── tests/                            # pytest suite
+├── knowledge/
+│   ├── day_trading_patterns.jsonl    # Curated training examples: RSI, VWAP, breakout patterns
+│   ├── risk_management_patterns.jsonl# Stop-loss discipline, earnings avoidance, macro holds
+│   └── regime_context_patterns.jsonl # High-VIX adjustments, sector rotation, trend signals
+├── tests/                            # pytest suite (255 passing)
 ├── logs/                             # Runtime: trading.db, *.jsonl (gitignored)
 ├── .env                              # Paper trading credentials (gitignored)
 ├── .env.live                         # Live trading credentials (gitignored)
@@ -184,7 +196,30 @@ ALERT_SMTP_PASSWORD=xxxx_xxxx_xxxx_xxxx
 
 ### 3. Initial model setup
 
-**Option A — vLLM (recommended, production)**
+**Option A — Download pre-trained LoRA from HuggingFace (fastest)**
+
+A finance-tuned LoRA adapter trained on real paper trading outcomes is published at [WereAllWinners/finance-qwen-32b](https://huggingface.co/WereAllWinners/finance-qwen-32b). This gives you a head start over training from scratch.
+
+```bash
+# Install HuggingFace CLI if needed
+pip install huggingface_hub
+
+# Download the adapter (~2.1 GB)
+hf download WereAllWinners/finance-qwen-32b \
+  --local-dir finetune/finance_qwen_32b_lora_latest \
+  --repo-type model
+```
+
+Then set in your `.env`:
+```env
+LORA_ADAPTER_PATH=finetune/finance_qwen_32b_lora_latest
+```
+
+The adapter targets `Qwen/Qwen2.5-32B-Instruct` as the base model — make sure your vLLM server or Ollama instance is running that model. The adapter will continue to be updated by your own daily fine-tuning runs as your system accumulates trade history.
+
+---
+
+**Option B — vLLM (recommended, production)**
 
 vLLM serves a merged BF16 model. After the first fine-tuning run, `model_promoter.py` merges the LoRA into the base weights and creates the `finance_qwen_32b_merged_latest` symlink that vLLM reads.
 
@@ -201,7 +236,7 @@ Then start the inference server:
 sudo systemctl start ai-inference-server
 ```
 
-**Option B — Ollama (simpler, lower hardware requirement)**
+**Option C — Ollama (simpler, lower hardware requirement)**
 
 ```bash
 ollama pull qwen2.5:32b
@@ -238,6 +273,7 @@ curl http://localhost:8765/health
 | 9:00 PM | Options bot: fine-tune (1 epoch) → eval → promote → merge → vLLM reload |
 | Saturday 10 AM | Weekly report + deep research |
 | Saturday 11 AM | Weekend strategist + major fine-tune (2 epochs) |
+| Saturday 11 AM | Strategy evolver: backtest → mutate → synthetic training examples + knowledge base injection |
 
 **vLLM restart sequence after fine-tuning:**
 1. Daemon calls `stop_for_finetuning()` → vLLM stops
@@ -486,6 +522,7 @@ This is an experimental trading system. **Use at your own risk.**
 
 ## Resources
 
+- [Pre-trained LoRA Adapter](https://huggingface.co/WereAllWinners/finance-qwen-32b) — finance-tuned on real paper trading outcomes
 - [Alpaca API Documentation](https://docs.alpaca.markets/)
 - [vLLM Documentation](https://docs.vllm.ai/)
 - [Unsloth Fine-tuning](https://github.com/unslothai/unsloth)
