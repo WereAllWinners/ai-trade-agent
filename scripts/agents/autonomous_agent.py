@@ -768,7 +768,7 @@ class AutonomousAgent:
             if is_daily_df(df) and len(df) >= 200:
                 _score_daily_df = df
             else:
-                _score_daily_df = get_daily_bars_for_ma(symbol, self.data_client)
+                _score_daily_df = get_daily_bars_for_ma(symbol, getattr(self, 'data_client', None))
             _score_ma = calculate_ma_atr(_score_daily_df, indicators['current_price'])
             if _score_ma is not None:
                 _score_ma_lines = (
@@ -1197,7 +1197,7 @@ class AutonomousAgent:
             if is_daily_df(df) and len(df) >= 200:
                 _daily_df = df
             else:
-                _daily_df = get_daily_bars_for_ma(symbol, self.data_client)
+                _daily_df = get_daily_bars_for_ma(symbol, getattr(self, 'data_client', None))
             ma_data = calculate_ma_atr(_daily_df, indicators['current_price'])
 
             # Fetch recent news snippet (no-op if POLYGON_API_KEY not set)
