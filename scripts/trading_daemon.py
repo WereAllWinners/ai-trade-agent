@@ -166,6 +166,28 @@ class TradingDaemon:
         except Exception as e:
             logging.error(f"❌ Trading session failed: {e}")
     
+    def run_live_outcome_tracking(self):
+        """Resolve fill prices and P&L for live trades so they enter the training pool.
+
+        The paper bot's nightly fine-tune calls training_data_builder which queries
+        all executed decisions regardless of source. Without outcomes in the DB, live
+        decisions can't be labeled and contribute no training signal. This runs the
+        same outcome_tracker subprocess as the paper bot, but inherits PAPER_TRADING=false
+        from the live daemon's environment so it queries the live Alpaca account.
+        """
+        try:
+            logging.info("📥 [live] Fetching live trade fill prices and computing P&L...")
+            result = subprocess.run(
+                [sys.executable, str(_SCRIPTS_DIR / 'analysis' / 'outcome_tracker.py')],
+                timeout=120,
+            )
+            if result.returncode == 0:
+                logging.info("✅ [live] Outcome tracking complete — live trades will feed tonight's fine-tune")
+            else:
+                logging.warning(f"⚠️ [live] Outcome tracker exited with code: {result.returncode}")
+        except Exception as e:
+            logging.warning(f"⚠️ [live] Outcome tracker failed: {e}")
+
     def run_performance_analysis(self):
         """Run outcome tracking then performance analysis."""
         # Step 1: Enrich trade log with fill prices and compute P&L
@@ -468,6 +490,15 @@ class TradingDaemon:
                         and current_time >= self.analysis_time):
                     self.run_performance_analysis()
                     self.run_online_training()
+                    analysis_done_today = True
+
+                # Live outcome tracking at 5:00 PM (live bot only)
+                # Resolves fill prices and P&L for live trades so they can be
+                # labeled and included in the paper bot's nightly fine-tune.
+                if (_LIVE_ONLY
+                        and not analysis_done_today
+                        and current_time >= self.analysis_time):
+                    self.run_live_outcome_tracking()
                     analysis_done_today = True
 
                 # Fine-tuning at 8:00 PM (paper bot only) — never run during market hours
