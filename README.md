@@ -15,16 +15,18 @@ Autonomous AI-powered trading system with dual agents for stocks and options, fe
           ▼             ▼             ▼              ▼
    Stock Bot       Options Bot    Stock Bot       Options Bot
    (paper)         (paper)        (live)          (live*)
-   training        training       exec only       exec only
-   fine-tunes      fine-tunes     no training     no training
+   training        training       outcome         outcome
+   fine-tunes      fine-tunes     tracking        tracking
+                                  @ 5 PM          @ 5 PM
 
   * live options bot gated behind $5,000 equity threshold
 ```
 
 The system runs **four trading agents** sharing one vLLM inference server:
-- Paper agents trade unlimited, generate training data, and drive daily fine-tuning
-- Live agents execute only — no fine-tuning, no analysis, no weekend strategist
+- Paper agents trade unlimited, drive daily fine-tuning, and run full performance analysis
+- Live agents execute trades and run outcome tracking at 5 PM — resolving real fill prices and P&L so live decisions enter the training pool alongside paper trades
 - All trade data is tagged `source=paper|live` and `bot=stock|options` in SQLite
+- Live trade examples are the highest-signal training data: real capital on the line means wins and losses carry genuine weight
 
 ## Features
 
@@ -228,8 +230,10 @@ curl http://localhost:8765/health
 | Every 30 min | Stock bot: discover candidates, LLM decision, bracket order |
 | Every 60 min | Options bot: screen for calls/puts, LLM decision, order |
 | 4:00 PM | Market closes |
-| 5:00 PM | Stock bot: performance analysis + online training |
-| 5:30 PM | Options bot: performance analysis |
+| 5:00 PM | Stock paper bot: performance analysis + online training |
+| 5:00 PM | Stock live bot: outcome tracking (fill prices + P&L → DB) |
+| 5:30 PM | Options paper bot: performance analysis |
+| 5:30 PM | Options live bot: outcome tracking |
 | 8:00 PM | Stock bot: fine-tune (1 epoch) → eval → promote → merge → vLLM reload |
 | 9:00 PM | Options bot: fine-tune (1 epoch) → eval → promote → merge → vLLM reload |
 | Saturday 10 AM | Weekly report + deep research |
@@ -337,10 +341,18 @@ Before enabling the live services, verify:
 ## Model Pipeline
 
 ```
-Daily trading → SQLite (decisions + outcomes)
+Paper trading     Live trading (real $)
+decisions         decisions
+    +                 +
+paper outcomes    live outcomes (resolved at 5 PM via outcome_tracker)
+         \           /
+          ↓         ↓
+        SQLite — unified decisions + outcomes table
+        (source='paper'|'live', bot='stock'|'options')
                      ↓
         training_data_builder.py
-        (builds training_data.json)
+        pulls ALL executed decisions regardless of source
+        labels each with its outcome (win/loss/hold signal)
                      ↓
           fine_tune_llm.py (SFT + DPO)
           [vLLM stopped, full GPU free]
