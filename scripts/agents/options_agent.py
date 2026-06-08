@@ -1211,12 +1211,16 @@ Reasoning: <one sentence explaining the key signal>"""
         # ── Session-level context blocks (Fix D / Fix E) ─────────────────────
         macro_context_block   = _load_macro_context_block()
         weekend_context_block = _load_weekend_context_block()
-        macro_guard_block     = economic_calendar.format_macro_guard_block(
+        _options_earnings_list = economic_calendar.get_earnings_today(self.watchlist)
+        live_earnings_symbols  = set(_options_earnings_list)  # hard BUY_CALL/BUY_PUT block below
+        macro_guard_block      = economic_calendar.format_macro_guard_block(
             macro_events,
-            economic_calendar.get_earnings_today(self.watchlist),
+            _options_earnings_list,
         )
         if macro_guard_block:
             logging.info(f"📅 Options macro guard:\n{macro_guard_block}")
+        if live_earnings_symbols:
+            logging.info(f"🛑 Options earnings hard-block active for: {sorted(live_earnings_symbols)}")
 
         logging.info(f"📊 Daily options trades: {self.daily_trades}/{self.params['max_daily_trades']}")
 
@@ -1287,6 +1291,10 @@ Reasoning: <one sentence explaining the key signal>"""
             # Multi-agent debate for high-conviction trades
             debate_result = None
             will_execute = decision['decision'] in ['buy_call', 'buy_put'] and decision['confidence'] >= min_conf
+            # Hard-block new BUY_CALL/BUY_PUT on live earnings (in addition to research file check above)
+            if will_execute and symbol in live_earnings_symbols:
+                logging.warning(f"🛑 EARNINGS BLOCK: {symbol} has earnings today/tomorrow — {decision['decision'].upper()} blocked")
+                will_execute = False
             if will_execute and decision['confidence'] >= _DEBATE_CONFIDENCE_THRESHOLD:
                 logging.info(f"⚖️  Debating {symbol} ({decision['decision'].upper()} @ {decision['confidence']:.0%})...")
                 debate_result = debate_trade(

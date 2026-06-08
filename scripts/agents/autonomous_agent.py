@@ -33,6 +33,7 @@ from alpaca.trading.requests import LimitOrderRequest
 from portfolio_overseer import PortfolioOverseer
 from allocation_controller import AllocationController
 import account_config as _acfg
+from utils.indicators import get_daily_bars_for_ma, calculate_ma_atr, is_daily_df
 
 _DEBATE_CONFIDENCE_THRESHOLD = 0.90   # Only debate very high-conviction trades
 _MIN_CASH_RESERVE = float(os.getenv('MIN_CASH_RESERVE', '500'))  # Never spend the account's last N dollars of cash
@@ -523,14 +524,10 @@ class AutonomousAgent:
         current_volume = df['volume'].iloc[-1]
         volume_ratio = current_volume / avg_volume.iloc[-1] if avg_volume.iloc[-1] > 0 else 1.0
         
-        # Price change
-        price_change_pct = ((df['close'].iloc[-1] - df['close'].iloc[0]) / df['close'].iloc[0]) * 100
-        
         return {
             'rsi': rsi.iloc[-1],
             'macd': macd.iloc[-1],
             'volume_ratio': volume_ratio,
-            'price_change_pct': price_change_pct,
             'current_price': df['close'].iloc[-1],
             'avg_volume': float(avg_volume.iloc[-1]),
             'session_volume': float(current_volume),
@@ -768,14 +765,32 @@ class AutonomousAgent:
             if indicators is None:
                 return None
 
+            if is_daily_df(df) and len(df) >= 200:
+                _score_daily_df = df
+            else:
+                _score_daily_df = get_daily_bars_for_ma(symbol, self.data_client)
+            _score_ma = calculate_ma_atr(_score_daily_df, indicators['current_price'])
+            if _score_ma is not None:
+                _score_ma_lines = (
+                    f"\n            50 MA:  ${_score_ma['ma50']:.2f}  ({_score_ma['pct_from_ma50']:+.1f}% from price)"
+                    f"\n            200 MA: ${_score_ma['ma200']:.2f}  ({_score_ma['pct_from_ma200']:+.1f}% from price)"
+                    + (f"\n            ATR (14d): ${_score_ma['atr_14']:.2f}" if _score_ma['atr_14'] is not None else '')
+                )
+                _score_ret_lines = ''.join([
+                    f"\n            5-Day Return:  {_score_ma['return_5d']:+.1f}%" if _score_ma['return_5d'] is not None else '',
+                    f"\n            20-Day Return: {_score_ma['return_20d']:+.1f}%" if _score_ma['return_20d'] is not None else '',
+                ])
+            else:
+                _score_ma_lines = ''
+                _score_ret_lines = ''
+
             news_snippet = news_fetcher.format_for_prompt(symbol)
             prompt = f"""You are a decisive short-term stock trader. Analyze {symbol} and give a clear trading decision.
 
             Current Price: ${indicators['current_price']:.2f}
             RSI (14): {indicators['rsi']:.1f}  (>70 overbought, <30 oversold)
             MACD: {indicators['macd']:.2f}  (positive = bullish momentum)
-            Volume Ratio: {indicators['volume_ratio']:.1f}x average  (>1.5 = elevated activity)
-            Price Change (100 bars): {indicators['price_change_pct']:+.1f}%
+            Volume Ratio: {indicators['volume_ratio']:.1f}x average  (>1.5 = elevated activity){_score_ret_lines}{_score_ma_lines}
 
             Discovery Signals: {', '.join(self.discovery.opportunities.get(symbol, []))}{news_snippet}
 
@@ -1067,11 +1082,32 @@ class AutonomousAgent:
             economic_calendar.get_earnings_today([]),  # symbols added below after discovery
         )
 
-        # Discover opportunities
+        # Discover opportunities — force a fresh scan on the first session of each trading day.
+        # A file-based stamp survives daemon restarts and subprocess boundaries.
+        _DISCOVERY_STAMP = Path('logs/last_fresh_discovery_date.txt')
+        _today_str = datetime.now().date().isoformat()
+        try:
+            _force_fresh = (
+                not _DISCOVERY_STAMP.exists()
+                or _DISCOVERY_STAMP.read_text().strip() != _today_str
+            )
+        except Exception:
+            _force_fresh = True
+
         max_stocks = self.params['max_stocks_to_analyze']
-        logging.info(f"🔍 Discovering top {max_stocks} opportunities...")
-        
-        opportunities = self.discovery.discover_opportunities(max_stocks=max_stocks)
+        if _force_fresh:
+            logging.info(f"🔍 First session of {_today_str} — forcing fresh discovery scan (bypassing cache)...")
+        else:
+            logging.info(f"🔍 Discovering top {max_stocks} opportunities (cached)...")
+
+        opportunities = self.discovery.discover_opportunities(
+            max_stocks=max_stocks, use_cache=(not _force_fresh)
+        )
+        if _force_fresh:
+            try:
+                _DISCOVERY_STAMP.write_text(_today_str)
+            except Exception as e:
+                logging.debug(f"Could not write discovery stamp: {e}")
         logging.info(f"✅ Found {len(opportunities)} opportunities")
 
         # Exploration: inject random symbols when recent Sharpe is below target
@@ -1106,12 +1142,16 @@ class AutonomousAgent:
             (opp['symbol'] if isinstance(opp, dict) else opp)
             for opp in opportunities
         ]
+        _earnings_list = economic_calendar.get_earnings_today(opp_symbols)
+        earnings_symbols = set(_earnings_list)  # used for hard BUY block below
         macro_guard_block = economic_calendar.format_macro_guard_block(
             macro_events,
-            economic_calendar.get_earnings_today(opp_symbols),
+            _earnings_list,
         )
         if macro_guard_block:
             logging.info(f"📅 Macro guard active:\n{macro_guard_block}")
+        if earnings_symbols:
+            logging.info(f"🛑 Earnings hard-block active for: {sorted(earnings_symbols)}")
 
         # Analyze each opportunity
         trades_executed = 0
@@ -1146,12 +1186,20 @@ class AutonomousAgent:
             df = self.get_market_data(symbol)
             if df is None:
                 continue
-            
+
             # Calculate indicators
             indicators = self.calculate_indicators(df)
             if indicators is None:
                 continue
-            
+
+            # Fetch daily bars for MA/ATR — reuse the primary df if it's already daily
+            # with ≥200 rows (Alpaca daily fallback path), otherwise make a separate call.
+            if is_daily_df(df) and len(df) >= 200:
+                _daily_df = df
+            else:
+                _daily_df = get_daily_bars_for_ma(symbol, self.data_client)
+            ma_data = calculate_ma_atr(_daily_df, indicators['current_price'])
+
             # Fetch recent news snippet (no-op if POLYGON_API_KEY not set)
             news_snippet = news_fetcher.format_for_prompt(symbol)
 
@@ -1160,15 +1208,28 @@ class AutonomousAgent:
             _weekend   = f"\n{weekend_context_block}" if weekend_context_block else ''
             _guard     = f"\n{macro_guard_block}\n" if macro_guard_block else ''
 
-            # Create AI prompt (Fix D: macro context before Discovery Signals;
-            # Fix E: weekend context after news; Fix C: guard before decision line)
+            # MA/ATR lines — omitted entirely when daily data is unavailable
+            if ma_data is not None:
+                _ma_lines = (
+                    f"\n            50 MA:  ${ma_data['ma50']:.2f}  ({ma_data['pct_from_ma50']:+.1f}% from price)"
+                    f"\n            200 MA: ${ma_data['ma200']:.2f}  ({ma_data['pct_from_ma200']:+.1f}% from price)  [above = bullish long-term trend]"
+                    + (f"\n            ATR (14d): ${ma_data['atr_14']:.2f}  (daily volatility range)" if ma_data['atr_14'] is not None else '')
+                )
+                _return_lines = ''.join([
+                    f"\n            5-Day Return:  {ma_data['return_5d']:+.1f}%" if ma_data['return_5d'] is not None else '',
+                    f"\n            20-Day Return: {ma_data['return_20d']:+.1f}%" if ma_data['return_20d'] is not None else '',
+                ])
+            else:
+                _ma_lines = ''
+                _return_lines = ''
+
+            # Create AI prompt
             prompt = f"""You are a decisive short-term stock trader. Analyze {symbol} and give a clear trading decision.
 
             Current Price: ${indicators['current_price']:.2f}
             RSI (14): {indicators['rsi']:.1f}  (>70 overbought, <30 oversold)
             MACD: {indicators['macd']:.2f}  (positive = bullish momentum)
-            Volume Ratio: {indicators['volume_ratio']:.1f}x average  (>1.5 = elevated activity)
-            Price Change (100 bars): {indicators['price_change_pct']:+.1f}%
+            Volume Ratio: {indicators['volume_ratio']:.1f}x average  (>1.5 = elevated activity){_return_lines}{_ma_lines}
 {_macro_ctx}
             Discovery Signals: {', '.join(self.discovery.opportunities.get(symbol, []))}{news_snippet}{_weekend}
 {_guard}
@@ -1197,6 +1258,10 @@ class AutonomousAgent:
             # Short-circuit SELL when we have no position — avoids an ~80s debate call
             if will_execute and decision['decision'] == 'sell' and self.get_position(symbol) is None:
                 logging.warning(f"⚠️  Skipping SELL {symbol}: no open position held")
+                will_execute = False
+            # Hard-block new BUY orders on earnings day (SELL allowed — exit before event)
+            if will_execute and decision['decision'] == 'buy' and symbol in earnings_symbols:
+                logging.warning(f"🛑 EARNINGS BLOCK: {symbol} has earnings today/tomorrow — BUY blocked (SELL allowed)")
                 will_execute = False
             if will_execute and decision['confidence'] >= _DEBATE_CONFIDENCE_THRESHOLD:
                 logging.info(f"⚖️  Debating {symbol} ({decision['decision'].upper()} @ {decision['confidence']:.0%})...")

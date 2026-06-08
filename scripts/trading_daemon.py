@@ -294,6 +294,25 @@ class TradingDaemon:
         except Exception as e:
             logging.error(f"❌ Weekend analysis failed: {e}")
 
+    def run_strategy_evolver(self):
+        """Evolve trading strategies and generate synthetic training examples (Saturday only)."""
+        try:
+            logging.info("=" * 70)
+            logging.info("🧬 RUNNING STRATEGY EVOLVER")
+            logging.info("=" * 70)
+            result = subprocess.run(
+                [sys.executable, str(_SCRIPTS_DIR / 'analysis' / 'strategy_evolver.py')],
+                timeout=1200,  # 20 min max
+            )
+            if result.returncode == 0:
+                logging.info("✅ Strategy evolver complete")
+            else:
+                logging.error(f"❌ Strategy evolver failed with code: {result.returncode}")
+        except subprocess.TimeoutExpired:
+            logging.error("❌ Strategy evolver timed out (20 min limit)")
+        except Exception as e:
+            logging.error(f"❌ Strategy evolver failed: {e}")
+
     def run_training_data_builder(self):
         """Convert today's decisions + outcomes into labelled training examples."""
         try:
@@ -476,12 +495,13 @@ class TradingDaemon:
                     weekly_report_done_this_week = True
                     last_weekly_report_week = current_week
 
-                # Weekend deep analysis on Saturday at 11:00 AM (paper bot only)
+                # Weekend deep analysis + strategy evolution on Saturday at 11:00 AM (paper bot only)
                 if (not _LIVE_ONLY
                         and now.weekday() == 5  # Saturday
                         and not weekend_strategist_done_this_week
                         and current_time >= self.weekend_strategist_time):
                     self.run_weekend_strategist()
+                    self.run_strategy_evolver()   # evolve strategies, enrich training_data.json
                     weekend_strategist_done_this_week = True
 
                 # Performance analysis at 5:00 PM (paper bot only)

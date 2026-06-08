@@ -16,6 +16,9 @@ logs/
 *.jsonl
 *.json
 
+# Keep curated knowledge base files (committed to repo)
+!knowledge/*.jsonl
+
 # Model files
 finetune/
 *.safetensors
