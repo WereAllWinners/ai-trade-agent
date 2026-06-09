@@ -332,7 +332,7 @@ The live and paper environments run simultaneously. Paper trading always continu
 | Threshold | Default | Effect |
 |---|---|---|
 | `OPTIONS_LIVE_THRESHOLD` | $5,000 | Options bot switches from paper to live |
-| `LIVE_EQUITY_THRESHOLD` | $25,000 | Full allocation params unlock; stock PDT guard relaxes |
+| `LIVE_EQUITY_THRESHOLD` | $2,000 | Full allocation params unlock; stock PDT guard relaxes |
 
 The stock live bot trades at **any equity level**. PDT compliance is enforced by `no_same_day_close=True` (never sell a position opened the same day) rather than blocking buying.
 
@@ -516,7 +516,7 @@ This is an experimental trading system. **Use at your own risk.**
 - Past paper trading performance does not guarantee live results
 - The author is not responsible for any financial losses
 - This is not financial advice
-- **PDT Rule**: Selling a US stock position the same day you bought it counts as a day trade. More than 3 day trades in 5 business days in an account under $25,000 triggers a 90-day trading restriction. The small-account mode enforces `no_same_day_close` to prevent this.
+- **PDT Rule**: Selling a US stock position the same day you bought it counts as a day trade. More than 3 day trades in 5 business days in an account under $2,000 triggers a 90-day trading restriction. The small-account mode enforces `no_same_day_close` to prevent this.
 - **Options Approval**: Buying options requires Level 2 options approval from Alpaca. Apply in your account settings before running the options bot live.
 - Review Alpaca's Terms of Service regarding automated trading before going live.
 

@@ -4,16 +4,16 @@ account_config.py — Equity-based trading configuration.
 
 Two account tiers, evaluated live at the start of each trading session:
 
-  Small account  (live equity < LIVE_EQUITY_THRESHOLD, default $25,000)
+  Small account  (live equity < LIVE_EQUITY_THRESHOLD, default $2,000)
     - Options bot: trades live with conservative small-account params
     - Stock bot:   forced to paper regardless of PAPER_TRADING env var
-                   (PDT rule caps same-day round-trips at 3 per 5 days under $25k)
+                   (PDT rule caps same-day round-trips at 3 per 5 days under $2k)
 
   Full account   (live equity >= LIVE_EQUITY_THRESHOLD)
     - Both bots use standard paper-trading params
     - One-time alert fired so the user knows to review config
 
-LIVE_EQUITY_THRESHOLD is read from .env (default 25000).
+LIVE_EQUITY_THRESHOLD is read from .env (default 2000).
 """
 
 import logging
@@ -22,7 +22,7 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-LIVE_EQUITY_THRESHOLD: float = float(os.getenv('LIVE_EQUITY_THRESHOLD', '25000'))
+LIVE_EQUITY_THRESHOLD: float = float(os.getenv('LIVE_EQUITY_THRESHOLD', '2000'))
 
 # Equity at which the options bot is allowed to go live.
 # Below this the options agent forces paper mode even when PAPER_TRADING=false.

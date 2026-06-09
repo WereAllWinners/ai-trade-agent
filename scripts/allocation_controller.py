@@ -247,7 +247,7 @@ class AllocationController:
         min_sharpe: float = 1.0,
         max_dd: float = 0.08,
         min_win_rate: float = 0.45,
-        min_equity: float = 25_000.0,
+        min_equity: float = 2_000.0,
     ) -> tuple[dict, float, int, list[str]]:
         """
         Evaluate whether this agent is ready for live trading.

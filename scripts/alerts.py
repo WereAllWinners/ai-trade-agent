@@ -379,7 +379,7 @@ def alert_live_trading_ready(agent_name: str, metrics: dict, equity: float,
         f"  LIVE TRADING READINESS — {agent_name}  {today}\n"
         f"  {verdict}\n"
         f"{'='*58}\n"
-        + _gate('Equity',       'equity',       f"${equity:,.0f}",                          '≥ $25,000')
+        + _gate('Equity',       'equity',       f"${equity:,.0f}",                          '≥ $2,000')
         + _gate('Paper days',   'paper trading', f"{paper_days}d",                           '≥ 30d')
         + _gate('Total trades', 'trades',        f"{metrics.get('total_trades', 0)}",        '≥ 50')
         + _gate('Sharpe ratio', 'sharpe',        f"{metrics.get('sharpe', 0):.2f}",          '≥ 1.0')

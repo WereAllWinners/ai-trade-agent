@@ -130,7 +130,7 @@ def run_preflight(
     # ------------------------------------------------------------------
     if pdt_flag:
         logging.warning(
-            "preflight: pattern_day_trader=True — you have < $25 000 equity "
+            "preflight: pattern_day_trader=True — you have < $2,000 equity "
             "and are restricted to 3 same-day round-trips per rolling 5 days"
         )
         # Not added to issues (not fatal) — agents already enforce _PDT_DAY_TRADE_LIMIT

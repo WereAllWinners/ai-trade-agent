@@ -256,7 +256,7 @@ class AutonomousAgent:
             paper=_paper
         )
 
-        # Live trading at sub-$25k is allowed in PDT-safe mode.
+        # Live trading at sub-$2k is allowed in PDT-safe mode.
         # Small-account params (max 2 trades/day, no same-day close) are applied
         # each session via run_trading_session() once equity is fetched.
         if not _paper:
