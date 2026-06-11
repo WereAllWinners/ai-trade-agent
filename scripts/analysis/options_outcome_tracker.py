@@ -26,6 +26,9 @@ from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 import db as _db
 
+# Reuse the SPY benchmark helper from outcome_tracker to avoid duplication
+from outcome_tracker import _fetch_spy_return
+
 load_dotenv()
 
 logging.basicConfig(
@@ -192,6 +195,7 @@ class OptionsOutcomeTracker:
                     exit_dt = datetime.fromisoformat(trade['timestamp'])
                     hold_hours = (exit_dt - entry_dt).total_seconds() / 3600
 
+                    spy_ret = _fetch_spy_return(entry['timestamp'], trade['timestamp'])
                     outcomes.append({
                         'symbol': contract,           # contract symbol (DB uses 'symbol' column)
                         'source': 'paper' if self.paper else 'live',
@@ -213,6 +217,9 @@ class OptionsOutcomeTracker:
                         'entry_reasoning': entry.get('reasoning', ''),
                         'exit_reason': trade.get('reason', ''),
                         'won': realized_pnl > 0,
+                        'spy_return_pct':   round(spy_ret, 4) if spy_ret is not None else None,
+                        'excess_return_pct': round(pnl_pct - spy_ret, 4) if spy_ret is not None else None,
+                        'regime':           entry.get('regime'),
                     })
 
         return outcomes

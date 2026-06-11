@@ -242,7 +242,9 @@ class TestOptionsLiveCashCheck:
         agent = _make_options_agent()
         result = self._setup_trade(agent, live_cash=800, option_price=1.00, quantity=2)
         assert result is True
-        agent.trading_client.submit_order.assert_called_once()
+        # submit_order is called at least once for the BUY; a second call for the
+        # GTC stop-limit SELL (C2) is also expected when OPTIONS_GTC_STOP is enabled.
+        agent.trading_client.submit_order.assert_called()
 
     def test_trade_blocked_when_cash_exactly_at_reserve_after_cost(self):
         """

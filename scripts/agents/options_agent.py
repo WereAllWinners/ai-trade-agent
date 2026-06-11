@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetOptionContractsRequest, GetOrdersRequest, MarketOrderRequest, LimitOrderRequest
+from alpaca.trading.requests import GetOptionContractsRequest, GetOrdersRequest, MarketOrderRequest, LimitOrderRequest, StopLimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, ContractType
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.requests import OptionLatestQuoteRequest
@@ -27,7 +27,7 @@ except Exception:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import _pathfix  # noqa: F401
-from model_inference_lora import get_trading_decision, parse_decision
+from model_inference_lora import get_trading_decision, parse_decision, _generate_base_model
 from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
 import news_fetcher
 import unusual_flow_scanner
@@ -39,6 +39,7 @@ from paper_market_simulator import PaperMarketSimulator
 import account_config as _acfg
 
 _DEBATE_CONFIDENCE_THRESHOLD = 0.85   # Options trades require higher bar for debate
+_debate_unavailable_count: int = 0    # E2: tracks base-model debate failures
 _MIN_CASH_RESERVE = 500.0             # Never spend the account's last $500 of cash
 _DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'  # log orders but never submit
 # Near-zero option exit: skip closing if total contract value is below this threshold
@@ -46,8 +47,12 @@ _DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'  # log orders but nev
 _MIN_EXIT_VALUE_USD = 10.0
 
 # Options liquidity thresholds — override via environment variables
-_MIN_OPEN_INTEREST = int(os.getenv('MIN_OPEN_INTEREST_OPTIONS', '200'))
-_MIN_OPTION_VOLUME = int(os.getenv('MIN_OPTION_VOLUME', '50'))
+_MIN_OPEN_INTEREST  = int(os.getenv('MIN_OPEN_INTEREST_OPTIONS', '200'))
+_MIN_OPTION_VOLUME  = int(os.getenv('MIN_OPTION_VOLUME', '50'))
+# E3: Hard liquidity gates (code-level, not just prompt instructions)
+_OPT_MIN_OI         = int(os.getenv('OPT_MIN_OI', '250'))           # OI gate (stricter than _MIN_OPEN_INTEREST)
+_OPT_MAX_SPREAD_PCT = float(os.getenv('OPT_MAX_SPREAD_PCT', '0.12'))  # (ask-bid)/mid > 12% → skip
+_OPT_MAX_FRICTION   = float(os.getenv('OPT_MAX_FRICTION_PCT', '0.15')) # (ask-mid)/mid > 15% → skip
 
 def _json_default(obj):
     """JSON serializer for types that the stdlib encoder can't handle."""
@@ -189,6 +194,29 @@ def _load_weekend_context_block() -> str:
         return ''
 
 
+def _compute_regime() -> str | None:
+    """Return current market regime string e.g. 'bull_midvol'.
+
+    Fetches SPY vs its 200-day MA (bull/bear) and VIX level (lowvol/midvol/highvol).
+    Returns None silently on any data-fetch failure so trading never blocks.
+    """
+    try:
+        spy = yf.download('SPY', period='1y', auto_adjust=True, progress=False)['Close']
+        if spy.empty or len(spy) < 200:
+            return None
+        spy_price  = float(spy.iloc[-1])
+        spy_200ma  = float(spy.tail(200).mean())
+        trend = 'bull' if spy_price > spy_200ma else 'bear'
+
+        vix = yf.download('^VIX', period='5d', auto_adjust=True, progress=False)['Close']
+        vix_val = float(vix.iloc[-1]) if not vix.empty else 20.0
+        vol = 'highvol' if vix_val > 25 else ('lowvol' if vix_val < 15 else 'midvol')
+        return f"{trend}_{vol}"
+    except Exception as e:
+        logging.debug("_compute_regime failed (non-fatal): %s", e)
+        return None
+
+
 def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) -> dict:
     """
     Contrarian second LLM call — challenges a high-conviction options trade.
@@ -208,7 +236,8 @@ def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) ->
         f"When in doubt, PROCEED."
     )
     try:
-        text = get_trading_decision(debate_prompt)   # Uses new LoRA + DPO model
+        # E2: route through the BASE (un-fine-tuned) model for diverse perspective.
+        text = _generate_base_model(debate_prompt)
         verdict = 'PROCEED'
         for line in text.splitlines():
             if 'VERDICT:' in line.upper():
@@ -216,7 +245,11 @@ def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) ->
                 break
         return {'verdict': verdict, 'reason': text.strip()}
     except Exception as e:
-        logging.warning(f"  Debate call failed for {symbol}: {e}")
+        global _debate_unavailable_count
+        _debate_unavailable_count += 1
+        logging.warning(
+            f"  Debate call failed for {symbol}: {e}  (debate_unavailable #{_debate_unavailable_count})"
+        )
         return {'verdict': 'PROCEED', 'reason': 'debate unavailable'}
 
 load_dotenv()
@@ -280,6 +313,8 @@ class OptionsAgent:
         self.last_reset_date = datetime.now().date()
         self.trade_cooldown = {}  # Symbol -> last trade time
         self.daily_start_equity = None  # Set at start of each trading day
+        self._last_order_id: str | None = None
+        self._session_regime: str | None = None
 
         if _DRY_RUN:
             logging.warning("🧪 DRY RUN MODE: orders will be logged but NOT submitted to Alpaca")
@@ -306,7 +341,8 @@ class OptionsAgent:
     
     def _log_decision(self, symbol: str, prompt: str, raw_response: str,
                       decision: dict, indicators: dict, market_context: dict,
-                      executed: bool, debate: dict | None = None) -> None:
+                      executed: bool, debate: dict | None = None,
+                      order_id: str | None = None) -> None:
         """Append one options decision record to options_decision_log.jsonl."""
         record = {
             'timestamp':      datetime.now().isoformat(),
@@ -323,6 +359,8 @@ class OptionsAgent:
             'reasoning':      decision.get('reasoning', ''),
             'executed':       executed,
             'debate':         debate,
+            'order_id':       order_id,
+            'regime':         self._session_regime,
         }
         try:
             with open(self._decision_log, 'a') as f:
@@ -488,6 +526,7 @@ class OptionsAgent:
                                symbol_bias: str = 'neutral',
                                news_snippet: str = '', flow_snippet: str = '',
                                greeks: dict | None = None,
+                               iv_rank: float | None = None,
                                macro_context_block: str = '',
                                weekend_context_block: str = '',
                                macro_guard_block: str = ''):
@@ -520,8 +559,22 @@ class OptionsAgent:
                 parts.append(f"Theta: {greeks['theta']:+.4f}/day  (time decay cost)")
             if greeks.get('gamma') is not None:
                 parts.append(f"Gamma: {greeks['gamma']:.4f}  (delta acceleration)")
-            if greeks.get('iv') is not None:
-                parts.append(f"IV: {greeks['iv']:.1%}  (implied vol — high IV = expensive premium, IV crush risk)")
+            iv = greeks.get('iv')
+            if iv is not None:
+                iv_rank_str = f"{iv_rank:.0%}" if iv_rank is not None else "N/A"
+                parts.append(
+                    f"IV: {iv:.1%}  |  IV Rank: {iv_rank_str}  "
+                    f"(high IV rank = expensive premium, high IV crush risk)"
+                )
+                # E3: expected move (approximate log-normal ATM formula)
+                dte = greeks.get('dte')
+                current_price = analysis.get('current_price')
+                if dte and current_price:
+                    expected_move = current_price * iv * (dte / 365) ** 0.5
+                    parts.append(
+                        f"Market-implied move by expiry: ±${expected_move:.2f}  "
+                        f"({expected_move / current_price:.1%})"
+                    )
             if parts:
                 greeks_block = '\n\nLive Option Greeks (ATM contract):\n' + '\n'.join(f'- {p}' for p in parts)
 
@@ -600,9 +653,9 @@ Reasoning: <one sentence explaining the key signal>"""
                     exp = datetime.strptime(exp, '%Y-%m-%d').date()
                 dte = (exp - datetime.now().date()).days
 
-                # Liquidity gate: skip contracts with insufficient open interest
+                # E3: Hard OI gate (uses stricter _OPT_MIN_OI for new entries)
                 oi = int(contract.open_interest or 0)
-                if oi < _MIN_OPEN_INTEREST:
+                if oi < _OPT_MIN_OI:
                     logging.debug(
                         f"  Skipping {contract.symbol}: OI {oi} < {_MIN_OPEN_INTEREST}"
                     )
@@ -687,7 +740,25 @@ Reasoning: <one sentence explaining the key signal>"""
                     return None
 
                 if bid > 0 and ask > 0:
-                    return (bid + ask) / 2.0
+                    mid = (bid + ask) / 2.0
+                    # E3: Hard spread gate — wide spreads signal illiquid contracts
+                    # where slippage destroys edge before the position is filled.
+                    spread_pct = (ask - bid) / mid if mid > 0 else 1.0
+                    if spread_pct > _OPT_MAX_SPREAD_PCT:
+                        logging.debug(
+                            "  Skipping %s: spread %.0f%% > max %.0f%%",
+                            contract_symbol, spread_pct * 100, _OPT_MAX_SPREAD_PCT * 100,
+                        )
+                        return None
+                    # E3: Friction gate — (ask-mid)/mid captures the immediate cost-to-entry
+                    friction = (ask - mid) / mid if mid > 0 else 1.0
+                    if friction > _OPT_MAX_FRICTION:
+                        logging.debug(
+                            "  Skipping %s: friction %.0f%% > max %.0f%%",
+                            contract_symbol, friction * 100, _OPT_MAX_FRICTION * 100,
+                        )
+                        return None
+                    return mid
                 elif ask > 0:
                     return ask
                 elif bid > 0:
@@ -878,6 +949,39 @@ Reasoning: <one sentence explaining the key signal>"""
             except Exception as e:
                 logging.warning(f"⚠️  Could not write options trade to DB: {e}")
             
+            self._last_order_id = str(submitted_order.id)
+
+            # C2: submit a GTC stop-limit SELL immediately after entry so the position
+            # is protected even if the daemon goes offline.  The stop fires at the same
+            # percentage threshold as the software stop_loss param.
+            if os.getenv('OPTIONS_GTC_STOP', 'true').lower() == 'true':
+                stop_trigger = round(fill_price * (1 + self.params['stop_loss']), 2)
+                stop_limit   = round(stop_trigger * 0.90, 2)  # 10% room for wide option spreads
+                if _DRY_RUN:
+                    logging.info(
+                        f"[DRY RUN] Would submit GTC stop-limit SELL: {contract.symbol[:20]} "
+                        f"stop=${stop_trigger:.4f} limit=${stop_limit:.4f}"
+                    )
+                else:
+                    try:
+                        stop_order = StopLimitOrderRequest(
+                            symbol=contract.symbol,
+                            qty=quantity,
+                            side=OrderSide.SELL,
+                            stop_price=stop_trigger,
+                            limit_price=stop_limit,
+                            time_in_force=TimeInForce.GTC,
+                        )
+                        self.trading_client.submit_order(stop_order)
+                        logging.info(
+                            f"🛡️  GTC stop-limit SELL placed: {contract.symbol[:20]} "
+                            f"stop=${stop_trigger:.4f} limit=${stop_limit:.4f}"
+                        )
+                    except Exception as _se:
+                        logging.warning(
+                            f"⚠️  GTC stop submission failed for {contract.symbol[:20]}: {_se}"
+                        )
+
             logging.info(f"✅ Executed OPTIONS trade: {quantity} contracts of {symbol} {contract_type.value}")
             alert_trade_executed(
                 'OptionsAgent', contract.symbol, 'buy',
@@ -917,6 +1021,29 @@ Reasoning: <one sentence explaining the key signal>"""
         except Exception as e:
             logging.warning(f"Could not check open orders for {symbol}: {e}")
             return False
+
+    def _cancel_gtc_stops(self, symbol: str) -> None:
+        """Cancel pending GTC stop-limit SELL orders for symbol.
+
+        Called before agent-initiated exits so the passive broker stop does not
+        block _has_open_exit_order.  Only cancels orders with a stop_price set
+        (stop-limit orders); plain GTC limit orders (DTE exits) are untouched.
+        """
+        try:
+            open_orders = self.trading_client.get_orders(
+                GetOrdersRequest(status='open')
+            )
+            for order in open_orders:
+                if (order.symbol == symbol
+                        and order.side == OrderSide.SELL
+                        and order.time_in_force == TimeInForce.GTC
+                        and getattr(order, 'stop_price', None) is not None):
+                    self.trading_client.cancel_order_by_id(str(order.id))
+                    logging.info(
+                        f"🗑️  Cancelled GTC stop order for {symbol[:20]}: {order.id}"
+                    )
+        except Exception as e:
+            logging.warning(f"⚠️  Could not cancel GTC stops for {symbol[:20]}: {e}")
 
     def _opened_today(self, symbol: str) -> bool:
         """True if a filled BUY order for this options contract was placed today (same-day PDT guard)."""
@@ -1008,8 +1135,12 @@ Reasoning: <one sentence explaining the key signal>"""
                     )
                     continue
 
-                # Gap 1: skip if an open sell order for this position already exists
-                # (prevents duplicate submissions when a prior GTC order is still live)
+                # Cancel any pending GTC stop orders before the duplicate-exit check.
+                # Agent-initiated exits (P&L/DTE thresholds) take priority over passive stops.
+                self._cancel_gtc_stops(position.symbol)
+
+                # Skip if an open sell order still exists after stop cancellation
+                # (e.g. a manually-submitted exit or a DTE GTC from a prior session).
                 if self._has_open_exit_order(position.symbol):
                     logging.info(
                         f"⏭️  Skipping exit for {position.symbol[:20]}... — "
@@ -1123,6 +1254,11 @@ Reasoning: <one sentence explaining the key signal>"""
             self.daily_start_equity = None
             logging.info("🔄 Daily options trade counter reset")
 
+        # Compute market regime once per session for decision tagging
+        self._session_regime = _compute_regime()
+        if self._session_regime:
+            logging.info(f"📊 Market regime: {self._session_regime}")
+
         # Fetch equity once at session start — drives account_config param selection
         # and the circuit breaker further below.
         try:
@@ -1167,6 +1303,17 @@ Reasoning: <one sentence explaining the key signal>"""
         # Step 1: Manage existing positions — runs BEFORE the circuit breaker so
         # DTE exits still fire on bad P&L days (defensive, not speculative).
         self.manage_existing_positions()
+
+        # C3: write reconcile status after the position sweep so health monitoring
+        # and morning_model_check have an up-to-date unprotected-positions count.
+        try:
+            from risk_reconciler import write_reconcile_status
+            write_reconcile_status(
+                self.trading_client,
+                Path('logs/reconcile_status.json'),
+            )
+        except Exception as _re:
+            logging.debug("Could not write reconcile_status: %s", _re)
 
         # Circuit breaker: check daily P&L before opening any new positions
         # (equity was already fetched at session start above)
@@ -1273,12 +1420,22 @@ Reasoning: <one sentence explaining the key signal>"""
             )
             greeks = self.get_atm_option_greeks(symbol, preliminary_ctype)
 
+            # E3: compute IV rank and upsert snapshot for historical tracking
+            iv_rank = None
+            if greeks and greeks.get('iv') is not None:
+                iv_val = float(greeks['iv'])
+                iv_rank = _db.get_iv_rank(symbol, iv_val)
+                try:
+                    _db.upsert_iv_snapshot(symbol, iv_val)
+                except Exception as _iv_err:
+                    logging.debug("Could not upsert IV snapshot for %s: %s", symbol, _iv_err)
+
             # Get AI decision — returns (decision, prompt, raw_response) in one LLM call
             sym_bias = symbol_bias.get(symbol, 'neutral')
             decision, prompt, raw_response = self.get_ai_options_decision(
                 analysis, market_bias=market_bias, symbol_bias=sym_bias,
                 news_snippet=news_snippet, flow_snippet=flow_snippet,
-                greeks=greeks,
+                greeks=greeks, iv_rank=iv_rank,
                 macro_context_block=macro_context_block,
                 weekend_context_block=weekend_context_block,
                 macro_guard_block=macro_guard_block,
@@ -1330,7 +1487,8 @@ Reasoning: <one sentence explaining the key signal>"""
                     available_capital = self.get_available_capital()
                     if available_capital < 100:
                         self._log_decision(symbol, prompt, raw_response, decision, analysis,
-                                           market_ctx, executed, debate=debate_result)
+                                           market_ctx, executed, debate=debate_result,
+                                           order_id=self._last_order_id)
                         break
             else:
                 if debate_result and debate_result['verdict'] == 'ABORT':
@@ -1341,7 +1499,8 @@ Reasoning: <one sentence explaining the key signal>"""
 
             # Log every decision (including HOLDs) for replay and validation
             self._log_decision(symbol, prompt, raw_response, decision, analysis,
-                               market_ctx, executed, debate=debate_result)
+                               market_ctx, executed, debate=debate_result,
+                               order_id=self._last_order_id if executed else None)
         
         logging.info(f"✅ Options session complete: {trades_executed} trades executed")
 

@@ -204,6 +204,38 @@ def check_inference(results: CheckResult, verbose: bool = False) -> None:
         print(f"\n  --- Model response ---\n{response[:600]}\n  ---")
 
 
+def check_reconcile_status(results: CheckResult) -> None:
+    """Verify no unprotected options positions from the last session."""
+    status_path = _PROJECT_ROOT / 'logs' / 'reconcile_status.json'
+    if not status_path.exists():
+        results.add(
+            'reconcile_status', False,
+            'reconcile_status.json not found (options daemon not started yet)',
+            warn_only=True,
+        )
+        return
+    try:
+        data = json.loads(status_path.read_text())
+        n = int(data.get('unprotected_positions', -1))
+        checked_at = data.get('checked_at', 'unknown')
+        if n < 0:
+            results.add(
+                'reconcile_unprotected', False,
+                f'Could not determine protection status (API error) — checked at {checked_at}',
+                warn_only=True,
+            )
+        else:
+            detail = (
+                f'{n} unprotected options position(s) detected — checked at {checked_at}'
+                if n > 0
+                else f'all positions protected — checked at {checked_at}'
+            )
+            results.add('reconcile_unprotected', n == 0, detail)
+    except Exception as e:
+        results.add('reconcile_status', False, f'Could not read reconcile_status.json: {e}',
+                    warn_only=True)
+
+
 def check_service_status(results: CheckResult) -> None:
     """Check that the trading daemon services are running."""
     for service in ('ai-trading-bot.service', 'ai-options-bot.service'):
@@ -249,10 +281,13 @@ def main():
     # 5. Services
     check_service_status(results)
 
-    # 6. Inference (optional, GPU-heavy)
+    # 6. Broker-side risk reconciliation
+    check_reconcile_status(results)
+
+    # 7. Inference (optional, GPU-heavy)
     if not args.no_inference and adapter_path:
         check_inference(results, verbose=args.verbose)
-    elif args.no_inference:
+    elif args.no_inference:  # noqa: SIM114
         print("  ⏭️  Skipping inference check (--no-inference)")
 
     # Report

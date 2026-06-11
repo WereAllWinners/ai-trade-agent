@@ -41,6 +41,14 @@ WEAK_LOSS_PCT       = -0.005
 LOSS_PCT            = -0.12
 STRONG_LOSS_PCT     = -0.30
 
+import os
+_MISSED_OPP_EXCESS   = float(os.getenv('TDB_MISSED_OPP_EXCESS', '0.03'))
+_HALF_LIFE_DAYS      = float(os.getenv('TDB_HALF_LIFE_DAYS', '45'))
+_MAX_EXAMPLES        = int(os.getenv('TDB_MAX_EXAMPLES', '5000'))
+
+# Module-level SPY cache so repeated HOLD lookups don't re-fetch the same window
+_SPY_RETURN_CACHE: dict = {}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -63,6 +71,43 @@ def _forward_price_change(symbol: str, entry_dt: datetime, hold_days: int) -> fl
     except Exception as e:
         logging.warning(f"yfinance lookup failed for {symbol}: {e}")
         return None
+
+
+def _forward_excess_return(symbol: str, entry_dt: datetime,
+                           hold_days: int) -> tuple[float | None, float | None]:
+    """Return (stock_return, excess_vs_spy) for the hold window, or (None, None) on failure.
+
+    SPY returns are cached per (entry_date, hold_days) to avoid repeated network calls
+    when many HOLD decisions share the same window.
+    """
+    stock_pct = _forward_price_change(symbol, entry_dt, hold_days)
+    cache_key = (entry_dt.date().isoformat(), hold_days)
+    if cache_key not in _SPY_RETURN_CACHE:
+        _SPY_RETURN_CACHE[cache_key] = _forward_price_change('SPY', entry_dt, hold_days)
+    spy_pct = _SPY_RETURN_CACHE[cache_key]
+    if stock_pct is None or spy_pct is None:
+        return None, None
+    return stock_pct, float(stock_pct - spy_pct)
+
+
+def _pick_bin(confidence: float) -> str | None:
+    """Map a confidence float to the calibration bin label used in weekly_report.py."""
+    if confidence < 0.60:
+        return None
+    elif confidence < 0.70:
+        return '0.60-0.70'
+    elif confidence < 0.80:
+        return '0.70-0.80'
+    elif confidence < 0.90:
+        return '0.80-0.90'
+    else:
+        return '0.90-1.00'
+
+
+def _example_weight(entry_dt: datetime) -> float:
+    """Recency weight: exponential decay with half-life _HALF_LIFE_DAYS. Floor 0.05."""
+    age_days = (datetime.now() - entry_dt).days
+    return max(0.05, 0.5 ** (age_days / _HALF_LIFE_DAYS))
 
 
 def _tiered_label_from_pnl(pnl_pct: float, decision: str, position_size: float = 0.0) -> tuple[str, float]:
@@ -101,34 +146,39 @@ def _tiered_label_from_pnl(pnl_pct: float, decision: str, position_size: float =
 
 
 def _build_ideal_output(decision: str, confidence: float, reasoning: str,
-                        label: str, pnl_pct: float | None, reward: float | None) -> str:
+                        label: str, pnl_pct: float | None = None,
+                        reward: float | None = None) -> str:
+    """Build the SFT target string.
+
+    Format is strictly Decision / Confidence / Reasoning — no Outcome or Reward
+    lines. Those belonged to the prompt context the model cannot see at inference
+    time and were teaching hallucination rather than forward-looking analysis.
+    """
     action_map = {
         'buy': 'BUY', 'sell': 'SELL', 'hold': 'HOLD',
         'buy_call': 'BUY_CALL', 'buy_put': 'BUY_PUT',
     }
     action_str = action_map.get(decision, decision.upper())
-
-    if label.startswith('strong_winner'):
-        outcome_note = f"Excellent trade — strong winner (+{pnl_pct:+.1%})."
-    elif label.startswith('winner'):
-        outcome_note = f"Profitable trade ({pnl_pct:+.1%})."
-    elif label == 'weak_winner':
-        outcome_note = f"Small win ({pnl_pct:+.1%}) — room for improvement."
-    elif label.startswith('strong_loser'):
-        outcome_note = f"Significant loss ({pnl_pct:+.1%}) — review signals carefully."
-    elif label.startswith('loser'):
-        outcome_note = f"Loss ({pnl_pct:+.1%}) — avoid similar setups."
-    else:
-        _pnl_str = f"{pnl_pct:+.1%}" if pnl_pct is not None else "N/A"
-        outcome_note = f"Minor loss or breakeven ({_pnl_str})."
-
-    reward_str = f" Reward signal: {reward:+.4f}" if reward is not None else ""
-
     return (
         f"Decision: {action_str}\n"
         f"Confidence: {confidence:.2f}\n"
-        f"Reasoning: {reasoning}\n"
-        f"Outcome: {outcome_note}{reward_str}"
+        f"Reasoning: {reasoning}"
+    )
+
+
+def _build_counterfactual_output(decision: str, pnl_pct: float | None) -> str:
+    """Counterfactual SFT target for loser-labeled decisions.
+
+    Teaches the model that HOLD was the better call for this prompt context.
+    The output format is identical to imitation targets so the SFT loss treats
+    them uniformly; only the decision and reasoning differ.
+    """
+    pnl_str = f"{pnl_pct:+.1%}" if pnl_pct is not None else "a loss"
+    return (
+        f"Decision: HOLD\n"
+        f"Confidence: 0.90\n"
+        f"Reasoning: The original {decision.upper()} resulted in {pnl_str}; "
+        f"indicators did not justify the entry risk at this time."
     )
 
 
@@ -150,6 +200,10 @@ def build_and_store(bot: str) -> tuple[int, int]:
     hold_decisions = [dict(r) for r in hold_rows]
 
     all_candidates = decisions + hold_decisions
+
+    # A5: calibration map built once per run; empty dict → fall back to raw confidence
+    calib_map = _db.get_calibration_map(bot)
+
     added = 0
 
     for rec in all_candidates:
@@ -177,8 +231,16 @@ def build_and_store(bot: str) -> tuple[int, int]:
         reward = None
         position_size = 0.03  # default fallback
 
-        # 1. Primary: SQLite outcomes
-        outcome = _db.get_outcome_by_entry(symbol, entry_dt.date().isoformat())
+        # 1. Primary: look up by order_id when available (A6), fall back to (symbol, date)
+        order_id = rec.get('order_id')
+        outcome = None
+        if order_id:
+            outcome = _db.get_outcome_by_order_id(order_id)
+        if outcome is None:
+            outcome = _db.get_outcome_by_entry(symbol, entry_dt.date().isoformat())
+            if outcome is None and order_id:
+                logging.debug("outcome lookup fallback used for symbol=%s date=%s", symbol, entry_dt.date())
+
         if outcome:
             pnl_pct = outcome.get('pnl_pct', 0)
             label, reward = _tiered_label_from_pnl(pnl_pct, decision, position_size)
@@ -191,18 +253,18 @@ def build_and_store(bot: str) -> tuple[int, int]:
                 if pnl_pct is not None:
                     label, reward = _tiered_label_from_pnl(pnl_pct, decision, position_size)
 
-        # 3. HOLD validation
+        # 3. HOLD validation — A1: use SPY-excess-return threshold, not absolute price change
         elif decision == 'hold':
             days_elapsed = (datetime.now() - entry_dt).days
             if days_elapsed >= HOLD_DAYS_FALLBACK:
-                pnl_pct = _forward_price_change(symbol, entry_dt, HOLD_DAYS_FALLBACK)
-                if pnl_pct is not None:
-                    if abs(pnl_pct) < 0.008:
+                pnl_pct, excess = _forward_excess_return(symbol, entry_dt, HOLD_DAYS_FALLBACK)
+                if excess is not None:
+                    if excess >= _MISSED_OPP_EXCESS:
+                        label = 'missed_opportunity'
+                        reward = -0.02
+                    elif abs(excess) < 0.008:
                         label = 'correct_hold'
                         reward = 0.0
-                    elif pnl_pct > 0.01 and decision in ('buy', 'buy_call'):
-                        label = 'missed_opportunity'
-                        reward = -0.02  # penalize missed upside
                     else:
                         label = 'correct_hold'
                         reward = 0.01
@@ -210,22 +272,31 @@ def build_and_store(bot: str) -> tuple[int, int]:
         if label is None:
             continue
 
+        # A5: replace cloned confidence with calibrated win-rate for that bin
+        conf_bin = _pick_bin(confidence)
+        if conf_bin and conf_bin in calib_map:
+            calibrated_conf = float(calib_map[conf_bin]['win_rate'])
+            calibrated_conf = max(0.05, min(0.95, calibrated_conf))
+        else:
+            calibrated_conf = confidence
+
         example = {
             'input': prompt,
-            'output': _build_ideal_output(decision, confidence, reasoning, label, pnl_pct, reward),
+            'output': _build_ideal_output(decision, calibrated_conf, reasoning, label),
             'label': label,
             'metadata': {
                 'bot': bot,
                 'source': rec.get('source', 'paper'),
                 'symbol': symbol,
                 'decision': decision,
-                'confidence': round(confidence, 4),
+                'confidence': round(calibrated_conf, 4),
                 'pnl_pct': round(pnl_pct, 6) if pnl_pct is not None else None,
                 'reward': round(reward, 6) if reward is not None else None,
                 'entry_date': entry_dt.date().isoformat(),
                 'session_id': rec.get('session_id', ''),
                 'prompt_hash': ph,
                 'generated_at': datetime.now().isoformat(),
+                'example_type': 'imitation',
             },
         }
 
@@ -233,36 +304,77 @@ def build_and_store(bot: str) -> tuple[int, int]:
             existing_hashes.add(ph)
             added += 1
 
-    # Export
+        # A2: for losers, emit a second counterfactual row teaching HOLD
+        if label in {'strong_loser', 'loser', 'weak_loser'}:
+            cf_ph = _prompt_hash(prompt + '|counterfactual')
+            if cf_ph not in existing_hashes:
+                cf_example = {
+                    'input': prompt,
+                    'output': _build_counterfactual_output(decision, pnl_pct),
+                    'label': 'counterfactual',
+                    'metadata': {
+                        'bot': bot,
+                        'source': rec.get('source', 'paper'),
+                        'symbol': symbol,
+                        'decision': decision,
+                        'confidence': round(calibrated_conf, 4),
+                        'pnl_pct': round(pnl_pct, 6) if pnl_pct is not None else None,
+                        'reward': round(reward, 6) if reward is not None else None,
+                        'entry_date': entry_dt.date().isoformat(),
+                        'session_id': rec.get('session_id', ''),
+                        'prompt_hash': cf_ph,
+                        'generated_at': datetime.now().isoformat(),
+                        'example_type': 'counterfactual',
+                    },
+                }
+                if _db.insert_training_example(cf_example):
+                    existing_hashes.add(cf_ph)
+                    added += 1
+
+    # Export with recency weighting (A7)
     all_examples = _db.get_training_examples(bot=bot)
+
+    def _weight_for(ex: dict) -> float:
+        try:
+            entry_dt = datetime.fromisoformat(ex.get('entry_date') or '2020-01-01')
+        except (ValueError, TypeError):
+            return 0.05
+        return _example_weight(entry_dt)
+
+    exportable = []
+    for e in all_examples:
+        w = _weight_for(e)
+        exportable.append({
+            'input':  e['prompt'],
+            'output': e['ideal_output'],
+            'label':  e['label'],
+            'weight': round(w, 6),
+            'metadata': {
+                'bot':          e['bot'],
+                'symbol':       e['symbol'],
+                'confidence':   e['confidence'],
+                'pnl_pct':      e['pnl_pct'],
+                'reward':       e.get('reward'),
+                'entry_date':   e['entry_date'],
+                'session_id':   e['session_id'],
+                'prompt_hash':  e['prompt_hash'],
+                'example_type': e.get('example_type', 'imitation'),
+            }
+        })
+
+    # Sort by weight descending (most recent first) and cap
+    exportable.sort(key=lambda x: x['weight'], reverse=True)
+    exportable = exportable[:_MAX_EXAMPLES]
+
     filename = 'training_data.json' if bot == 'stock' else 'options_training_data.json'
     output_path = _DATA_DIR / filename
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    exportable = [
-        {
-            'input': e['prompt'],
-            'output': e['ideal_output'],
-            'label': e['label'],
-            'metadata': {
-                'bot': e['bot'],
-                'symbol': e['symbol'],
-                'confidence': e['confidence'],
-                'pnl_pct': e['pnl_pct'],
-                'reward': e.get('reward'),
-                'entry_date': e['entry_date'],
-                'session_id': e['session_id'],
-                'prompt_hash': e['prompt_hash'],
-            }
-        }
-        for e in all_examples
-    ]
-
     with open(output_path, 'w') as f:
         json.dump(exportable, f, indent=2)
 
-    logging.info(f"✅ {bot.capitalize()}: +{added} new enriched examples → {len(all_examples)} total")
-    return added, len(all_examples)
+    logging.info(f"✅ {bot.capitalize()}: +{added} new examples → {len(exportable)} exported (of {len(all_examples)} total)")
+    return added, len(exportable)
 
 
 def build_portfolio_level_examples() -> int:
@@ -326,8 +438,7 @@ def build_portfolio_level_examples() -> int:
                 f"Confidence: 1.00\n"
                 f"Reasoning: Correctly blocked — {sector} exposure was {pct_str} which exceeds "
                 f"the {cap_str} sector cap. Adding {symbol} would have worsened concentration risk. "
-                f"Next time, route capital to under-represented sectors or wait for rebalancing.\n"
-                f"Outcome: Correct portfolio veto — no reward penalty."
+                f"Next time, route capital to under-represented sectors or wait for rebalancing."
             )
             label = 'correct_hold'
         else:
@@ -335,8 +446,7 @@ def build_portfolio_level_examples() -> int:
                 f"Decision: HOLD\n"
                 f"Confidence: 1.00\n"
                 f"Reasoning: Trade was blocked due to: {reason}. "
-                f"Review position sizing and sector limits before retrying.\n"
-                f"Outcome: Portfolio constraint enforced."
+                f"Review position sizing and sector limits before retrying."
             )
             label = 'correct_hold'
 

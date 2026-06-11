@@ -20,7 +20,21 @@ _MIN_MARKET_CAP       = int(os.getenv('MIN_MARKET_CAP',               '500_000_0
 
 _DELISTED_CACHE_PATH = Path(__file__).resolve().parent.parent / 'logs' / 'delisted_cache.json'
 _DISCOVERY_CACHE_PATH = Path(__file__).resolve().parent.parent / 'logs' / 'discovery_cache.json'
+_SIGNAL_EV_PATH = Path(__file__).resolve().parent.parent / 'logs' / 'signal_expectancy.json'
 _DISCOVERY_CACHE_TTL_HOURS = 4  # Reuse discovery results for up to 4 hours
+
+
+def _load_signal_ev() -> dict[str, float]:
+    """Load per-signal expected value map from logs/signal_expectancy.json.
+
+    Returns {} when the file does not exist or cannot be parsed so that
+    rank_opportunities falls back to count-based ranking without raising.
+    """
+    try:
+        data = json.loads(_SIGNAL_EV_PATH.read_text())
+        return data.get('signal_ev', {})
+    except Exception:
+        return {}
 
 
 def passes_liquidity_filter(symbol: str, info: dict) -> bool:
@@ -566,13 +580,22 @@ class StockDiscovery:
         return liquid_stocks
     
     def rank_opportunities(self, stocks):
-        """Rank by signal count."""
+        """Rank by signal EV sum; falls back to signal count when EV map is absent."""
+        ev_map = _load_signal_ev()
         ranked = []
-        
+
         for symbol in stocks:
-            signal_count = len(self.opportunities.get(symbol, []))
-            ranked.append((symbol, signal_count))
-        
+            signals = self.opportunities.get(symbol, [])
+            if ev_map:
+                # Use EV for known signals; unknown signals get a small count-based bonus
+                score = sum(
+                    ev_map[sig] if sig in ev_map else len(signals) * 0.001
+                    for sig in signals
+                )
+            else:
+                score = float(len(signals))
+            ranked.append((symbol, score))
+
         ranked.sort(key=lambda x: x[1], reverse=True)
         return [symbol for symbol, _ in ranked]
     

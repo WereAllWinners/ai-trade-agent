@@ -61,21 +61,59 @@ Should we BUY, SELL, or HOLD? Provide Decision, Confidence (0-1), and Reasoning.
         0.60,
     ),
     (
-        "strong_overbought_sell",
+        "exit_after_gains",
         """Analyze TSLA for trading:
 
-Current Price: $410.00
-RSI (14): 84.3          <- heavily overbought
-MACD: -1.8 (bearish divergence)
-Volume Ratio: 0.7x avg  <- declining volume on rally
-Price vs 200-day MA: +38% (far above)
-Price Change (5d): +22%
+Current Price: $390.00
+RSI (14): 78.4          <- overbought
+MACD: -1.2 (bearish divergence developing)
+Volume Ratio: 0.6x avg  <- declining volume on price stall
+Price vs 200-day MA: +28% (overextended)
+Price Change (5d): -2% (stalling after big run)
+Current Position: Long TSLA entered at $341 (+14.4% unrealised gain)
+Stop loss: -7% | Take profit: +15%
 
-Discovery Signals: Extreme overbought, insider selling detected last week.
+Discovery Signals: Take-profit level approaching, RSI overbought, momentum fading.
 
 Should we BUY, SELL, or HOLD? Provide Decision, Confidence (0-1), and Reasoning.""",
         "sell",
         0.60,
+    ),
+    (
+        "earnings_hold",
+        """Analyze AMZN for trading:
+
+Current Price: $215.00
+RSI (14): 58.0          <- moderately bullish
+MACD: +1.1 (positive momentum)
+Volume Ratio: 0.9x avg
+Price vs 200-day MA: +12%
+Price Change (5d): +3%
+Upcoming: Earnings report in 2 days (IV elevated 40% above historical norm)
+
+Discovery Signals: Moderate bullish setup but high earnings event uncertainty.
+
+Should we BUY, SELL, or HOLD? Provide Decision, Confidence (0-1), and Reasoning.""",
+        "hold",
+        0.50,
+    ),
+    (
+        "macro_guard_hold",
+        """Analyze NVDA for trading:
+
+Current Price: $130.00
+RSI (14): 52.0          <- neutral
+MACD: +0.5 (mild positive)
+Volume Ratio: 1.0x avg
+Price vs 200-day MA: +5%
+Price Change (5d): +1%
+Market Context: Federal Reserve interest rate decision announcement in 2 hours.
+
+Discovery Signals: Neutral technical setup on a high-volatility macro event day.
+
+Should we BUY, SELL, or HOLD? Provide Decision, Confidence (0-1), and Reasoning.""",
+        "hold",
+        0.40,
     ),
     (
         "neutral_hold",

@@ -21,6 +21,30 @@ from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 import db as _db
 
+
+def _fetch_spy_return(entry_ts: str, exit_ts: str) -> float | None:
+    """Return SPY price-return (as a fraction) over the hold window.
+
+    Used to populate spy_return_pct on closed outcomes so we can measure alpha.
+    Returns None silently on any fetch failure.
+    """
+    try:
+        import yfinance as yf
+        entry_dt = datetime.fromisoformat(entry_ts).date()
+        exit_dt  = datetime.fromisoformat(exit_ts).date()
+        if entry_dt >= exit_dt:
+            return None
+        spy = yf.download(
+            'SPY', start=str(entry_dt), end=str(exit_dt + __import__('datetime').timedelta(days=1)),
+            auto_adjust=True, progress=False
+        )['Close']
+        if spy.empty or len(spy) < 2:
+            return None
+        return float((spy.iloc[-1] - spy.iloc[0]) / spy.iloc[0])
+    except Exception as e:
+        logging.debug("_fetch_spy_return failed (non-fatal): %s", e)
+        return None
+
 load_dotenv()
 
 logging.basicConfig(
@@ -179,6 +203,7 @@ class OutcomeTracker:
                     exit_dt = datetime.fromisoformat(trade['timestamp'])
                     hold_hours = (exit_dt - entry_dt).total_seconds() / 3600
 
+                    spy_ret = _fetch_spy_return(entry['timestamp'], trade['timestamp'])
                     outcomes.append({
                         'symbol': symbol,
                         'source': 'paper' if self.paper else 'live',
@@ -195,6 +220,9 @@ class OutcomeTracker:
                         'entry_confidence': entry.get('confidence'),
                         'entry_reasoning': entry.get('reasoning', ''),
                         'won': realized_pnl > 0,
+                        'spy_return_pct':   round(spy_ret, 4) if spy_ret is not None else None,
+                        'excess_return_pct': round(pnl_pct - spy_ret, 4) if spy_ret is not None else None,
+                        'regime':           entry.get('regime'),
                     })
 
         return outcomes

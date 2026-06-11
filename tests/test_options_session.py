@@ -36,7 +36,9 @@ logging.disable(logging.CRITICAL)
 dummy_lora = types.ModuleType('model_inference_lora')
 dummy_lora.parse_decision = lambda r: {'decision': 'buy', 'confidence': 0.85, 'reasoning': r[:80]}
 dummy_lora.get_trading_decision = lambda prompt, **kw: 'BUY_CALL. Confidence: 0.85.'
+dummy_lora._generate_base_model = lambda prompt, **kw: 'VERDICT: PROCEED'
 dummy_lora.load_model_once = lambda: None
+dummy_lora._parse_failures_count = 0
 sys.modules['model_inference_lora'] = dummy_lora
 
 dummy_ollama = types.ModuleType('ollama')
@@ -219,6 +221,8 @@ class TestHappyPath(unittest.TestCase):
             mock_db.reserve_cash.return_value = 1
             mock_db.release_cash.return_value = None
             mock_db.insert_trade.return_value = None
+            mock_db.get_iv_rank.return_value = None
+            mock_db.upsert_iv_snapshot.return_value = None
             self.agent.run_options_session()
 
     def test_trade_executed(self):

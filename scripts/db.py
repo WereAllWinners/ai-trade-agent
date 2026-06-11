@@ -179,6 +179,18 @@ CREATE TABLE IF NOT EXISTS unreconciled_orders (
     reason      TEXT,
     UNIQUE(order_id, reason)
 );
+
+-- E3: Historical IV snapshots for IV-rank computation.
+-- One row per (symbol, timestamp); UNIQUE prevents duplicate intraday upserts.
+CREATE TABLE IF NOT EXISTS iv_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol      TEXT NOT NULL,
+    timestamp   TEXT NOT NULL,
+    iv          REAL,
+    hv_20       REAL,
+    iv_rank     REAL,
+    UNIQUE(symbol, timestamp)
+);
 """
 
 
@@ -210,6 +222,29 @@ def _migrate(conn) -> None:
         updated = conn.execute("SELECT COUNT(*) FROM outcomes WHERE bot='options'").fetchone()[0]
         logging.info("db: migrated outcomes — added bot column, tagged %d options rows", updated)
 
+    # A6: order_id on decisions for accurate outcome lookup (avoids same-symbol/same-day ambiguity)
+    dec_cols = {row[1] for row in conn.execute("PRAGMA table_info(decisions)")}
+    if 'order_id' not in dec_cols:
+        conn.execute("ALTER TABLE decisions ADD COLUMN order_id TEXT")
+        logging.info("db: migrated decisions — added order_id column")
+    if 'regime' not in dec_cols:
+        conn.execute("ALTER TABLE decisions ADD COLUMN regime TEXT")
+        logging.info("db: migrated decisions — added regime column")
+
+    # D1: SPY benchmark columns on outcomes for excess-return labeling
+    out_cols = {row[1] for row in conn.execute("PRAGMA table_info(outcomes)")}
+    if 'spy_return_pct' not in out_cols:
+        conn.execute("ALTER TABLE outcomes ADD COLUMN spy_return_pct REAL")
+        logging.info("db: migrated outcomes — added spy_return_pct column")
+    if 'excess_return_pct' not in out_cols:
+        conn.execute("ALTER TABLE outcomes ADD COLUMN excess_return_pct REAL")
+        logging.info("db: migrated outcomes — added excess_return_pct column")
+
+    # D2: regime tag on outcomes for per-regime performance breakdowns
+    if 'regime' not in out_cols:
+        conn.execute("ALTER TABLE outcomes ADD COLUMN regime TEXT")
+        logging.info("db: migrated outcomes — added regime column")
+
 
 def init_db(db_path: Path = DB_PATH) -> None:
     """Create tables and indexes if they don't exist yet, then run migrations."""
@@ -229,10 +264,12 @@ def insert_decision(rec: dict, source: str = 'paper', db_path: Path = DB_PATH) -
     sql = """
         INSERT OR IGNORE INTO decisions
             (timestamp, session_id, bot, source, model, symbol, prompt, raw_response,
-             decision, confidence, reasoning, executed, indicators, market_context, debate)
+             decision, confidence, reasoning, executed, indicators, market_context, debate,
+             order_id, regime)
         VALUES
             (:timestamp, :session_id, :bot, :source, :model, :symbol, :prompt, :raw_response,
-             :decision, :confidence, :reasoning, :executed, :indicators, :market_context, :debate)
+             :decision, :confidence, :reasoning, :executed, :indicators, :market_context, :debate,
+             :order_id, :regime)
     """
     row = {
         'timestamp':      rec.get('timestamp'),
@@ -250,6 +287,8 @@ def insert_decision(rec: dict, source: str = 'paper', db_path: Path = DB_PATH) -
         'indicators':     json.dumps(rec['indicators'], default=_json_default) if rec.get('indicators') else None,
         'market_context': json.dumps(rec['market_context'], default=_json_default) if rec.get('market_context') else None,
         'debate':         json.dumps(rec['debate'], default=_json_default) if rec.get('debate') else None,
+        'order_id':       rec.get('order_id'),
+        'regime':         rec.get('regime'),
     }
     with get_conn(db_path) as conn:
         conn.execute(sql, row)
@@ -291,14 +330,35 @@ def insert_outcome(rec: dict, bot: str = 'stock', source: str = 'paper',
         INSERT OR IGNORE INTO outcomes
             (symbol, bot, source, buy_order_id, sell_order_id, entry_timestamp, exit_timestamp,
              entry_price, exit_price, shares, realized_pnl, pnl_pct, hold_hours,
-             entry_confidence, entry_reasoning, won)
+             entry_confidence, entry_reasoning, won,
+             spy_return_pct, excess_return_pct, regime)
         VALUES
             (:symbol, :bot, :source, :buy_order_id, :sell_order_id, :entry_timestamp, :exit_timestamp,
              :entry_price, :exit_price, :shares, :realized_pnl, :pnl_pct, :hold_hours,
-             :entry_confidence, :entry_reasoning, :won)
+             :entry_confidence, :entry_reasoning, :won,
+             :spy_return_pct, :excess_return_pct, :regime)
     """
-    row = {**rec, 'won': 1 if rec.get('won') else 0,
-           'bot': rec.get('bot', bot), 'source': rec.get('source', source)}
+    row = {
+        'symbol':            rec.get('symbol'),
+        'bot':               rec.get('bot', bot),
+        'source':            rec.get('source', source),
+        'buy_order_id':      rec.get('buy_order_id'),
+        'sell_order_id':     rec.get('sell_order_id'),
+        'entry_timestamp':   rec.get('entry_timestamp'),
+        'exit_timestamp':    rec.get('exit_timestamp'),
+        'entry_price':       rec.get('entry_price'),
+        'exit_price':        rec.get('exit_price'),
+        'shares':            rec.get('shares'),
+        'realized_pnl':      rec.get('realized_pnl'),
+        'pnl_pct':           rec.get('pnl_pct'),
+        'hold_hours':        rec.get('hold_hours'),
+        'entry_confidence':  rec.get('entry_confidence'),
+        'entry_reasoning':   rec.get('entry_reasoning'),
+        'won':               1 if rec.get('won') else 0,
+        'spy_return_pct':    rec.get('spy_return_pct'),
+        'excess_return_pct': rec.get('excess_return_pct'),
+        'regime':            rec.get('regime'),
+    }
     with get_conn(db_path) as conn:
         conn.execute(sql, row)
 
@@ -369,6 +429,66 @@ def get_outcome_by_entry(symbol: str, entry_date: str,
     with get_conn(db_path) as conn:
         row = conn.execute(sql, [symbol, f"{entry_date}%"]).fetchone()
     return dict(row) if row else None
+
+
+def get_outcome_by_order_id(order_id: str, db_path: Path = DB_PATH) -> dict | None:
+    """Look up a closed-trade outcome by exact Alpaca buy_order_id.
+
+    Preferred over get_outcome_by_entry when the order ID is available — avoids
+    mislabeling when the same symbol trades more than once on the same day.
+    """
+    sql = "SELECT * FROM outcomes WHERE buy_order_id = ?"
+    with get_conn(db_path) as conn:
+        row = conn.execute(sql, [order_id]).fetchone()
+    return dict(row) if row else None
+
+
+def get_calibration_map(bot: str, lookback_days: int = 90,
+                        db_path: Path = DB_PATH) -> dict:
+    """Return realized win-rate per confidence bin for *bot* over the last *lookback_days*.
+
+    Bins match the four ranges used in weekly_report.py::calculate_confidence_calibration.
+    Returns {} gracefully when no data exists (early in training).
+    Requires a minimum of 10 outcomes per bin; bins below the minimum are omitted.
+    """
+    from datetime import timedelta
+    cutoff = (datetime.now() - timedelta(days=lookback_days)).isoformat()
+    sql = """
+        SELECT entry_confidence, won
+        FROM outcomes
+        WHERE bot = ? AND exit_timestamp >= ? AND entry_confidence IS NOT NULL
+    """
+    with get_conn(db_path) as conn:
+        rows = conn.execute(sql, [bot, cutoff]).fetchall()
+
+    if not rows:
+        return {}
+
+    bins: dict[str, list] = {
+        '0.60-0.70': [],
+        '0.70-0.80': [],
+        '0.80-0.90': [],
+        '0.90-1.00': [],
+    }
+    for row in rows:
+        conf = row['entry_confidence']
+        won  = row['won']
+        if conf < 0.60:
+            continue
+        elif conf < 0.70:
+            bins['0.60-0.70'].append(won)
+        elif conf < 0.80:
+            bins['0.70-0.80'].append(won)
+        elif conf < 0.90:
+            bins['0.80-0.90'].append(won)
+        else:
+            bins['0.90-1.00'].append(won)
+
+    result = {}
+    for bin_label, outcomes in bins.items():
+        if len(outcomes) >= 10:
+            result[bin_label] = {'count': len(outcomes), 'win_rate': sum(outcomes) / len(outcomes)}
+    return result
 
 
 def get_training_examples(bot: str = None, label: str = None,
@@ -515,6 +635,14 @@ def get_existing_prompt_hashes(db_path: Path = DB_PATH) -> set[str]:
     return {r['prompt_hash'] for r in rows}
 
 
+def get_all_outcomes(bot: str = 'stock', db_path: Path = DB_PATH) -> list[dict]:
+    """Return all outcome rows for the given bot, ordered by entry_timestamp."""
+    sql = "SELECT * FROM outcomes WHERE bot = ? ORDER BY entry_timestamp"
+    with get_conn(db_path) as conn:
+        rows = conn.execute(sql, [bot]).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # Daily circuit-breaker state
 # ---------------------------------------------------------------------------
@@ -555,6 +683,57 @@ def insert_unreconciled_order(rec: dict, bot: str, db_path: Path = DB_PATH) -> N
                VALUES (:recorded_at, :bot, :order_id, :symbol, :status, :reason)""",
             {**rec, 'bot': bot},
         )
+
+
+# ---------------------------------------------------------------------------
+# IV history helpers (E3 — Options IV enrichment)
+# ---------------------------------------------------------------------------
+
+_IV_RANK_MIN_ROWS = 30  # minimum historical rows to trust iv_rank
+
+
+def upsert_iv_snapshot(
+    symbol: str,
+    iv: float | None,
+    hv_20: float | None = None,
+    timestamp: str | None = None,
+    db_path: Path = DB_PATH,
+) -> None:
+    """Insert (or ignore duplicate) an IV snapshot for *symbol*."""
+    ts = timestamp or datetime.now().isoformat()
+    with get_conn(db_path) as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO iv_history (symbol, timestamp, iv, hv_20)
+               VALUES (:symbol, :timestamp, :iv, :hv_20)""",
+            {'symbol': symbol, 'timestamp': ts, 'iv': iv, 'hv_20': hv_20},
+        )
+
+
+def get_iv_rank(
+    symbol: str,
+    current_iv: float,
+    db_path: Path = DB_PATH,
+) -> float | None:
+    """Return the percentile rank of *current_iv* vs stored iv_history for *symbol*.
+
+    Returns None when fewer than _IV_RANK_MIN_ROWS snapshots exist (not enough
+    history to produce a reliable rank).
+
+    Example: 0.75 means current_iv exceeds 75% of historical readings.
+    """
+    with get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT iv FROM iv_history WHERE symbol = ? AND iv IS NOT NULL",
+            (symbol,),
+        ).fetchall()
+
+    if len(rows) < _IV_RANK_MIN_ROWS:
+        return None
+
+    ivs = sorted(float(r['iv']) for r in rows)
+    n   = len(ivs)
+    below = sum(1 for v in ivs if v < current_iv)
+    return round(below / n, 4)
 
 
 if __name__ == '__main__':

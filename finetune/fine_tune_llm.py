@@ -23,6 +23,80 @@ from datasets import Dataset
 from trl import SFTTrainer, DPOTrainer
 from transformers import TrainingArguments
 
+_FINETUNE_DIR   = Path(__file__).resolve().parent
+_DPO_PAIRS_PATH = _FINETUNE_DIR / 'data' / 'dpo_pairs.jsonl'
+
+
+class DPOStageTrainer:
+    """DPO training stage using properly-formed preference pairs from build_dpo_dataset.py.
+
+    Replaces the broken inline DPO stage that passed raw SFT data (no chosen/rejected
+    split) directly to DPOTrainer. Reads finetune/data/dpo_pairs.jsonl which has the
+    {prompt, chosen, rejected, ...} schema produced by build_dpo_dataset.py.
+    Skips silently if the file is missing or has fewer than MIN_DPO_PAIRS rows.
+    """
+    MIN_DPO_PAIRS = 8
+
+    def __init__(self, model, tokenizer, pairs_path: Path,
+                 output_dir: str, batch_size: int = 1):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.pairs_path = pairs_path
+        self.output_dir = output_dir
+        self.batch_size = batch_size
+
+    def train(self) -> bool:
+        """Run DPO stage. Returns True if training ran, False if skipped."""
+        if not self.pairs_path.exists():
+            print(f"⚠️  DPO pairs not found at {self.pairs_path} — skipping DPO stage")
+            return False
+
+        pairs = []
+        with open(self.pairs_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        pairs.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+
+        if len(pairs) < self.MIN_DPO_PAIRS:
+            print(f"⚠️  Only {len(pairs)} DPO pairs (need ≥ {self.MIN_DPO_PAIRS}) — skipping DPO stage")
+            return False
+
+        print(f"\n🔄 Starting DPO Stage with {len(pairs)} preference pairs...")
+        dpo_dataset = Dataset.from_list([
+            {'prompt': p['prompt'], 'chosen': p['chosen'], 'rejected': p['rejected']}
+            for p in pairs
+        ])
+
+        dpo_args = TrainingArguments(
+            output_dir=f"{self.output_dir}_dpo",
+            per_device_train_batch_size=max(1, self.batch_size // 2),
+            gradient_accumulation_steps=8,
+            num_train_epochs=1,
+            learning_rate=5e-5,
+            fp16=not torch.cuda.is_bf16_supported(),
+            bf16=torch.cuda.is_bf16_supported(),
+            logging_steps=10,
+            optim="adamw_8bit",
+            save_strategy="no",
+            report_to="none",
+        )
+
+        dpo_trainer = DPOTrainer(
+            model=self.model,
+            args=dpo_args,
+            train_dataset=dpo_dataset,
+            tokenizer=self.tokenizer,
+            beta=0.1,
+        )
+        dpo_trainer.train()
+        print(f"✅ DPO Stage complete")
+        return True
+
+
 class AdvancedModelTrainer:
     def __init__(
         self,
@@ -138,90 +212,80 @@ You are an expert financial trading advisor with knowledge from the world's best
         return model, tokenizer
 
     def train(self, data_paths, num_epochs=3, batch_size=2,
-              learning_rate=2e-4, checkpoint_path=None, do_dpo=True):
+              learning_rate=2e-4, checkpoint_path=None, do_dpo=True, dpo_only=False):
+        """
+        Run SFT (and optionally DPO) fine-tuning.
 
+        dpo_only=True: skip SFT entirely; load model and run only the DPO stage
+        using finetune/data/dpo_pairs.jsonl. Requires --continue-from pointing
+        at an existing adapter so the model is not randomly initialised.
+        """
         print(f"\n{'='*70}")
         print("🎓 STARTING FINE-TUNING")
         print(f"{'='*70}")
-        print(f"Mode:          {self.mode.upper()}")
-        print(f"Epochs (SFT):  {num_epochs}")
-        print(f"Batch size:    {batch_size} x 4 grad accum = {batch_size*4} effective")
-        print(f"Learning rate: {learning_rate}")
+        print(f"Mode:          {'DPO-ONLY' if dpo_only else self.mode.upper()}")
+        if not dpo_only:
+            print(f"Epochs (SFT):  {num_epochs}")
+            print(f"Batch size:    {batch_size} x 4 grad accum = {batch_size*4} effective")
+            print(f"Learning rate: {learning_rate}")
         if checkpoint_path:
             print(f"Resuming from: {checkpoint_path}")
         print(f"{'='*70}\n")
 
         model, tokenizer = self.load_model()
-        dataset = self.load_training_data(data_paths)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = f"{self.output_dir}_{timestamp}"
         print(f"\n💾 Output directory: {output_dir}")
 
-        # === SFT Stage ===
-        training_args = TrainingArguments(
-            output_dir=output_dir,
-            per_device_train_batch_size=batch_size,
-            gradient_accumulation_steps=4,
-            warmup_steps=20,
-            num_train_epochs=num_epochs,
-            learning_rate=learning_rate,
-            fp16=not torch.cuda.is_bf16_supported(),
-            bf16=torch.cuda.is_bf16_supported(),
-            logging_steps=5,
-            optim="adamw_8bit",
-            weight_decay=0.01,
-            lr_scheduler_type="cosine",
-            seed=3407,
-            save_strategy="steps",
-            save_steps=500,
-            save_total_limit=5,
-            report_to="none",
-        )
+        dataset_size = 0
 
-        trainer = SFTTrainer(
-            model=model,
-            tokenizer=tokenizer,
-            train_dataset=dataset,
-            dataset_text_field="text",
-            max_seq_length=self.max_seq_length,
-            args=training_args,
-        )
+        if not dpo_only:
+            # === SFT Stage ===
+            dataset = self.load_training_data(data_paths)
+            dataset_size = len(dataset)
 
-        if torch.cuda.is_available():
-            print(f"\n🖥️  GPU: {torch.cuda.get_device_name(0)}")
-            print(f"💾 VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-
-        print(f"\n🚀 Starting SFT Stage...")
-        trainer.train(resume_from_checkpoint=checkpoint_path)
-
-        # === DPO Stage (if enabled and reward data exists) ===
-        if do_dpo and any(ex.get("reward") is not None for ex in dataset):
-            print(f"\n🔄 Starting DPO Stage using reward signals...")
-            # Simple DPO setup - create preference pairs (higher reward = preferred)
-            # For production, you can expand this with more sophisticated pairing
-            dpo_args = TrainingArguments(
-                output_dir=f"{output_dir}_dpo",
-                per_device_train_batch_size=batch_size // 2,
-                gradient_accumulation_steps=8,
-                num_train_epochs=1,
-                learning_rate=5e-5,   # Lower LR for DPO
+            training_args = TrainingArguments(
+                output_dir=output_dir,
+                per_device_train_batch_size=batch_size,
+                gradient_accumulation_steps=4,
+                warmup_steps=20,
+                num_train_epochs=num_epochs,
+                learning_rate=learning_rate,
                 fp16=not torch.cuda.is_bf16_supported(),
                 bf16=torch.cuda.is_bf16_supported(),
-                logging_steps=10,
+                logging_steps=5,
                 optim="adamw_8bit",
-                save_strategy="no",
+                weight_decay=0.01,
+                lr_scheduler_type="cosine",
+                seed=3407,
+                save_strategy="steps",
+                save_steps=500,
+                save_total_limit=5,
                 report_to="none",
             )
 
-            dpo_trainer = DPOTrainer(
+            trainer = SFTTrainer(
                 model=model,
-                args=dpo_args,
-                train_dataset=dataset,   # Will need proper chosen/rejected pairs in production
                 tokenizer=tokenizer,
-                beta=0.1,                # DPO beta parameter
+                train_dataset=dataset,
+                dataset_text_field="text",
+                max_seq_length=self.max_seq_length,
+                args=training_args,
             )
-            dpo_trainer.train()
+
+            if torch.cuda.is_available():
+                print(f"\n🖥️  GPU: {torch.cuda.get_device_name(0)}")
+                print(f"💾 VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+            print(f"\n🚀 Starting SFT Stage...")
+            trainer.train(resume_from_checkpoint=checkpoint_path)
+
+        # === DPO Stage ===
+        dpo_ran = False
+        if do_dpo or dpo_only:
+            dpo_stage = DPOStageTrainer(model, tokenizer, _DPO_PAIRS_PATH, output_dir, batch_size)
+            dpo_ran = dpo_stage.train()
 
         print(f"\n💾 Saving final model to {output_dir}...")
         model.save_pretrained(output_dir)
@@ -241,13 +305,14 @@ You are an expert financial trading advisor with knowledge from the world's best
             merged_dir = None
 
         metadata = {
-            'mode': self.mode,
+            'mode': 'dpo_only' if dpo_only else self.mode,
             'base_model': self.base_model,
             'data_paths': data_paths if isinstance(data_paths, list) else [data_paths],
-            'num_epochs': num_epochs,
-            'dataset_size': len(dataset),
+            'num_epochs': num_epochs if not dpo_only else 0,
+            'dataset_size': dataset_size,
             'checkpoint_resumed': checkpoint_path,
-            'dpo_applied': do_dpo,
+            'dpo_applied': dpo_ran,
+            'dpo_only': dpo_only,
             'timestamp': timestamp,
             'output_dir': output_dir,
             'merged_dir': merged_dir,
@@ -270,8 +335,8 @@ You are an expert financial trading advisor with knowledge from the world's best
 def main():
     parser = argparse.ArgumentParser(description='Fine-tune trading LLM with SFT + DPO')
 
-    parser.add_argument('--data', type=str, nargs='+', required=True,
-                        help='Path(s) to training data JSON file(s)')
+    parser.add_argument('--data', type=str, nargs='+', default=None,
+                        help='Path(s) to training data JSON file(s) (required unless --dpo-only)')
 
     parser.add_argument('--continue-from', type=str, default=None,
                         help='Path to existing LoRA adapter to continue training from')
@@ -284,8 +349,14 @@ def main():
     parser.add_argument('--learning-rate', type=float, default=2e-4)
     parser.add_argument('--no-dpo', action='store_true',
                         help='Skip DPO stage even if reward data is available')
+    parser.add_argument('--dpo-only', action='store_true',
+                        help='Skip SFT; run only the DPO stage using finetune/data/dpo_pairs.jsonl '
+                             '(requires --continue-from pointing at an existing adapter)')
 
     args = parser.parse_args()
+
+    if not args.dpo_only and not args.data:
+        parser.error('--data is required unless --dpo-only is set')
 
     adapter_source = args.checkpoint or args.continue_from
 
@@ -310,7 +381,8 @@ def main():
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         checkpoint_path=args.checkpoint,
-        do_dpo=not args.no_dpo
+        do_dpo=not args.no_dpo,
+        dpo_only=args.dpo_only,
     )
 
     print(f"\n✅ All done! Model ready at: {output_dir}")

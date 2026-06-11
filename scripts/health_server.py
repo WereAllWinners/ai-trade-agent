@@ -277,6 +277,21 @@ def build_prometheus_metrics() -> str:
         lines.append('# TYPE aitrade_portfolio_vetoes_total counter')
         lines.append(f'aitrade_portfolio_vetoes_total {len(constraints)} {now_ms}')
 
+    # ------------------------------------------------------------------
+    # Broker-side risk reconciliation (C3 — options positions without a SELL)
+    # -1 = API unavailable (unknown), 0 = all protected, N = N unprotected
+    # ------------------------------------------------------------------
+    reconcile = _read_json_file(_LOGS_DIR / 'reconcile_status.json', {})
+    if reconcile:
+        gauge(
+            'aitrade_unprotected_positions',
+            int(reconcile.get('unprotected_positions', -1)),
+            help_text=(
+                'Number of options positions without any open SELL order '
+                '(GTC stop or limit). -1 = status unknown (API error).'
+            ),
+        )
+
     return '\n'.join(lines) + '\n'
 
 

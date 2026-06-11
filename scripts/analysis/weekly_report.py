@@ -25,6 +25,11 @@ from collections import defaultdict
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 
+# ---------------------------------------------------------------------------
+# SPY benchmark cache (per-process, keyed by date range string)
+# ---------------------------------------------------------------------------
+_SPY_CACHE: dict[str, float | None] = {}
+
 load_dotenv()
 
 logging.basicConfig(
@@ -276,6 +281,66 @@ class WeeklyReporter:
         )
 
     # ------------------------------------------------------------------
+    # SPY benchmark (D3) + regime breakdown (D3)
+    # ------------------------------------------------------------------
+
+    def spy_benchmark_return(self, start_date: datetime, end_date: datetime) -> float | None:
+        """Total SPY return over [start_date, end_date].  Cached per process."""
+        key = f"{start_date.date()}/{end_date.date()}"
+        if key in _SPY_CACHE:
+            return _SPY_CACHE[key]
+        try:
+            import yfinance as yf
+            hist = yf.Ticker('SPY').history(
+                start=start_date.strftime('%Y-%m-%d'),
+                end=(end_date + timedelta(days=1)).strftime('%Y-%m-%d'),
+            )
+            if hist.empty or len(hist) < 2:
+                _SPY_CACHE[key] = None
+                return None
+            hist.columns = [c.lower() for c in hist.columns]
+            first = float(hist['close'].iloc[0])
+            last  = float(hist['close'].iloc[-1])
+            result = (last - first) / first if first > 0 else None
+        except Exception as e:
+            logging.warning("SPY benchmark fetch failed: %s", e)
+            result = None
+        _SPY_CACHE[key] = result
+        return result
+
+    def calculate_regime_breakdown(self, outcomes: list[dict]) -> dict:
+        """Group closed-trade outcomes by regime and compute per-regime stats.
+
+        Outcomes that have no 'regime' key (or NULL) are binned under 'unknown'.
+        Returns a dict keyed by regime string; each value has:
+          trade_count, win_rate, avg_excess_return_pct
+        where avg_excess_return_pct uses outcome['excess_return_pct'] when
+        available (populated by PR-1 outcome tracking), else 0.
+        """
+        by_regime: dict[str, list[dict]] = defaultdict(list)
+        for o in outcomes:
+            regime = o.get('regime') or 'unknown'
+            by_regime[regime].append(o)
+
+        result = {}
+        for regime, trades in sorted(by_regime.items()):
+            n   = len(trades)
+            wins = sum(1 for t in trades if t.get('won'))
+            excess_returns = [
+                float(t['excess_return_pct'])
+                for t in trades
+                if t.get('excess_return_pct') is not None
+            ]
+            result[regime] = {
+                'trade_count':          n,
+                'win_rate':             round(wins / n, 4),
+                'avg_excess_return_pct': round(
+                    sum(excess_returns) / len(excess_returns), 4
+                ) if excess_returns else None,
+            }
+        return result
+
+    # ------------------------------------------------------------------
     # Go-live gate evaluation
     # ------------------------------------------------------------------
 
@@ -329,15 +394,35 @@ class WeeklyReporter:
         label = f"last {days_back} days" if days_back else "all time"
         logging.info("Generating performance report (%s)...", label)
 
-        outcomes = self.load_outcomes(days_back=days_back)
+        outcomes     = self.load_outcomes(days_back=days_back)
         equity_curve = self.get_equity_curve(days_back=days_back or 365)
 
-        trade_metrics = self.calculate_trade_metrics(outcomes)
-        sharpe = self.calculate_sharpe(equity_curve)
-        max_drawdown = self.calculate_max_drawdown(equity_curve)
-        calibration = self.calculate_confidence_calibration(outcomes)
-        symbol_perf = self.calculate_symbol_performance(outcomes)
-        gates = self.evaluate_go_live_gates(trade_metrics, sharpe, max_drawdown, calibration)
+        trade_metrics  = self.calculate_trade_metrics(outcomes)
+        sharpe         = self.calculate_sharpe(equity_curve)
+        max_drawdown   = self.calculate_max_drawdown(equity_curve)
+        calibration    = self.calculate_confidence_calibration(outcomes)
+        symbol_perf    = self.calculate_symbol_performance(outcomes)
+        regime_bkdown  = self.calculate_regime_breakdown(outcomes)
+        gates          = self.evaluate_go_live_gates(trade_metrics, sharpe, max_drawdown, calibration)
+
+        # SPY benchmark: compare strategy return to SPY over the same window
+        spy_return = None
+        if equity_curve:
+            start_ts = datetime.fromtimestamp(equity_curve[0][0])
+            end_ts   = datetime.fromtimestamp(equity_curve[-1][0])
+            spy_return = self.spy_benchmark_return(start_ts, end_ts)
+
+        strat_return = None
+        if equity_curve:
+            eq_vals = [eq for _, eq in equity_curve if eq and eq > 0]
+            if len(eq_vals) >= 2:
+                strat_return = round((eq_vals[-1] - eq_vals[0]) / eq_vals[0], 4)
+
+        excess_return = (
+            round(strat_return - spy_return, 4)
+            if strat_return is not None and spy_return is not None
+            else None
+        )
 
         account_equity = None
         try:
@@ -354,10 +439,14 @@ class WeeklyReporter:
                 'sharpe_ratio': sharpe,
                 'max_drawdown': max_drawdown,
                 'equity_curve_points': len(equity_curve),
+                'strategy_return':  strat_return,
+                'spy_return':       spy_return,
+                'excess_return':    excess_return,
             },
             'trades': trade_metrics,
             'confidence_calibration': calibration,
             'symbol_performance': symbol_perf,
+            'regime_breakdown': regime_bkdown,
             'go_live_gates': gates,
         }
 
@@ -397,6 +486,17 @@ class WeeklyReporter:
         dd = p.get('max_drawdown')
         print(f"  Sharpe Ratio : {sharpe if sharpe is not None else 'N/A (need more data)'}")
         print(f"  Max Drawdown : {dd:.1%}" if dd is not None else "  Max Drawdown : N/A")
+
+        # D3: SPY benchmark comparison
+        strat_ret = p.get('strategy_return')
+        spy_ret   = p.get('spy_return')
+        exc_ret   = p.get('excess_return')
+        if strat_ret is not None:
+            spy_str = f"{spy_ret:+.1%}" if spy_ret is not None else "N/A"
+            exc_str = f"{exc_ret:+.1%}" if exc_ret is not None else "N/A"
+            print(f"  Strategy Ret : {strat_ret:+.1%}")
+            print(f"  SPY Return   : {spy_str}  (same period)")
+            print(f"  Excess Alpha : {exc_str}")
 
         if t:
             print("\n── TRADE OUTCOMES ──")
@@ -446,6 +546,16 @@ class WeeklyReporter:
                       f"{pnl_str:>10}  ({stats['trades']} trades)")
         else:
             print("  No data yet.")
+
+        # D3: Regime breakdown
+        regime_bkdown = report.get('regime_breakdown', {})
+        if regime_bkdown:
+            print("\n── REGIME BREAKDOWN ──")
+            for regime, stats in sorted(regime_bkdown.items()):
+                exc = stats.get('avg_excess_return_pct')
+                exc_str = f"{exc:+.2%}" if exc is not None else "  N/A"
+                print(f"  {regime:20s}  n={stats['trade_count']:3d}  "
+                      f"WR={stats['win_rate']:.0%}  excess={exc_str}")
 
         print("\n── GO-LIVE READINESS ──")
         gate_rows = [(k, v) for k, v in gates.items() if not k.startswith('_')]

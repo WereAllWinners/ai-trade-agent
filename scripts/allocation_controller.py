@@ -44,6 +44,7 @@ import json
 import logging
 import math
 import os
+import random
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -66,6 +67,70 @@ TIER3_PCT: float = float(os.getenv('ALLOC_TIER3_PCT', '0.05'))
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _ALLOC_CONFIG  = _PROJECT_ROOT / 'logs' / 'allocation_config.json'
 _RISK_FREE_RATE = 0.05  # annualised, used for Sharpe calculation
+
+_BOOTSTRAP_N_RESAMPLES = int(os.getenv('ALLOC_BOOT_N', '10000'))
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap helpers (pure — no I/O, no deps beyond stdlib)
+# ---------------------------------------------------------------------------
+
+def _bootstrap_expectancy(
+    pnl_pcts: list[float],
+    n_boot: int = _BOOTSTRAP_N_RESAMPLES,
+    seed: int = 42,
+) -> tuple[float, float]:
+    """Return (mean, p5) of bootstrapped per-trade expectancy.
+
+    Uses stdlib random to avoid a numpy dependency.  For small samples
+    (< 10 trades) both values are the sample mean so callers see the same
+    number in both positions — bootstrap is unreliable on tiny samples anyway.
+    """
+    if len(pnl_pcts) < 10:
+        mean = sum(pnl_pcts) / len(pnl_pcts) if pnl_pcts else 0.0
+        return mean, mean
+
+    rng = random.Random(seed)
+    n   = len(pnl_pcts)
+    boot_means: list[float] = []
+    for _ in range(n_boot):
+        sample = [pnl_pcts[rng.randrange(n)] for _ in range(n)]
+        boot_means.append(sum(sample) / n)
+
+    boot_means.sort()
+    p5_idx = int(0.05 * n_boot)
+    return sum(boot_means) / n_boot, boot_means[p5_idx]
+
+
+def _bootstrap_sharpe(
+    pnl_pcts: list[float],
+    trades_per_year: float,
+    rf_per_trade: float,
+    n_boot: int = _BOOTSTRAP_N_RESAMPLES,
+    seed: int = 42,
+) -> tuple[float, float]:
+    """Return (median, p5) of bootstrapped annualised Sharpe.
+
+    Returns (0.0, 0.0) when fewer than 10 samples are available.
+    """
+    if len(pnl_pcts) < 10:
+        return 0.0, 0.0
+
+    rng = random.Random(seed)
+    n   = len(pnl_pcts)
+    boot_sharpes: list[float] = []
+    for _ in range(n_boot):
+        sample = [pnl_pcts[rng.randrange(n)] for _ in range(n)]
+        mean_s = sum(sample) / n
+        var_s  = sum((p - mean_s) ** 2 for p in sample) / max(n - 1, 1)
+        std_s  = math.sqrt(var_s) if var_s > 0 else 1e-9
+        sharpe = (mean_s - rf_per_trade) / std_s * math.sqrt(trades_per_year)
+        boot_sharpes.append(sharpe)
+
+    boot_sharpes.sort()
+    median_idx = n_boot // 2
+    p5_idx     = int(0.05 * n_boot)
+    return boot_sharpes[median_idx], boot_sharpes[p5_idx]
 
 
 # ---------------------------------------------------------------------------
@@ -210,30 +275,46 @@ class AllocationController:
             dd = (peak - equity) / peak if peak > 0 else 0.0
             max_dd = max(max_dd, dd)
 
+        # Bootstrap confidence intervals (D4)
+        exp_mean, exp_p5 = _bootstrap_expectancy(pnl_pcts)
+        sharpe_median, sharpe_p5 = _bootstrap_sharpe(
+            pnl_pcts, trades_per_year, rf_per_trade
+        )
+
         return {
-            'total_trades': n,
-            'win_rate': round(win_rate, 4),
-            'sharpe': round(sharpe, 4),
-            'max_dd': round(max_dd, 4),
+            'total_trades':      n,
+            'win_rate':          round(win_rate, 4),
+            'sharpe':            round(sharpe, 4),
+            'max_dd':            round(max_dd, 4),
             'annualised_return': round(annualised_return, 4),
+            # Bootstrap estimates
+            'expectancy_mean':   round(exp_mean, 6),
+            'expectancy_p5':     round(exp_p5, 6),
+            'sharpe_median':     round(sharpe_median, 4),
+            'sharpe_p5':         round(sharpe_p5, 4),
         }
 
     def _evaluate_tier(self, m: dict) -> int:
-        n      = m['total_trades']
-        sharpe = m['sharpe']
-        max_dd = m['max_dd']
+        n             = m['total_trades']
+        max_dd        = m['max_dd']
+        exp_p5        = m.get('expectancy_p5', 0.0)
+        sharpe_median = m.get('sharpe_median', 0.0)
 
+        # Tier 3 (proven): ≥50 trades, bootstrap expectancy p5 > 0,
+        #   bootstrap Sharpe median ≥ threshold, max_dd < 5 %
         if (
-            n      >= MIN_TRADES_TIER3
-            and sharpe >= SHARPE_THRESHOLD_TIER3
-            and max_dd  < MAX_DD_THRESHOLD_TIER3
+            n             >= MIN_TRADES_TIER3
+            and exp_p5     >  0.0
+            and sharpe_median >= SHARPE_THRESHOLD_TIER3
+            and max_dd     <  MAX_DD_THRESHOLD_TIER3
         ):
             return 3
 
+        # Tier 2 (promising): ≥20 trades, bootstrap expectancy p5 > 0, max_dd < 8 %
         if (
             n      >= MIN_TRADES_TIER2
-            and sharpe >= SHARPE_THRESHOLD_TIER2
-            and max_dd  < MAX_DD_THRESHOLD_TIER2
+            and exp_p5 >  0.0
+            and max_dd <  MAX_DD_THRESHOLD_TIER2
         ):
             return 2
 
@@ -332,14 +413,15 @@ class AllocationController:
                 'position_size_pct': {1: TIER1_PCT, 2: TIER2_PCT, 3: TIER3_PCT}[self._cached_tier],
                 'gates': {
                     'tier2': {
-                        'min_trades':    MIN_TRADES_TIER2,
-                        'sharpe_min':    SHARPE_THRESHOLD_TIER2,
-                        'max_dd_max':    MAX_DD_THRESHOLD_TIER2,
+                        'min_trades':      MIN_TRADES_TIER2,
+                        'expectancy_p5_gt': 0.0,    # bootstrap p5 must be positive
+                        'max_dd_max':      MAX_DD_THRESHOLD_TIER2,
                     },
                     'tier3': {
-                        'min_trades':    MIN_TRADES_TIER3,
-                        'sharpe_min':    SHARPE_THRESHOLD_TIER3,
-                        'max_dd_max':    MAX_DD_THRESHOLD_TIER3,
+                        'min_trades':          MIN_TRADES_TIER3,
+                        'expectancy_p5_gt':    0.0,
+                        'sharpe_median_min':   SHARPE_THRESHOLD_TIER3,
+                        'max_dd_max':          MAX_DD_THRESHOLD_TIER3,
                     },
                 },
                 'current_metrics': metrics,

@@ -43,6 +43,12 @@ _ENV_FILE      = _PROJECT_ROOT / '.env'
 # 0.0 = must be equal or better; 0.05 = allow up to 5% regression.
 _PROMOTION_TOLERANCE = 0.0
 
+# Replay gate — off by default; enable with ENABLE_REPLAY_GATE=true
+_ENABLE_REPLAY_GATE        = os.getenv('ENABLE_REPLAY_GATE', 'false').lower() == 'true'
+_PROMOTER_SHADOW           = os.getenv('PROMOTER_SHADOW', 'false').lower() == 'true'
+_PROMOTION_EXPECTANCY_TOL  = float(os.getenv('PROMOTION_EXPECTANCY_TOL', '0.0'))
+_REPLAY_MAX_DD_SCALE       = float(os.getenv('REPLAY_MAX_DD_SCALE', '1.25'))
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -75,6 +81,46 @@ def _run_eval(adapter_path: str) -> dict | None:
     )
     if not written:
         logging.error("No eval result file found after run")
+        return None
+
+    return json.loads(written[-1].read_text())
+
+
+def _run_replay_eval(adapter_path: str) -> dict | None:
+    """
+    Run replay_eval.py for adapter_path in a subprocess.
+    Returns the parsed result dict from the saved JSON, or None on failure.
+    """
+    replay_script = _SCRIPTS_DIR / 'training' / 'replay_eval.py'
+    if not replay_script.exists():
+        logging.warning("replay_eval.py not found — skipping replay gate")
+        return None
+
+    log_path = _PROJECT_ROOT / 'logs' / 'decision_log.jsonl'
+    if not log_path.exists():
+        logging.warning("Decision log not found at %s — skipping replay gate", log_path)
+        return None
+
+    before_ts = datetime.now(timezone.utc).timestamp()
+    env = {**os.environ, 'LORA_ADAPTER_PATH': adapter_path}
+
+    logging.info("🔁 Replay eval: %s", Path(adapter_path).name)
+    result = subprocess.run(
+        [sys.executable, str(replay_script), '--log', str(log_path)],
+        timeout=1800,  # 30 min
+        env=env,
+    )
+    if result.returncode not in (0, 1):
+        logging.error("Replay eval exited with code %d", result.returncode)
+        return None
+
+    _EVAL_DIR.mkdir(parents=True, exist_ok=True)
+    written = sorted(
+        [f for f in _EVAL_DIR.glob('replay_eval_*.json') if f.stat().st_mtime >= before_ts],
+        key=lambda f: f.stat().st_mtime,
+    )
+    if not written:
+        logging.error("No replay eval result file found")
         return None
 
     return json.loads(written[-1].read_text())
@@ -141,6 +187,44 @@ def _restart_services() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Promotion record helper
+# ---------------------------------------------------------------------------
+
+def _write_promotion_record(
+    *,
+    promoted: bool,
+    candidate_path: str,
+    current_path: str,
+    candidate_result: dict,
+    current_result: dict,
+    replay_candidate: dict | None = None,
+    replay_current: dict | None = None,
+    replay_verdict: bool | None = None,
+) -> None:
+    record: dict = {
+        'decided_at':    datetime.now().isoformat(),
+        'promoted':      promoted,
+        'candidate':     candidate_path,
+        'current':       current_path,
+        'candidate_scores': {k: candidate_result.get(k)
+                             for k in ('pass_rate', 'directional_acc', 'format_score', 'grade')},
+        'current_scores':   {k: current_result.get(k)
+                             for k in ('pass_rate', 'directional_acc', 'format_score', 'grade')},
+    }
+    if replay_candidate is not None:
+        record['replay_candidate'] = {k: replay_candidate.get(k)
+                                      for k in ('expectancy', 'max_dd', 'trade_count', 'prompt_set_hash')}
+        record['replay_current']   = {k: replay_current.get(k)
+                                      for k in ('expectancy', 'max_dd', 'trade_count', 'prompt_set_hash')}
+        record['replay_verdict']   = replay_verdict
+
+    record_path = _EVAL_DIR / f"promotion_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    _EVAL_DIR.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(json.dumps(record, indent=2))
+    logging.info(f"📋 Promotion record → {record_path.name}")
+
+
+# ---------------------------------------------------------------------------
 # Core promotion logic
 # ---------------------------------------------------------------------------
 
@@ -177,6 +261,7 @@ def promote(candidate_path: str, merged_path: str = None) -> bool:
     logging.info(f"   Current   : {Path(current_path).name}")
     logging.info(f"{'='*60}\n")
 
+    # ── Stage 1: Smoke test ──────────────────────────────────────────────────
     candidate_result = _run_eval(candidate_path)
     current_result   = _run_eval(current_path)
 
@@ -190,14 +275,79 @@ def promote(candidate_path: str, merged_path: str = None) -> bool:
     p_acc   = current_result['directional_acc']
     c_grade = candidate_result['grade']
     p_grade = current_result['grade']
+    c_fmt   = candidate_result.get('format_score', 1.0)
 
     logging.info(f"\n{'Metric':<22} {'Candidate':>10} {'Current':>10} {'Delta':>8}")
     logging.info(f"{'-'*52}")
     logging.info(f"{'pass_rate':<22} {c_pass:>10.1%} {p_pass:>10.1%} {c_pass-p_pass:>+8.1%}")
     logging.info(f"{'directional_acc':<22} {c_acc:>10.1%} {p_acc:>10.1%} {c_acc-p_acc:>+8.1%}")
+    logging.info(f"{'format_score':<22} {c_fmt:>10.1%}")
     logging.info(f"{'grade':<22} {c_grade:>10} {p_grade:>10}")
 
-    promoted = c_pass >= p_pass - _PROMOTION_TOLERANCE
+    # Hard fail: grade F means total output breakdown; format < 0.9 means the model
+    # stopped producing Decision/Confidence/Reasoning reliably.
+    smoke_passed = c_grade != 'F' and c_fmt >= 0.90
+    if not smoke_passed:
+        logging.info(
+            f"\n⏪ REJECTED (smoke test) — grade {c_grade}, format {c_fmt:.0%} < 90%"
+        )
+        _write_promotion_record(
+            promoted=False, candidate_path=candidate_path, current_path=current_path,
+            candidate_result=candidate_result, current_result=current_result,
+        )
+        return False
+
+    # Legacy pass/rate gate (still applies unless overridden by replay gate below)
+    smoke_promoted = c_pass >= p_pass - _PROMOTION_TOLERANCE
+
+    # ── Stage 2: Replay gate (optional, gated behind ENABLE_REPLAY_GATE=true) ──
+    replay_candidate: dict | None = None
+    replay_current:   dict | None = None
+    replay_verdict:   bool | None = None
+
+    if _ENABLE_REPLAY_GATE:
+        logging.info("\n🔁 Running replay gate...")
+        replay_candidate = _run_replay_eval(candidate_path)
+        replay_current   = _run_replay_eval(current_path)
+
+        if replay_candidate is not None and replay_current is not None:
+            c_exp  = replay_candidate['expectancy']
+            p_exp  = replay_current['expectancy']
+            c_mdd  = replay_candidate['max_dd']
+            p_mdd  = replay_current['max_dd']
+            c_cnt  = replay_candidate['trade_count']
+            p_cnt  = replay_current['trade_count']
+
+            logging.info(
+                f"\n{'Replay Metric':<22} {'Candidate':>10} {'Current':>10} {'Delta':>8}"
+            )
+            logging.info(f"{'-'*52}")
+            logging.info(f"{'expectancy':<22} {c_exp:>+10.2%} {p_exp:>+10.2%} {c_exp-p_exp:>+8.2%}")
+            logging.info(f"{'max_dd':<22} {c_mdd:>10.1%} {p_mdd:>10.1%}")
+            logging.info(f"{'trade_count':<22} {c_cnt:>10} {p_cnt:>10}")
+
+            if (c_cnt < 5 and p_cnt >= 5) or (p_cnt < 5 and c_cnt >= 5):
+                replay_verdict = False
+                logging.info("   Replay: insufficient trades for fair comparison")
+            else:
+                expectancy_ok = c_exp >= p_exp - _PROMOTION_EXPECTANCY_TOL
+                max_dd_ok     = c_mdd <= p_mdd * _REPLAY_MAX_DD_SCALE
+                replay_verdict = expectancy_ok and max_dd_ok
+
+            if _PROMOTER_SHADOW:
+                logging.info(
+                    "   [SHADOW] Replay verdict: %s (smoke-test decision applies)",
+                    'PROMOTE' if replay_verdict else 'REJECT',
+                )
+            else:
+                smoke_promoted = replay_verdict
+                logging.info(
+                    "   Replay verdict: %s", 'PROMOTE' if smoke_promoted else 'REJECT'
+                )
+        else:
+            logging.warning("Replay eval unavailable — falling back to smoke-test decision")
+
+    promoted = smoke_promoted
 
     if promoted:
         logging.info(
@@ -216,21 +366,83 @@ def promote(candidate_path: str, merged_path: str = None) -> bool:
         )
         logging.info(f"   Keeping: {Path(current_path).name}")
 
-    # Write promotion record to logs
-    record = {
-        'decided_at':    datetime.now().isoformat(),
-        'promoted':      promoted,
-        'candidate':     candidate_path,
-        'current':       current_path,
-        'candidate_scores': {k: candidate_result.get(k) for k in ('pass_rate', 'directional_acc', 'grade')},
-        'current_scores':   {k: current_result.get(k)   for k in ('pass_rate', 'directional_acc', 'grade')},
-    }
-    record_path = _EVAL_DIR / f"promotion_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    _EVAL_DIR.mkdir(parents=True, exist_ok=True)
-    record_path.write_text(json.dumps(record, indent=2))
-    logging.info(f"📋 Promotion record → {record_path.name}")
-
+    _write_promotion_record(
+        promoted=promoted, candidate_path=candidate_path, current_path=current_path,
+        candidate_result=candidate_result, current_result=current_result,
+        replay_candidate=replay_candidate, replay_current=replay_current,
+        replay_verdict=replay_verdict,
+    )
     return promoted
+
+
+# ---------------------------------------------------------------------------
+# Rollback
+# ---------------------------------------------------------------------------
+
+def rollback(n: int = 2) -> bool:
+    """
+    Restore the production symlink to the previously promoted adapter.
+
+    Reads promotion records in reverse-chronological order, finds the most
+    recently promoted adapter that is NOT the current production one, and
+    re-points the finance_qwen_32b_lora_latest symlink + .env.
+
+    n controls how many promotion records to scan (default 2 means look back
+    through up to 4 records to find 2 distinct promoted paths).
+    """
+    _EVAL_DIR.mkdir(parents=True, exist_ok=True)
+    record_files = sorted(
+        _EVAL_DIR.glob('promotion_*.json'),
+        key=lambda f: f.stat().st_mtime,
+        reverse=True,
+    )
+
+    # Collect promoted adapter paths in reverse-chronological order
+    promoted_adapters: list[str] = []
+    for f in record_files:
+        try:
+            data = json.loads(f.read_text())
+            if data.get('promoted') and data.get('candidate'):
+                promoted_adapters.append(data['candidate'])
+        except Exception:
+            continue
+        if len(promoted_adapters) >= n * 2:
+            break
+
+    current = _current_production_adapter()
+    logging.info(f"Current production adapter: {Path(current).name if current else 'none'}")
+
+    # Find the most recent promoted adapter that differs from current
+    target: str | None = None
+    for path in promoted_adapters:
+        if path != current:
+            target = path
+            break
+
+    if target is None:
+        logging.error("❌ No previous promoted adapter found (need at least 2 successful promotions)")
+        return False
+
+    if not Path(target).exists():
+        logging.error(f"❌ Previous adapter directory no longer exists: {target}")
+        return False
+
+    logging.info(f"⏪ Rolling back to: {Path(target).name}")
+    _update_latest_symlink(target)
+    _update_env(target)
+    _restart_services()
+
+    record = {
+        'decided_at': datetime.now().isoformat(),
+        'action':     'rollback',
+        'promoted':   True,
+        'candidate':  target,
+        'current':    current,
+    }
+    record_path = _EVAL_DIR / f"rollback_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    record_path.write_text(json.dumps(record, indent=2))
+    logging.info(f"📋 Rollback record → {record_path.name}")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -239,11 +451,22 @@ def promote(candidate_path: str, merged_path: str = None) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(description='Evaluate and promote a fine-tuned LoRA adapter')
-    parser.add_argument('--candidate', type=str, required=True,
+    parser.add_argument('--candidate', type=str, default=None,
                         help='Path to the candidate (newly fine-tuned) adapter directory')
     parser.add_argument('--merged-model', type=str, default=None,
                         help='Path to the BF16-merged model directory for vLLM serving (optional)')
+    parser.add_argument('--rollback', type=int, nargs='?', const=2, default=None,
+                        metavar='N',
+                        help='Roll back to the previous promoted adapter; '
+                             'scans the last N*2 promotion records (default N=2)')
     args = parser.parse_args()
+
+    if args.rollback is not None:
+        rolled_back = rollback(args.rollback)
+        sys.exit(0 if rolled_back else 2)
+
+    if args.candidate is None:
+        parser.error('--candidate is required unless --rollback is used')
 
     promoted = promote(args.candidate, merged_path=args.merged_model)
     # Exit 0 = promoted, 2 = rejected (not an error — caller can check)

@@ -2,6 +2,7 @@
 """
 Model Inference with LoRA - OPTIMIZED with model caching
 """
+import json
 import os
 import logging
 import time
@@ -31,6 +32,17 @@ _MODEL_CACHE = {
     'tokenizer': None,
     'loaded': False
 }
+
+# E1: parse failure tracking — incremented when neither JSON nor regex can extract
+# a valid decision from the model response.  Written to logs/parse_failures.json
+# every 50 failures for Prometheus scraping.
+_parse_failures_count: int = 0
+
+# E2: base-model env vars — when set, debate_trade uses a different model tag
+# (un-fine-tuned base) to provide diverse perspective.  Falls back to OLLAMA_MODEL /
+# VLLM_MODEL when not configured so the change is a safe no-op by default.
+_OLLAMA_BASE_MODEL = os.getenv('OLLAMA_BASE_MODEL', '')
+_VLLM_BASE_MODEL   = os.getenv('VLLM_BASE_MODEL', '')
 
 
 def load_model_once():
@@ -149,43 +161,168 @@ def get_trading_decision(prompt, max_new_tokens=200, temperature=0.7):
 
     return response
 
-def parse_decision(response):
-    """Parse the model's response into structured decision."""
+def parse_decision(response: str) -> dict:
+    """Parse the model's response into a structured decision.
+
+    Attempt 1 — JSON block: look for ``{...}`` anywhere in the response.
+      Accepts keys: decision, confidence, reasoning (case-insensitive).
+    Attempt 2 — structured-line regex: existing Decision:/Confidence: pattern.
+    On total failure: return hold with confidence=None and increment
+      _parse_failures_count (caller can gate on ``confidence is None``).
+    """
+    global _parse_failures_count
+
+    # ── Attempt 1: JSON block ─────────────────────────────────────────────────
+    json_start = response.find('{')
+    json_end   = response.rfind('}')
+    if json_start != -1 and json_end != -1 and json_end > json_start:
+        try:
+            blob = json.loads(response[json_start:json_end + 1])
+            # Normalise keys to lower-case for robustness
+            blob = {k.lower(): v for k, v in blob.items()}
+            j_decision = str(blob.get('decision', '')).lower().strip()
+            if j_decision in ('buy', 'buy_call', 'sell', 'hold'):
+                j_conf = blob.get('confidence')
+                if j_conf is not None:
+                    try:
+                        j_conf = float(j_conf)
+                        if j_conf > 1:
+                            j_conf = j_conf / 100
+                        j_conf = max(0.0, min(1.0, j_conf))
+                    except (ValueError, TypeError):
+                        j_conf = None
+                j_reasoning = str(blob.get('reasoning', response[:200])).replace('\n', ' ').strip()
+                return {
+                    'decision':     j_decision,
+                    'confidence':   j_conf,
+                    'reasoning':    j_reasoning[:200],
+                    'raw_response': response,
+                    'parse_method': 'json',
+                }
+        except (json.JSONDecodeError, Exception):
+            pass
+
+    # ── Attempt 2: structured-line regex ─────────────────────────────────────
     response_lower = response.lower()
-    
-    # Extract decision (BUY, SELL, HOLD)
-    decision = "hold"
-    if "buy" in response_lower and "don't buy" not in response_lower and "not buy" not in response_lower:
-        decision = "buy"
-    elif "sell" in response_lower and "don't sell" not in response_lower and "not sell" not in response_lower:
-        decision = "sell"
-    
-    # Extract confidence (look for numbers between 0 and 1)
-    confidence = 0.5
+
+    decision = 'hold'
+    found_decision = False
+    if 'buy' in response_lower and "don't buy" not in response_lower and 'not buy' not in response_lower:
+        decision = 'buy'
+        found_decision = True
+    elif 'sell' in response_lower and "don't sell" not in response_lower and 'not sell' not in response_lower:
+        decision = 'sell'
+        found_decision = True
+    else:
+        # 'hold' — only explicit
+        for line in response_lower.splitlines():
+            if 'decision:' in line and 'hold' in line:
+                found_decision = True
+                break
+
+    confidence = None
     confidence_match = re.search(r'confidence[:\s]+(\d*\.?\d+)', response_lower)
     if confidence_match:
         try:
             conf_val = float(confidence_match.group(1))
-            # Handle both 0-1 scale and 0-100 scale
             if conf_val > 1:
                 conf_val = conf_val / 100
             confidence = max(0.0, min(1.0, conf_val))
-        except (ValueError, TypeError) as e:
-            import logging as _log
-            _log.warning(f"Could not parse confidence value '{confidence_match.group(1)}': {e}. Defaulting to 0.5")
-    else:
-        import logging as _log
-        _log.debug("No confidence value found in model response, defaulting to 0.5")
-    
-    # Extract reasoning (first 200 chars of response)
+        except (ValueError, TypeError) as _e:
+            logging.warning(
+                "Could not parse confidence value '%s': %s",
+                confidence_match.group(1), _e,
+            )
+
     reasoning = response[:200].replace('\n', ' ').strip()
-    
+
+    if not found_decision and confidence is None:
+        _parse_failures_count += 1
+        logging.debug(
+            "parse_decision: ambiguous response (failure #%d), returning hold/None",
+            _parse_failures_count,
+        )
+        _maybe_write_parse_failures()
+
     return {
-        'decision': decision,
-        'confidence': confidence,
-        'reasoning': reasoning,
-        'raw_response': response
+        'decision':     decision,
+        'confidence':   confidence,
+        'reasoning':    reasoning,
+        'raw_response': response,
+        'parse_method': 'regex',
     }
+
+
+def _maybe_write_parse_failures() -> None:
+    """Persist _parse_failures_count to logs/ every 50 failures for Prometheus."""
+    if _parse_failures_count % 50 != 0:
+        return
+    try:
+        path = _SCRIPTS_DIR.parent / 'logs' / 'parse_failures.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        from datetime import datetime as _dt
+        path.write_text(json.dumps({
+            'parse_failures_total': _parse_failures_count,
+            'updated_at': _dt.now().isoformat(),
+        }))
+    except Exception as _e:
+        logging.debug("Could not write parse_failures.json: %s", _e)
+
+
+def _generate_base_model(prompt: str, max_new_tokens: int = 200, temperature: float = 0.7) -> str:
+    """Generate using the BASE model (un-fine-tuned) for diverse debate perspective.
+
+    When OLLAMA_BASE_MODEL / VLLM_BASE_MODEL is not set, falls back silently to
+    the fine-tuned model so the change is a safe no-op.
+
+    For the direct GPU path (no client backend), running a second model would
+    exhaust memory, so we also fall back to the primary model.
+    """
+    _backend = os.getenv('INFERENCE_BACKEND', 'direct').lower()
+
+    if _backend == 'ollama':
+        base_model = _OLLAMA_BASE_MODEL
+        if not base_model:
+            return get_trading_decision(prompt, max_new_tokens, temperature)
+        import ollama
+        response = ollama.generate(
+            model=base_model,
+            prompt=prompt,
+            think=False,
+            options={
+                'temperature': temperature,
+                'top_p': 0.9,
+                'num_predict': max_new_tokens,
+            },
+        )
+        return response['response']
+
+    elif _backend == 'vllm':
+        base_model = _VLLM_BASE_MODEL
+        if not base_model:
+            return get_trading_decision(prompt, max_new_tokens, temperature)
+        from inference_client import VLLM_BASE_URL, VLLM_API_KEY, INFERENCE_TIMEOUT
+        import requests
+        payload = {
+            'model':       base_model,
+            'prompt':      prompt,
+            'max_tokens':  max_new_tokens,
+            'temperature': temperature,
+            'top_p': 0.9,
+        }
+        resp = requests.post(
+            f"{VLLM_BASE_URL}/completions",
+            json=payload,
+            headers={'Authorization': f"Bearer {VLLM_API_KEY}"},
+            timeout=INFERENCE_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()['choices'][0]['text']
+
+    else:
+        # Direct GPU path: second model load would exceed memory — use fine-tuned model
+        logging.debug("_generate_base_model: direct GPU backend has no separate base model; using primary")
+        return get_trading_decision(prompt, max_new_tokens, temperature)
 
 if __name__ == "__main__":
     # Test the model

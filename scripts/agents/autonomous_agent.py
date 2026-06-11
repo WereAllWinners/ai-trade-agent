@@ -21,7 +21,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import _pathfix  # noqa: F401
 
-from model_inference_lora import get_trading_decision, parse_decision, load_model_once
+from model_inference_lora import get_trading_decision, parse_decision, load_model_once, _generate_base_model
 from stock_discovery import StockDiscovery
 from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
 import news_fetcher
@@ -36,6 +36,7 @@ import account_config as _acfg
 from utils.indicators import get_daily_bars_for_ma, calculate_ma_atr, is_daily_df
 
 _DEBATE_CONFIDENCE_THRESHOLD = 0.90   # Only debate very high-conviction trades
+_debate_unavailable_count: int = 0    # E2: tracks base-model debate failures
 _MIN_CASH_RESERVE = float(os.getenv('MIN_CASH_RESERVE', '500'))  # Never spend the account's last N dollars of cash
 _DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'  # log orders but never submit
 _PDT_DAY_TRADE_LIMIT = 3              # Max same-day round trips before PDT block kicks in
@@ -207,6 +208,30 @@ def _settled_cash(account) -> float:
     return float(account.non_marginable_buying_power)
 
 
+def _compute_regime() -> str | None:
+    """Return current market regime string e.g. 'bull_midvol'.
+
+    Fetches SPY vs its 200-day MA (bull/bear) and VIX level (lowvol/midvol/highvol).
+    Returns None silently on any data-fetch failure so trading never blocks.
+    """
+    try:
+        import yfinance as yf
+        spy = yf.download('SPY', period='1y', auto_adjust=True, progress=False)['Close']
+        if spy.empty or len(spy) < 200:
+            return None
+        spy_price  = float(spy.iloc[-1])
+        spy_200ma  = float(spy.tail(200).mean())
+        trend = 'bull' if spy_price > spy_200ma else 'bear'
+
+        vix = yf.download('^VIX', period='5d', auto_adjust=True, progress=False)['Close']
+        vix_val = float(vix.iloc[-1]) if not vix.empty else 20.0
+        vol = 'highvol' if vix_val > 25 else ('lowvol' if vix_val < 15 else 'midvol')
+        return f"{trend}_{vol}"
+    except Exception as e:
+        logging.debug("_compute_regime failed (non-fatal): %s", e)
+        return None
+
+
 def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) -> dict:
     """
     Contrarian second LLM call — challenges a high-conviction trade.
@@ -225,7 +250,9 @@ def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) ->
         f"When in doubt, PROCEED."
     )
     try:
-        text = get_trading_decision(debate_prompt)   # Now uses new LoRA + DPO model
+        # E2: route debate through the BASE (un-fine-tuned) model for diverse perspective.
+        # Falls back to the primary model when OLLAMA_BASE_MODEL/VLLM_BASE_MODEL not set.
+        text = _generate_base_model(debate_prompt)
         verdict = 'PROCEED'
         for line in text.splitlines():
             if 'VERDICT:' in line.upper():
@@ -233,7 +260,9 @@ def debate_trade(symbol: str, action: str, confidence: float, reasoning: str) ->
                 break
         return {'verdict': verdict, 'reason': text.strip()}
     except Exception as e:
-        logging.warning(f"  Debate call failed for {symbol}: {e}")
+        global _debate_unavailable_count
+        _debate_unavailable_count += 1
+        logging.warning(f"  Debate call failed for {symbol}: {e}  (debate_unavailable #{_debate_unavailable_count})")
         return {'verdict': 'PROCEED', 'reason': 'debate unavailable'}
 
 load_dotenv()
@@ -294,6 +323,7 @@ class AutonomousAgent:
         self.fee_simulator      = FeeSimulator(paper=_paper)
         self.paper_sim          = PaperMarketSimulator(paper=_paper)
         self._last_order_id: str | None = None
+        self._session_regime: str | None = None
         self._paper             = _paper
 
         # Decision logging — unique ID per process run for replay correlation
@@ -361,7 +391,8 @@ class AutonomousAgent:
     
     def _log_decision(self, symbol: str, prompt: str, raw_response: str,
                       decision: dict, indicators: dict, executed: bool,
-                      debate: dict | None = None) -> None:
+                      debate: dict | None = None,
+                      order_id: str | None = None) -> None:
         """Append one decision record to decision_log.jsonl.
 
         Every call to the LLM is logged — including HOLDs — so replay mode
@@ -381,6 +412,8 @@ class AutonomousAgent:
             'reasoning':    decision.get('reasoning', ''),
             'executed':     executed,
             'debate':       debate,
+            'order_id':     order_id,
+            'regime':       self._session_regime,
         }
         try:
             with open(self._decision_log, 'a') as f:
@@ -1016,6 +1049,11 @@ class AutonomousAgent:
             self.pdt_blocked = False
             logging.info("🔄 Daily trade counter reset")
 
+        # Compute market regime once per session for decision tagging
+        self._session_regime = _compute_regime()
+        if self._session_regime:
+            logging.info(f"📊 Market regime: {self._session_regime}")
+
         # Get account info
         account = self.trading_client.get_account()
         equity = float(account.equity)
@@ -1313,7 +1351,8 @@ class AutonomousAgent:
             log_indicators = {**indicators,
                               'discovery_signals': self.discovery.opportunities.get(symbol, [])}
             self._log_decision(symbol, prompt, response, decision, log_indicators, executed,
-                               debate=debate_result)
+                               debate=debate_result,
+                               order_id=self._last_order_id if executed else None)
         
         logging.info(f"✅ Session complete: {trades_executed} trades executed")
 

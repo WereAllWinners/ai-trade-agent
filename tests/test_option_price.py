@@ -17,8 +17,10 @@ sys.path.insert(0, 'scripts/agents')
 import types
 dummy = types.ModuleType('model_inference_lora')
 dummy.parse_decision = lambda r: {'decision': 'hold', 'confidence': 0.5, 'reasoning': r[:100]}
-dummy.get_trading_decision = lambda prompt, **kw: {'decision': 'hold', 'confidence': 0.5, 'reasoning': 'stub'}
+dummy.get_trading_decision = lambda prompt, **kw: 'HOLD. Confidence: 0.5.'
+dummy._generate_base_model = lambda prompt, **kw: 'VERDICT: PROCEED'
 dummy.load_model_once = lambda: None
+dummy._parse_failures_count = 0
 sys.modules['model_inference_lora'] = dummy
 
 # Also stub out ollama
