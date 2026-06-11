@@ -54,24 +54,56 @@ _REPLAY_MAX_DD_SCALE       = float(os.getenv('REPLAY_MAX_DD_SCALE', '1.25'))
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _run_eval(adapter_path: str) -> dict | None:
+def _run_eval(
+    adapter_path: str,
+    with_golden: bool = False,
+) -> tuple[dict | None, bool | None]:
     """
-    Run eval_model.py for adapter_path in a subprocess.
-    Returns the parsed summary dict from the saved eval JSON, or None on failure.
+    Run eval_model.py for *adapter_path* in a subprocess.
+
+    Returns (smoke_result, golden_veto):
+      smoke_result  — parsed eval summary dict, or None on failure
+      golden_veto   — True (veto), False (pass), None (golden gate skipped/absent)
     """
     eval_script = _SCRIPTS_DIR / 'training' / 'eval_model.py'
     before_ts   = datetime.now(timezone.utc).timestamp()
 
-    logging.info(f"🔬 Evaluating: {Path(adapter_path).name}")
-    result = subprocess.run(
-        [sys.executable, str(eval_script), '--adapter', adapter_path],
-        timeout=900,  # 15 min per eval
-    )
+    cmd = [sys.executable, str(eval_script), '--adapter', adapter_path]
+    if with_golden:
+        cmd.append('--golden')
 
-    # returncode 1 = grade F — still a valid run, result was saved
-    if result.returncode not in (0, 1):
-        logging.error(f"Eval subprocess exited with code {result.returncode}")
-        return None
+    timeout = 1200 if with_golden else 900  # golden adds ~5 min of inference
+
+    logging.info(f"🔬 Evaluating: {Path(adapter_path).name}")
+    result = subprocess.run(cmd, timeout=timeout, stderr=subprocess.PIPE)
+
+    golden_veto: bool | None = None
+
+    if with_golden:
+        if result.returncode == 2:
+            # Golden gate veto — smoke test result was still saved
+            golden_veto = True
+            logging.error(
+                "❌ Golden gate VETO for %s — stderr: %s",
+                Path(adapter_path).name,
+                result.stderr.decode(errors='replace')[-500:],
+            )
+        elif result.returncode in (0, 1):
+            golden_veto = False
+        else:
+            logging.error(
+                "Eval subprocess exited with unexpected code %d — stderr: %s",
+                result.returncode,
+                result.stderr.decode(errors='replace')[-500:],
+            )
+            return None, None
+    elif result.returncode not in (0, 1):
+        logging.error(
+            "Eval subprocess exited with code %d — stderr: %s",
+            result.returncode,
+            result.stderr.decode(errors='replace')[-500:],
+        )
+        return None, None
 
     # Find the eval JSON written after we started
     _EVAL_DIR.mkdir(parents=True, exist_ok=True)
@@ -81,9 +113,9 @@ def _run_eval(adapter_path: str) -> dict | None:
     )
     if not written:
         logging.error("No eval result file found after run")
-        return None
+        return None, golden_veto
 
-    return json.loads(written[-1].read_text())
+    return json.loads(written[-1].read_text()), golden_veto
 
 
 def _run_replay_eval(adapter_path: str) -> dict | None:
@@ -102,12 +134,15 @@ def _run_replay_eval(adapter_path: str) -> dict | None:
         return None
 
     before_ts = datetime.now(timezone.utc).timestamp()
-    env = {**os.environ, 'LORA_ADAPTER_PATH': adapter_path}
+    # Force INFERENCE_BACKEND='direct' so the subprocess cold-loads the LoRA adapter
+    # from LORA_ADAPTER_PATH.  Ollama/vLLM ignore LORA_ADAPTER_PATH and would test
+    # both candidate and incumbent against the same already-loaded model.
+    env = dict(os.environ, LORA_ADAPTER_PATH=adapter_path, INFERENCE_BACKEND='direct')
 
-    logging.info("🔁 Replay eval: %s", Path(adapter_path).name)
+    logging.info("🔁 Replay eval: %s (direct backend)", Path(adapter_path).name)
     result = subprocess.run(
         [sys.executable, str(replay_script), '--log', str(log_path)],
-        timeout=1800,  # 30 min
+        timeout=2400,  # 40 min: cold 32B load (~8 min) + 200 prompt inference (~25 min)
         env=env,
     )
     if result.returncode not in (0, 1):
@@ -261,12 +296,21 @@ def promote(candidate_path: str, merged_path: str = None) -> bool:
     logging.info(f"   Current   : {Path(current_path).name}")
     logging.info(f"{'='*60}\n")
 
-    # ── Stage 1: Smoke test ──────────────────────────────────────────────────
-    candidate_result = _run_eval(candidate_path)
-    current_result   = _run_eval(current_path)
+    # ── Stage 1: Smoke test (+ golden gate for candidate) ───────────────────
+    # Golden eval runs inside the candidate subprocess to share the model load.
+    candidate_result, golden_veto = _run_eval(candidate_path, with_golden=True)
+    current_result,   _           = _run_eval(current_path)
 
     if candidate_result is None or current_result is None:
         logging.error("❌ Eval failed — keeping current adapter as a safety measure")
+        return False
+
+    if golden_veto is True:
+        logging.error("❌ REJECTED (golden gate veto) — pass_rate dropped >15 pts vs baseline")
+        _write_promotion_record(
+            promoted=False, candidate_path=candidate_path, current_path=current_path,
+            candidate_result=candidate_result, current_result=current_result,
+        )
         return False
 
     c_pass  = candidate_result['pass_rate']
@@ -306,9 +350,38 @@ def promote(candidate_path: str, merged_path: str = None) -> bool:
     replay_verdict:   bool | None = None
 
     if _ENABLE_REPLAY_GATE:
+        # Free VRAM for two consecutive cold 32B loads before spawning subprocesses.
+        _backend = os.getenv('INFERENCE_BACKEND', 'direct').lower()
+        try:
+            if _backend == 'ollama':
+                from inference_client import _stop_ollama
+                _stop_ollama()
+                logging.info("🛑 Ollama unloaded — freeing VRAM for replay eval")
+            elif _backend == 'vllm':
+                from inference_client import _stop_vllm
+                _stop_vllm()
+                logging.info("🛑 vLLM stopped — freeing VRAM for replay eval")
+        except Exception as _stop_err:
+            logging.warning("Could not stop inference server before replay eval: %s", _stop_err)
+
         logging.info("\n🔁 Running replay gate...")
         replay_candidate = _run_replay_eval(candidate_path)
         replay_current   = _run_replay_eval(current_path)
+
+        # Verify both runs evaluated the same prompt set.  A mismatch means one eval
+        # ran on a different selection of held-out prompts (e.g. due to a race that
+        # modified the decision log between the two runs).  The comparison would be
+        # unfair, so we discard the replay verdict and fall back to the smoke test.
+        if (replay_candidate is not None and replay_current is not None
+                and replay_candidate.get('prompt_set_hash') != replay_current.get('prompt_set_hash')):
+            logging.error(
+                "⚠️  Replay eval prompt_set_hash MISMATCH — candidate=%s incumbent=%s. "
+                "The two evals ran on different prompt sets; discarding replay verdict "
+                "and falling back to smoke-test gate.",
+                replay_candidate.get('prompt_set_hash'),
+                replay_current.get('prompt_set_hash'),
+            )
+            replay_candidate = replay_current = None
 
         if replay_candidate is not None and replay_current is not None:
             c_exp  = replay_candidate['expectancy']

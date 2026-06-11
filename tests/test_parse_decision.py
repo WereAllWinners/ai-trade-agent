@@ -71,15 +71,16 @@ class TestParseDecision:
         assert result['confidence'] <= 1.0
 
     def test_confidence_clamped_to_0(self):
-        # Regex matches only non-negative numbers; "-0.2" is not parsed → None.
-        # Downstream callers treat confidence=None as 0.0 via `confidence or 0.0`.
+        # Regex matches only non-negative numbers; "-0.2" is unparseable → coerced to 0.0.
         result = parse_decision("BUY. Confidence: -0.2.")
-        assert result['confidence'] is None or result['confidence'] >= 0.0
+        assert isinstance(result['confidence'], float)
+        assert result['confidence'] >= 0.0
 
-    def test_confidence_is_none_when_missing(self):
-        """No confidence keyword in response → confidence should be None (not 0.5)."""
+    def test_confidence_is_zero_when_missing(self):
+        """No confidence keyword in response → coerced to 0.0 (parse_failed=False since BUY found)."""
         result = parse_decision("BUY based on technical analysis.")
-        assert result['confidence'] is None
+        assert result['confidence'] == 0.0
+        assert result['parse_failed'] is False
 
     # ------------------------------------------------------------------
     # Output structure
@@ -154,3 +155,62 @@ class TestParseDecision:
         parse_decision("The market conditions are complex. There is uncertainty.")
         after = _mli._parse_failures_count
         assert after > before
+
+
+class TestParseDecisionSafety:
+    """confidence is never None; parse_failed distinguishes total failure from partial parse."""
+
+    def test_confidence_always_float(self):
+        """parse_decision must never return confidence=None regardless of input."""
+        ambiguous = "The market conditions are complex. There is uncertainty."
+        partial   = "BUY based on technical analysis."
+        clear     = "BUY. Confidence: 0.80."
+        for response in (ambiguous, partial, clear):
+            result = parse_decision(response)
+            assert isinstance(result['confidence'], float), (
+                f"confidence is not a float for: {response!r}"
+            )
+
+    def test_parse_failed_true_only_on_total_failure(self):
+        """parse_failed=True when neither decision NOR confidence is parseable."""
+        result = parse_decision("The market conditions are complex. There is uncertainty.")
+        assert result['parse_failed'] is True
+        assert result['confidence'] == 0.0
+
+    def test_parse_failed_false_when_decision_found_without_confidence(self):
+        """Decision found but no confidence keyword → parse_failed=False, confidence=0.0."""
+        result = parse_decision("BUY based on technical analysis.")
+        assert result['parse_failed'] is False
+        assert result['confidence'] == 0.0
+
+    def test_parse_failed_false_on_successful_parse(self):
+        result = parse_decision("BUY. Confidence: 0.82.")
+        assert result['parse_failed'] is False
+        assert result['confidence'] == 0.82
+
+    def test_parse_failed_false_on_json_parse(self):
+        result = parse_decision('{"decision": "buy", "confidence": 0.88, "reasoning": "test"}')
+        assert result['parse_failed'] is False
+
+    def test_ambiguous_response_safe_in_session_loop_comparisons(self):
+        """The returned dict from a total-failure parse must survive all agent comparisons."""
+        result = parse_decision("The market conditions are complex. There is uncertainty.")
+        # These are the exact comparisons that were crashing in autonomous_agent.py
+        min_confidence = 0.60
+        debate_threshold = 0.90
+        _ = result['confidence'] >= min_confidence           # was TypeError
+        _ = result['confidence'] >= debate_threshold         # was TypeError
+        _ = f"{result['confidence']:.2f}"                   # was TypeError
+        _ = f"{result['confidence']:.0%}"                   # was TypeError
+
+    def test_ambiguous_response_safe_in_rebalance_path(self):
+        """Arithmetic used in _maybe_rotate_portfolio must not raise on parse-failure output."""
+        result = parse_decision("The market conditions are complex. There is uncertainty.")
+        assumed_return = 0.05
+        # autonomous_agent.py:959 — new_ev = new_decision['confidence'] * assumed_return
+        new_ev = result['confidence'] * assumed_return      # was TypeError
+        # autonomous_agent.py:980 — if new_decision['confidence'] <= weakest['confidence']
+        _ = result['confidence'] <= result['confidence']    # was TypeError
+        # autonomous_agent.py:983 — f"{new_decision['confidence']:.2f}"
+        _ = f"{result['confidence']:.2f}"                  # was TypeError
+        assert new_ev == 0.0  # 0.0 * anything = 0.0 → rotation will be rejected (correct)

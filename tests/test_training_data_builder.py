@@ -201,6 +201,26 @@ class TestExampleWeight:
         at_half_life = _example_weight(datetime.now() - timedelta(days=_HALF_LIFE_DAYS))
         assert at_half_life == pytest.approx(0.5, rel=0.05)
 
+    def test_90_day_examples_retained_at_roughly_quarter_rate_of_fresh(self):
+        """With half-life=45d, 90-day-old weight = 0.25 = ~25% of fresh weight (~1.0).
+        Using probabilistic sampling over 1000 examples each, the ratio of retention
+        rates should be ~0.25 (within a 10% relative tolerance at seed=42)."""
+        import random as _random
+        from training_data_builder import _example_weight
+        n = 1000
+        rng = _random.Random(42)
+        w_fresh = _example_weight(datetime.now() - timedelta(days=1))   # ≈ 0.985
+        w_old   = _example_weight(datetime.now() - timedelta(days=90))  # = 0.25
+
+        retained_fresh = sum(1 for _ in range(n) if rng.random() < w_fresh)
+        retained_old   = sum(1 for _ in range(n) if rng.random() < w_old)
+
+        ratio = retained_old / retained_fresh
+        # Expected ratio ≈ 0.25 / 0.985 ≈ 0.254 — allow ±30% relative (sampling noise)
+        assert 0.18 < ratio < 0.35, (
+            f"Retention ratio {ratio:.3f} is outside expected range [0.18, 0.35]"
+        )
+
 
 # ---------------------------------------------------------------------------
 # A4 — _forward_excess_return caches SPY

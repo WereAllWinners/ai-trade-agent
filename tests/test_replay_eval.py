@@ -253,18 +253,171 @@ class TestRunReplayEval:
 # ---------------------------------------------------------------------------
 # model_promoter two-stage gate (PR-4)
 # ---------------------------------------------------------------------------
+# _run_replay_eval subprocess env contract
+# ---------------------------------------------------------------------------
+
+class TestRunReplayEvalSubprocessEnv:
+    """_run_replay_eval must pass INFERENCE_BACKEND='direct' and correct LORA_ADAPTER_PATH."""
+
+    def test_inference_backend_forced_to_direct(self, tmp_path):
+        """Subprocess must receive INFERENCE_BACKEND='direct' regardless of caller env."""
+        import model_promoter
+        import subprocess as _sp
+
+        log = tmp_path / 'decision_log.jsonl'
+        log.write_text('')
+
+        captured_envs: list[dict] = []
+
+        def fake_run(cmd, timeout, env, **kw):
+            captured_envs.append(dict(env))
+            # Write a fake result JSON so the function can parse a result
+            result_file = tmp_path / 'eval' / 'replay_eval_fake.json'
+            result_file.parent.mkdir(parents=True, exist_ok=True)
+            result_file.write_text(json.dumps({
+                'expectancy': 0.01, 'max_dd': 0.05, 'trade_count': 10,
+                'n_symbols': 3, 'prompt_set_hash': 'abc123',
+            }))
+            return _sp.CompletedProcess(cmd, 0)
+
+        with patch('model_promoter.subprocess.run', side_effect=fake_run), \
+             patch.object(model_promoter, '_EVAL_DIR', tmp_path / 'eval'):
+            model_promoter._run_replay_eval(str(tmp_path / 'adapter_a'))
+
+        assert len(captured_envs) == 1
+        assert captured_envs[0]['INFERENCE_BACKEND'] == 'direct'
+
+    def test_lora_adapter_path_set_to_given_adapter(self, tmp_path):
+        """Each _run_replay_eval call must set LORA_ADAPTER_PATH to its own adapter."""
+        import model_promoter
+        import subprocess as _sp
+
+        log = tmp_path / 'decision_log.jsonl'
+        log.write_text('')
+
+        captured_adapter_paths: list[str] = []
+        call_count = 0
+
+        def fake_run(cmd, timeout, env, **kw):
+            nonlocal call_count
+            captured_adapter_paths.append(env.get('LORA_ADAPTER_PATH', ''))
+            result_file = tmp_path / 'eval' / f'replay_eval_{call_count}.json'
+            result_file.parent.mkdir(parents=True, exist_ok=True)
+            result_file.write_text(json.dumps({
+                'expectancy': 0.01, 'max_dd': 0.05, 'trade_count': 10,
+                'n_symbols': 3, 'prompt_set_hash': 'abc123',
+            }))
+            call_count += 1
+            return _sp.CompletedProcess(cmd, 0)
+
+        adapter_a = str(tmp_path / 'adapter_a')
+        adapter_b = str(tmp_path / 'adapter_b')
+
+        with patch('model_promoter.subprocess.run', side_effect=fake_run), \
+             patch.object(model_promoter, '_EVAL_DIR', tmp_path / 'eval'):
+            model_promoter._run_replay_eval(adapter_a)
+            model_promoter._run_replay_eval(adapter_b)
+
+        assert captured_adapter_paths[0] == adapter_a
+        assert captured_adapter_paths[1] == adapter_b
+        assert captured_adapter_paths[0] != captured_adapter_paths[1]
+
+
+class TestReplayGateAdapterIsolation:
+    """Two run_replay_eval calls with different adapter paths give different results
+    when get_trading_decision returns different responses per LORA_ADAPTER_PATH.
+    This confirms model-backend isolation without loading actual weights."""
+
+    def _write_log(self, path: Path, n: int = 10) -> None:
+        from datetime import datetime, timedelta
+        with open(path, 'w') as f:
+            for i in range(n):
+                ts = (datetime.now() - timedelta(days=i)).isoformat()
+                f.write(json.dumps({
+                    'decision':   'buy',
+                    'bot':        'stock',
+                    'symbol':     f'SYM{i}',
+                    'timestamp':  ts,
+                    'prompt':     f'Analyze SYM{i} with data {i}.',
+                    'confidence': 0.80,
+                }) + '\n')
+
+    def test_different_adapters_produce_different_expectancy(self, tmp_path):
+        """Adapter A (always buys, winning) vs Adapter B (always holds) → different expectancy.
+
+        Mocks at the model backend level (model_inference_lora.get_trading_decision),
+        NOT at _rerun_decision.  The backend mock reads LORA_ADAPTER_PATH from os.environ —
+        exactly how a real model would behave if different weights were loaded per adapter.
+        """
+        import os
+        import types
+        from replay_eval import run_replay_eval
+
+        log = tmp_path / 'decision_log.jsonl'
+        self._write_log(log, n=10)
+
+        # Ensure a stub model_inference_lora module is present so _rerun_decision
+        # can do `from model_inference_lora import get_trading_decision` without
+        # loading torch/transformers.
+        if 'model_inference_lora' not in sys.modules:
+            stub = types.ModuleType('model_inference_lora')
+            sys.modules['model_inference_lora'] = stub
+
+        # Model backend mock: checks LORA_ADAPTER_PATH to return different responses.
+        # adapter_a → BUY (simulates a model trained to buy aggressively)
+        # adapter_b → HOLD (simulates an incumbent that is more conservative)
+        def model_backend_mock(prompt, **kw):
+            adapter = os.environ.get('LORA_ADAPTER_PATH', '')
+            if 'adapter_a' in adapter:
+                return 'BUY. Confidence: 0.85.'
+            return 'HOLD. Confidence: 0.50.'
+
+        eval_dir = tmp_path / 'eval'
+        eval_dir.mkdir()
+
+        with patch('replay_eval._db') as mock_db, \
+             patch('replay_eval._EVAL_DIR', eval_dir), \
+             patch('replay_eval._simulate_trade',
+                   return_value={'pnl_pct': 0.05, 'exit_reason': 'take_profit'}), \
+             patch('model_inference_lora.get_trading_decision',
+                   side_effect=model_backend_mock, create=True), \
+             patch('model_inference_lora.parse_decision',
+                   side_effect=lambda r: {
+                       'decision': 'buy' if 'BUY' in r else 'hold',
+                       'confidence': 0.85 if 'BUY' in r else 0.50,
+                       'parse_failed': False,
+                   }, create=True):
+            mock_db.get_existing_prompt_hashes.return_value = set()
+
+            result_a = run_replay_eval(log_path=log, lookback_days=30, seed=42,
+                                       adapter_path=str(tmp_path / 'adapter_a'))
+            result_b = run_replay_eval(log_path=log, lookback_days=30, seed=42,
+                                       adapter_path=str(tmp_path / 'adapter_b'))
+
+        assert result_a['trade_count'] > 0, "adapter_a should produce trades"
+        assert result_b['trade_count'] == 0, "adapter_b (hold) should produce zero trades"
+        assert result_a['expectancy'] > result_b['expectancy'], (
+            f"adapter_a expectancy {result_a['expectancy']} should exceed "
+            f"adapter_b {result_b['expectancy']}"
+        )
+
+
+# ---------------------------------------------------------------------------
 
 class TestModelPromoterTwoStageGate:
     """Smoke test hard fail and replay gate behaviour."""
 
     def _make_eval_result(self, grade='B', pass_rate=0.75, format_score=0.95,
-                          directional_acc=0.80) -> dict:
-        return {
-            'grade':          grade,
-            'pass_rate':      pass_rate,
-            'format_score':   format_score,
-            'directional_acc': directional_acc,
-        }
+                          directional_acc=0.80, golden_veto=None) -> tuple:
+        return (
+            {
+                'grade':           grade,
+                'pass_rate':       pass_rate,
+                'format_score':    format_score,
+                'directional_acc': directional_acc,
+            },
+            golden_veto,  # (smoke_result, golden_veto) — None means gate skipped
+        )
 
     def _make_replay_result(self, expectancy=0.02, max_dd=0.08,
                              trade_count=15) -> dict:
@@ -460,3 +613,47 @@ class TestModelPromoterTwoStageGate:
         assert 'replay_candidate' in data
         assert 'replay_current' in data
         assert 'expectancy' in data['replay_candidate']
+
+    def test_prompt_set_hash_mismatch_falls_back_to_smoke_test(self, tmp_path):
+        """Mismatched prompt_set_hash between the two replay evals → replay verdict discarded,
+        smoke-test gate applies.  This prevents unfair comparisons when the decision log
+        is modified between the two subprocess runs."""
+        import model_promoter
+        adapter1 = tmp_path / 'adapter1'
+        adapter1.mkdir()
+        adapter2 = tmp_path / 'adapter2'
+        adapter2.mkdir()
+        latest = tmp_path / 'lora_latest'
+        latest.symlink_to(str(adapter1))
+
+        # Candidate has better replay expectancy, BUT prompt_set_hash differs.
+        # Smoke test says candidate pass_rate is only barely above current (0.76 vs 0.75).
+        # If replay verdict were used, it would strongly promote; smoke-test should be used.
+        mismatched_candidate = {**self._make_replay_result(expectancy=0.10, max_dd=0.02),
+                                 'prompt_set_hash': 'hash_AAA'}
+        mismatched_current   = {**self._make_replay_result(expectancy=0.01, max_dd=0.10),
+                                 'prompt_set_hash': 'hash_BBB'}  # ← different hash
+
+        with patch.object(model_promoter, '_ENABLE_REPLAY_GATE', True), \
+             patch.object(model_promoter, '_PROMOTER_SHADOW', False), \
+             patch.object(model_promoter, '_current_production_adapter', return_value=str(adapter1)), \
+             patch.object(model_promoter, '_run_eval', side_effect=[
+                 # Candidate barely meets legacy smoke-test tolerance
+                 self._make_eval_result(pass_rate=0.76, format_score=0.95),
+                 self._make_eval_result(pass_rate=0.75, format_score=0.95),
+             ]), \
+             patch.object(model_promoter, '_run_replay_eval', side_effect=[
+                 mismatched_candidate,
+                 mismatched_current,
+             ]), \
+             patch.object(model_promoter, '_update_latest_symlink'), \
+             patch.object(model_promoter, '_update_env'), \
+             patch.object(model_promoter, '_restart_services'), \
+             patch.object(model_promoter, '_write_promotion_record'), \
+             patch.object(model_promoter, '_LATEST', latest), \
+             patch.object(model_promoter, '_ENV_FILE', tmp_path / '.env'):
+            result = model_promoter.promote(str(adapter2))
+
+        # Smoke test says promote (76% > 75% within tolerance).
+        # Even though replay hashes mismatched, fallback to smoke → should promote.
+        assert result is True

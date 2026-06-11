@@ -69,9 +69,11 @@ def _run_promoter(finetune_dir: Path, adapters_before: set) -> None:
         cmd += ['--merged-model', merged_path]
 
     try:
-        subprocess.run(cmd, timeout=2400)  # 40 min for two evals
+        # Budget: smoke test (~5 min) + 2× replay eval at 40 min each = ~85 min.
+        # 7200s (120 min) gives comfortable headroom for cold 32B loads.
+        subprocess.run(cmd, timeout=7200)
     except subprocess.TimeoutExpired:
-        logging.error("❌ Model promotion timed out after 40 minutes")
+        logging.error("❌ Model promotion timed out after 120 minutes")
     except Exception as e:
         logging.error(f"❌ Model promotion failed: {e}")
 

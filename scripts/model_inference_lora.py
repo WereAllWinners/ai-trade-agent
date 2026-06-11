@@ -194,10 +194,11 @@ def parse_decision(response: str) -> dict:
                 j_reasoning = str(blob.get('reasoning', response[:200])).replace('\n', ' ').strip()
                 return {
                     'decision':     j_decision,
-                    'confidence':   j_conf,
+                    'confidence':   j_conf if j_conf is not None else 0.0,
                     'reasoning':    j_reasoning[:200],
                     'raw_response': response,
                     'parse_method': 'json',
+                    'parse_failed': False,
                 }
         except (json.JSONDecodeError, Exception):
             pass
@@ -236,13 +237,18 @@ def parse_decision(response: str) -> dict:
 
     reasoning = response[:200].replace('\n', ' ').strip()
 
+    parse_failed = False
     if not found_decision and confidence is None:
         _parse_failures_count += 1
+        parse_failed = True
         logging.debug(
-            "parse_decision: ambiguous response (failure #%d), returning hold/None",
+            "parse_decision: ambiguous response (failure #%d), returning hold/0.0",
             _parse_failures_count,
         )
         _maybe_write_parse_failures()
+
+    if confidence is None:
+        confidence = 0.0
 
     return {
         'decision':     decision,
@@ -250,6 +256,7 @@ def parse_decision(response: str) -> dict:
         'reasoning':    reasoning,
         'raw_response': response,
         'parse_method': 'regex',
+        'parse_failed': parse_failed,
     }
 
 

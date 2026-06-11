@@ -42,6 +42,7 @@ LOSS_PCT            = -0.12
 STRONG_LOSS_PCT     = -0.30
 
 import os
+import random
 _MISSED_OPP_EXCESS   = float(os.getenv('TDB_MISSED_OPP_EXCESS', '0.03'))
 _HALF_LIFE_DAYS      = float(os.getenv('TDB_HALF_LIFE_DAYS', '45'))
 _MAX_EXAMPLES        = int(os.getenv('TDB_MAX_EXAMPLES', '5000'))
@@ -331,7 +332,11 @@ def build_and_store(bot: str) -> tuple[int, int]:
                     existing_hashes.add(cf_ph)
                     added += 1
 
-    # Export with recency weighting (A7)
+    # Export with probabilistic recency filtering (A7)
+    # Each example is included with probability = its recency weight, so fresh examples
+    # (~weight≈1.0) are almost always included and old examples (~weight≈0.05) are
+    # included only 5% of the time.  After stochastic filtering, subsample without
+    # replacement to at most TDB_MAX_EXAMPLES.
     all_examples = _db.get_training_examples(bot=bot)
 
     def _weight_for(ex: dict) -> float:
@@ -341,10 +346,13 @@ def build_and_store(bot: str) -> tuple[int, int]:
             return 0.05
         return _example_weight(entry_dt)
 
-    exportable = []
+    _EXPORT_SEED = int(os.getenv('TDB_EXPORT_SEED', '42'))
+    _export_rng  = random.Random(_EXPORT_SEED)
+
+    candidates = []
     for e in all_examples:
         w = _weight_for(e)
-        exportable.append({
+        candidates.append({
             'input':  e['prompt'],
             'output': e['ideal_output'],
             'label':  e['label'],
@@ -362,9 +370,42 @@ def build_and_store(bot: str) -> tuple[int, int]:
             }
         })
 
-    # Sort by weight descending (most recent first) and cap
-    exportable.sort(key=lambda x: x['weight'], reverse=True)
-    exportable = exportable[:_MAX_EXAMPLES]
+    # Probabilistic inclusion: each example retained with probability = weight
+    exportable = [ex for ex in candidates if _export_rng.random() < ex['weight']]
+
+    # Subsample without replacement if still over the cap
+    if len(exportable) > _MAX_EXAMPLES:
+        exportable = _export_rng.sample(exportable, _MAX_EXAMPLES)
+
+    # Log retention by age bucket for observability
+    _now = datetime.now()
+    _age_buckets: dict[str, list[int]] = {
+        '<7d': [0, 0], '7-30d': [0, 0], '31-90d': [0, 0], '>90d': [0, 0],
+    }
+    for ex in candidates:
+        try:
+            age_days = (_now - datetime.fromisoformat(ex['metadata']['entry_date'])).days
+        except (ValueError, TypeError, KeyError):
+            age_days = 9999
+        if   age_days <  7:  bkt = '<7d'
+        elif age_days < 30:  bkt = '7-30d'
+        elif age_days < 90:  bkt = '31-90d'
+        else:                bkt = '>90d'
+        _age_buckets[bkt][1] += 1  # total
+    for ex in exportable:
+        try:
+            age_days = (_now - datetime.fromisoformat(ex['metadata']['entry_date'])).days
+        except (ValueError, TypeError, KeyError):
+            age_days = 9999
+        if   age_days <  7:  bkt = '<7d'
+        elif age_days < 30:  bkt = '7-30d'
+        elif age_days < 90:  bkt = '31-90d'
+        else:                bkt = '>90d'
+        _age_buckets[bkt][0] += 1  # retained
+    for bkt, (kept, total) in _age_buckets.items():
+        if total > 0:
+            logging.info("  [export] %s: %d / %d retained (%.0f%%)", bkt, kept, total,
+                         100 * kept / total)
 
     filename = 'training_data.json' if bot == 'stock' else 'options_training_data.json'
     output_path = _DATA_DIR / filename
@@ -373,7 +414,10 @@ def build_and_store(bot: str) -> tuple[int, int]:
     with open(output_path, 'w') as f:
         json.dump(exportable, f, indent=2)
 
-    logging.info(f"✅ {bot.capitalize()}: +{added} new examples → {len(exportable)} exported (of {len(all_examples)} total)")
+    logging.info(
+        "✅ %s: +%d new examples → %d exported (probabilistic, of %d total)",
+        bot.capitalize(), added, len(exportable), len(all_examples),
+    )
     return added, len(exportable)
 
 
