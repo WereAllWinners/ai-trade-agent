@@ -315,6 +315,45 @@ def check_reconcile_status(results: CheckResult) -> None:
                     warn_only=True)
 
 
+def check_merged_symlink_alignment(results: CheckResult) -> None:
+    """Verify that finance_qwen_32b_merged_latest points to the path in the latest promotion record."""
+    merged_latest = _PROJECT_ROOT / 'finetune' / 'finance_qwen_32b_merged_latest'
+    if not merged_latest.is_symlink():
+        results.add('merged_symlink', False,
+                    f'{merged_latest.name} is missing — vLLM may be serving an outdated model',
+                    warn_only=True)
+        return
+    actual = merged_latest.resolve()
+    promo_files = sorted(
+        (_PROJECT_ROOT / 'logs' / 'eval').glob('promotion_*.json'),
+        key=lambda f: f.stat().st_mtime,
+    )
+    if not promo_files:
+        results.add('merged_symlink_alignment', True,
+                    'no promotion record found — cannot verify alignment',
+                    warn_only=True)
+        return
+    try:
+        promo = json.loads(promo_files[-1].read_text())
+    except Exception as e:
+        results.add('merged_symlink_alignment', False,
+                    f'could not read promotion record: {e}', warn_only=True)
+        return
+    recorded = promo.get('merged_model')
+    if not recorded:
+        results.add('merged_symlink_alignment', True,
+                    'promotion record has no merged_model field — run after next fine-tune',
+                    warn_only=True)
+        return
+    aligned = actual == Path(recorded).resolve()
+    results.add(
+        'merged_symlink_alignment',
+        aligned,
+        f"readlink={actual.name} {'==' if aligned else '!='} promoted={Path(recorded).name}",
+        warn_only=not aligned,
+    )
+
+
 def check_service_status(results: CheckResult) -> None:
     """Check that the trading daemon services are running."""
     for service in ('ai-trading-bot.service', 'ai-options-bot.service'):
@@ -346,7 +385,18 @@ def main():
 
     results = CheckResult()
 
-    # 1. Symlink
+    # 0. Self-heal: ensure vLLM is running before any checks that depend on it.
+    #    Uses start-only (never stop/restart) so it is safe to call here.
+    if os.getenv('INFERENCE_BACKEND', 'ollama').lower() == 'vllm':
+        try:
+            sys.path.insert(0, str(_SCRIPTS_DIR))
+            from inference_client import ensure_vllm_running
+            ensure_vllm_running()
+        except Exception as e:
+            results.add('vllm_self_heal', False,
+                        f'ensure_vllm_running failed: {e}', warn_only=True)
+
+    # 1. LoRA adapter symlink
     adapter_path = check_symlink(results)
 
     if adapter_path:
@@ -357,19 +407,22 @@ def main():
         # 4. Weight files
         check_adapter_files(adapter_path, results)
 
-    # 5. Services
+    # 5. Merged model symlink vs promotion record alignment
+    check_merged_symlink_alignment(results)
+
+    # 6. Services
     check_service_status(results)
 
-    # 6. Repair + detect: reprotect naked positions, then verify all protected.
+    # 7. Repair + detect: reprotect naked positions, then verify all protected.
     # Sequence is deliberate: sweep runs first so a nonzero count after repair
     # means "tried and failed," not just "not checked yet."
     repair_naked_positions(results)
     check_reconcile_status(results)
 
-    # 7. Inference (optional, GPU-heavy)
+    # 8. Inference (optional, GPU-heavy)
     if not args.no_inference and adapter_path:
         check_inference(results, verbose=args.verbose)
-    elif args.no_inference:  # noqa: SIM114
+    elif args.no_inference:
         print("  ⏭️  Skipping inference check (--no-inference)")
 
     # Report

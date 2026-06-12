@@ -54,14 +54,29 @@ def _run_promoter(finetune_dir: Path, adapters_before: set) -> None:
     new_adapter = new_adapters[-1]
     logging.info(f"🔍 New adapter detected: {new_adapter.name}")
 
-    # Look for a companion merged BF16 model (same timestamp, different name prefix).
-    # fine_tune_llm.py names it: finance_qwen_32b_lora_merged_bf16_YYYYMMDD_HHMMSS
-    merged_candidate = finetune_dir / new_adapter.name.replace('_lora_', '_lora_merged_bf16_')
-    merged_path = str(merged_candidate) if merged_candidate.exists() else None
+    # Look for a companion merged BF16 model written by fine_tune_llm.py.
+    # Primary: read the absolute path from training_metadata.json (reliable across CWDs).
+    # Fallback: reconstruct via name substitution for old adapters without metadata.
+    merged_path = None
+    metadata_file = new_adapter / 'training_metadata.json'
+    if metadata_file.exists():
+        try:
+            meta = json.loads(metadata_file.read_text())
+            candidate = Path(meta.get('merged_dir', ''))
+            if candidate.is_absolute() and candidate.exists():
+                merged_path = str(candidate)
+        except Exception as _meta_err:
+            logging.warning("Could not read training_metadata.json: %s", _meta_err)
+
+    if merged_path is None:
+        merged_candidate = finetune_dir / new_adapter.name.replace('_lora_', '_lora_merged_bf16_')
+        if merged_candidate.exists():
+            merged_path = str(merged_candidate)
+
     if merged_path:
-        logging.info(f"🔍 Merged model detected: {merged_candidate.name}")
+        logging.info(f"🔍 Merged model detected: {Path(merged_path).name}")
     else:
-        logging.info("ℹ️  No merged model found — vLLM will keep serving the previous merged model")
+        logging.warning("⚠️  No merged model found — vLLM will keep serving the previous merged model")
 
     promoter_script = Path(__file__).resolve().parent / 'model_promoter.py'
     cmd = [sys.executable, str(promoter_script), '--candidate', str(new_adapter)]

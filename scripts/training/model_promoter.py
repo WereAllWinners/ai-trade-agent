@@ -205,12 +205,18 @@ def _update_env(adapter_path: str) -> None:
 def _update_merged_symlink(merged_path: str) -> None:
     """Update finance_qwen_32b_merged_latest to point at the newly merged BF16 model."""
     if not merged_path or not Path(merged_path).exists():
-        logging.warning(f"Merged model not found at {merged_path} — skipping symlink update")
+        logging.warning("Merged model not found at %s — skipping symlink update", merged_path)
         return
-    if _MERGED_LATEST.is_symlink() or _MERGED_LATEST.exists():
-        _MERGED_LATEST.unlink()
-    _MERGED_LATEST.symlink_to(merged_path)
-    logging.info(f"🔗 Symlink updated: {_MERGED_LATEST.name} → {Path(merged_path).name}")
+    target = Path(merged_path).resolve()
+    tmp = _MERGED_LATEST.parent / f'.tmp_merged_latest_{os.getpid()}'
+    try:
+        tmp.unlink(missing_ok=True)
+        os.symlink(target, tmp)
+        os.replace(tmp, _MERGED_LATEST)   # atomic rename — no window where symlink is absent
+        logging.info("🔗 Symlink updated: %s → %s", _MERGED_LATEST.name, target.name)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _restart_services() -> None:
@@ -235,12 +241,14 @@ def _write_promotion_record(
     replay_candidate: dict | None = None,
     replay_current: dict | None = None,
     replay_verdict: bool | None = None,
+    merged_model: str | None = None,
 ) -> None:
     record: dict = {
         'decided_at':    datetime.now().isoformat(),
         'promoted':      promoted,
         'candidate':     candidate_path,
         'current':       current_path,
+        'merged_model':  str(Path(merged_model).resolve()) if merged_model else None,
         'candidate_scores': {k: candidate_result.get(k)
                              for k in ('pass_rate', 'directional_acc', 'format_score', 'grade')},
         'current_scores':   {k: current_result.get(k)
@@ -349,21 +357,39 @@ def promote(candidate_path: str, merged_path: str = None) -> bool:
     replay_current:   dict | None = None
     replay_verdict:   bool | None = None
 
-    if _ENABLE_REPLAY_GATE:
-        # Free VRAM for two consecutive cold 32B loads before spawning subprocesses.
+    # Use a local flag so we can skip replay without touching the module-level constant
+    # (Python would treat _ENABLE_REPLAY_GATE as local if we assigned it, causing
+    # UnboundLocalError on the outer `if _ENABLE_REPLAY_GATE:` reference).
+    _run_replay = _ENABLE_REPLAY_GATE
+
+    if _run_replay:
+        # The replay eval uses INFERENCE_BACKEND='direct' (cold 32B GPU load).
+        # Running that alongside a live vLLM server would OOM on 128 GB unified memory.
+        # The daemon's stop_for_finetuning() should have stopped vLLM before launching
+        # finetune_model.py; if vLLM is somehow still active, skip replay and fall back
+        # to the smoke verdict — the promoter must never be granted stop authority.
         _backend = os.getenv('INFERENCE_BACKEND', 'direct').lower()
-        try:
-            if _backend == 'ollama':
+        if _backend == 'ollama':
+            try:
                 from inference_client import _stop_ollama
                 _stop_ollama()
                 logging.info("🛑 Ollama unloaded — freeing VRAM for replay eval")
-            elif _backend == 'vllm':
-                from inference_client import _stop_vllm
-                _stop_vllm()
-                logging.info("🛑 vLLM stopped — freeing VRAM for replay eval")
-        except Exception as _stop_err:
-            logging.warning("Could not stop inference server before replay eval: %s", _stop_err)
+            except Exception as _stop_err:
+                logging.warning("Could not unload Ollama before replay eval: %s", _stop_err)
+        elif _backend == 'vllm':
+            _vllm_active = subprocess.run(
+                ['sudo', 'systemctl', 'is-active', 'ai-inference-server.service'],
+                capture_output=True, text=True,
+            ).stdout.strip() == 'active'
+            if _vllm_active:
+                logging.error(
+                    "❌ REPLAY GATE SKIPPED: vLLM is still active (daemon did not stop it). "
+                    "Running direct-GPU replay alongside live vLLM would OOM. "
+                    "Falling back to smoke-test verdict."
+                )
+                _run_replay = False
 
+    if _run_replay:
         logging.info("\n🔁 Running replay gate...")
         replay_candidate = _run_replay_eval(candidate_path)
         replay_current   = _run_replay_eval(current_path)
@@ -444,6 +470,7 @@ def promote(candidate_path: str, merged_path: str = None) -> bool:
         candidate_result=candidate_result, current_result=current_result,
         replay_candidate=replay_candidate, replay_current=replay_current,
         replay_verdict=replay_verdict,
+        merged_model=merged_path if promoted else None,
     )
     return promoted
 

@@ -362,9 +362,17 @@ class TradingDaemon:
         self.run_market_research()
         self.run_training_data_builder()
         self.run_dpo_builder()
-        # Free GPU VRAM by unloading the inference model before the training job
-        # loads a 32B base model.  The backend will auto-reload on the next inference call.
-        inference_client.stop_for_finetuning()
+        # Free GPU VRAM by unloading the inference model before the training job loads
+        # the 32B base model.  Returns False if blocked (market hours / lock contention)
+        # — in that case we abort: the server is still live and must not be disturbed.
+        stopped = inference_client.stop_for_finetuning()
+        if not stopped:
+            from alerts import send_alert, AlertLevel
+            send_alert(AlertLevel.WARNING, 'finetune_aborted_server_live',
+                       'Fine-tune aborted: vLLM stop was blocked (market hours or lock '
+                       'contention). Inference server remains live.')
+            logging.warning("⚠️  Fine-tune aborted — inference server still live; skipping this cycle")
+            return
         try:
             logging.info("🔔 Time for daily model fine-tuning!")
             logging.info("======================================================================")
@@ -388,6 +396,7 @@ class TradingDaemon:
         finally:
             # Restart vLLM here, after finetune_model.py and all its children (training +
             # eval subprocesses) have fully exited and released their GPU memory.
+            # start_after_finetuning() checks is-active first — no-ops if already up.
             inference_client.start_after_finetuning()
     
     def sleep_until_next_event(self):
@@ -462,10 +471,22 @@ class TradingDaemon:
                 if self._finetune_requested:
                     self._finetune_requested = False
                     if not _LIVE_ONLY:
-                        finetune_done_today = False
-                        logging.info("🔔 Running off-cycle fine-tune (SIGUSR1)...")
-                        self.run_finetuning()
-                        finetune_done_today = True
+                        if self.is_market_open():
+                            # Never fine-tune during market hours via SIGUSR1 — stop_for_finetuning
+                            # would kill a live vLLM server and orphan active trading sessions.
+                            from alerts import send_alert, AlertLevel
+                            send_alert(AlertLevel.WARNING, 'sigusr1_deferred_market_hours',
+                                       'Off-cycle fine-tune deferred: SIGUSR1 received during '
+                                       'market hours. Fine-tune will run at the scheduled time.')
+                            logging.warning(
+                                "⚠️  SIGUSR1 fine-tune ignored — market is open. "
+                                "Fine-tune will run at scheduled time after close."
+                            )
+                        else:
+                            finetune_done_today = False
+                            logging.info("🔔 Running off-cycle fine-tune (SIGUSR1)...")
+                            self.run_finetuning()
+                            finetune_done_today = True
                     else:
                         logging.info("📬 SIGUSR1 received but TRADING_LIVE_ONLY=1 — ignoring fine-tune request")
 

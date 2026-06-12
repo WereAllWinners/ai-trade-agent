@@ -190,38 +190,54 @@ class StockDiscovery:
         
         headers = {'User-Agent': 'Mozilla/5.0 (compatible; research-bot/1.0)'}
 
+        _SP500_URL   = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+        _NASDAQ_URL  = 'https://en.wikipedia.org/wiki/Nasdaq-100'
+        _DOW_URL     = 'https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average'
+
         # S&P 500
+        _resp = None
         try:
-            html = requests.get('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', headers=headers, timeout=10).text
-            sp500_symbols = pd.read_html(html)[0]['Symbol'].str.replace('.', '-').tolist()
+            _resp = requests.get(_SP500_URL, headers=headers, timeout=10)
+            sp500_symbols = pd.read_html(_resp.text)[0]['Symbol'].str.replace('.', '-').tolist()
             constituents.extend(sp500_symbols)
             logging.info(f"  ✅ S&P 500: {len(sp500_symbols)} stocks")
         except Exception as e:
-            logging.warning(f"Failed to fetch S&P 500: {e}")
+            _status = _resp.status_code if _resp is not None else 'N/A'
+            _body   = (_resp.text[:200] if _resp is not None else '')
+            logging.warning("Failed to fetch S&P 500 (url=%s status=%s body_head=%.200r): %s",
+                            _SP500_URL, _status, _body, str(e)[:100])
 
         # NASDAQ 100
+        _resp = None
         try:
-            html = requests.get('https://en.wikipedia.org/wiki/Nasdaq-100', headers=headers, timeout=10).text
-            tables = pd.read_html(html)
+            _resp = requests.get(_NASDAQ_URL, headers=headers, timeout=10)
+            tables = pd.read_html(_resp.text)
             nasdaq100_df = next((t for t in tables if 'Ticker' in t.columns), None)
             if nasdaq100_df is not None:
                 nasdaq100_symbols = nasdaq100_df['Ticker'].dropna().tolist()
                 constituents.extend(nasdaq100_symbols)
                 logging.info(f"  ✅ NASDAQ 100: {len(nasdaq100_symbols)} stocks")
         except Exception as e:
-            logging.warning(f"Failed to fetch NASDAQ 100: {e}")
+            _status = _resp.status_code if _resp is not None else 'N/A'
+            _body   = (_resp.text[:200] if _resp is not None else '')
+            logging.warning("Failed to fetch NASDAQ 100 (url=%s status=%s body_head=%.200r): %s",
+                            _NASDAQ_URL, _status, _body, str(e)[:100])
 
         # Dow Jones 30
+        _resp = None
         try:
-            html = requests.get('https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average', headers=headers, timeout=10).text
-            tables = pd.read_html(html)
+            _resp = requests.get(_DOW_URL, headers=headers, timeout=10)
+            tables = pd.read_html(_resp.text)
             dow_df = next((t for t in tables if 'Symbol' in t.columns), None)
             if dow_df is not None:
                 dow_symbols = dow_df['Symbol'].dropna().tolist()
                 constituents.extend(dow_symbols)
                 logging.info(f"  ✅ Dow 30: {len(dow_symbols)} stocks")
         except Exception as e:
-            logging.warning(f"Failed to fetch Dow 30: {e}")
+            _status = _resp.status_code if _resp is not None else 'N/A'
+            _body   = (_resp.text[:200] if _resp is not None else '')
+            logging.warning("Failed to fetch Dow 30 (url=%s status=%s body_head=%.200r): %s",
+                            _DOW_URL, _status, _body, str(e)[:100])
         
         # Add popular growth/tech stocks
         popular_stocks = [
