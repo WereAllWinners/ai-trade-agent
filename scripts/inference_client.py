@@ -126,6 +126,19 @@ def stop_for_finetuning() -> bool:
         logging.warning("⚠️  stop_for_finetuning() blocked — market is open")
         return False
 
+    # Idempotency guard: if vLLM is already inactive, treat as stopped.
+    # FileLock prevents concurrent acquisition but NOT sequential re-acquisition
+    # by the same process — without this check a retry loop in the caller could
+    # issue stop after stop. A second systemctl stop on an already-dead service
+    # is a no-op, but it delays fine-tuning and can mask bugs in caller logic.
+    _pre = subprocess.run(
+        ['sudo', 'systemctl', 'is-active', 'ai-inference-server.service'],
+        capture_output=True, text=True,
+    )
+    if _pre.stdout.strip() != 'active':
+        logging.info("ℹ️  vLLM already inactive — stop_for_finetuning is a no-op (already stopped)")
+        return True
+
     if _LIFECYCLE_LOCK is None:
         _stop_vllm()
         return True
