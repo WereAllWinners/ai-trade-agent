@@ -39,6 +39,11 @@ _DEBATE_CONFIDENCE_THRESHOLD = 0.90   # Only debate very high-conviction trades
 _debate_unavailable_count: int = 0    # E2: tracks base-model debate failures
 _MIN_CASH_RESERVE = float(os.getenv('MIN_CASH_RESERVE', '500'))  # Never spend the account's last N dollars of cash
 _DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'  # log orders but never submit
+# GTC bracket stop legs can fill same-day and consume a day trade on small accounts.
+# Capital protection outranks PDT conservation by default. Set to 'false' only when
+# PDT conservation is critical (small account + no_same_day_close active); entries
+# will then be submitted WITHOUT a bracket, relying on the reprotect sweep next session.
+_ALLOW_SAME_DAY_STOP_OUT = os.getenv('ALLOW_SAME_DAY_STOP_OUT', 'true').lower() == 'true'
 _PDT_DAY_TRADE_LIMIT = 3              # Max same-day round trips before PDT block kicks in
 _EXPLORATION_SHARPE_THRESHOLD = 1.0   # Inject novel symbols when recent Sharpe is below this
 _EXPLORATION_COUNT = 2                # Number of random symbols to inject per session
@@ -681,12 +686,22 @@ class AutonomousAgent:
                 return False
 
             # Alpaca does not allow bracket orders on fractional quantities.
-            # For fractional shares, submit a simple market order — the agent
-            # monitors positions every 30 min and issues SELL decisions for exits.
-            # For whole-share positions, use a bracket order for automatic exits.
+            # For fractional shares, submit a plain market order — the agent
+            # monitors positions every 30 min and issues SELL decisions for exits;
+            # reprotect_positions() will attach a stop on the next session sweep.
+            # For whole-share positions, use a GTC bracket order so child legs
+            # survive overnight.  DAY brackets were confirmed non-surviving (2026-06-12).
             stop_price   = round(fill_price * (1 + self.params['stop_loss']), 2)
             target_price = round(fill_price * (1 + self.params['take_profit']), 2)
-            if shares != int(shares):
+
+            no_bracket = (
+                shares != int(shares)  # fractional — Alpaca rejects bracket
+                or (
+                    not _ALLOW_SAME_DAY_STOP_OUT
+                    and self.params.get('no_same_day_close')
+                )
+            )
+            if no_bracket:
                 order = MarketOrderRequest(
                     symbol=symbol,
                     qty=round(shares, 9),
@@ -694,8 +709,9 @@ class AutonomousAgent:
                     time_in_force=TimeInForce.DAY,
                 )
                 logging.info(
-                    f"📋 Fractional order — no bracket (stop ${stop_price:.2f} / "
-                    f"target ${target_price:.2f} tracked by agent)"
+                    f"📋 {'Fractional' if shares != int(shares) else 'PDT-safe'} order — "
+                    f"no bracket (stop ${stop_price:.2f} / target ${target_price:.2f} "
+                    f"— reprotect sweep will attach OCO next session)"
                 )
             else:
                 order = LimitOrderRequest(
@@ -703,7 +719,7 @@ class AutonomousAgent:
                     qty=int(shares),
                     side=side,
                     limit_price=round(fill_price, 2),
-                    time_in_force=TimeInForce.DAY,
+                    time_in_force=TimeInForce.GTC,
                     order_class=OrderClass.BRACKET,
                     stop_loss=StopLossRequest(stop_price=stop_price),
                     take_profit=TakeProfitRequest(limit_price=target_price),
@@ -1040,6 +1056,8 @@ class AutonomousAgent:
 
     def run_trading_session(self):
         """Run a single trading session - analyze and potentially trade."""
+        _session_start = datetime.now()
+
         # Reset daily counter if new day
         today = datetime.now().date()
         if today != self.last_reset_date:
@@ -1355,6 +1373,54 @@ class AutonomousAgent:
                                order_id=self._last_order_id if executed else None)
         
         logging.info(f"✅ Session complete: {trades_executed} trades executed")
+
+        # ── End-of-session: cancel stale unfilled parent bracket entries ──────
+        # GTC bracket entries that haven't filled after a full session cycle are
+        # stale (price moved away from the limit). Cancel them so they don't fill
+        # later at an unintended price.  Filled parents' child OCO legs are SELL
+        # orders and are NOT touched by this sweep.
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import OrderSide as _OrdSide, TimeInForce as _TIF
+            _cutoff = _session_start
+            _open_buys = self.trading_client.get_orders(
+                GetOrdersRequest(status='open')
+            )
+            for _ord in _open_buys:
+                if (
+                    _ord.side == _OrdSide.BUY
+                    and str(_ord.time_in_force).upper() in ('GTC', 'TIMEINFORCE.GTC')
+                    and _ord.submitted_at is not None
+                    and _ord.submitted_at.replace(tzinfo=None) < _cutoff
+                ):
+                    if _DRY_RUN:
+                        logging.info(
+                            "[DRY RUN] Would cancel stale GTC BUY %s submitted at %s",
+                            _ord.symbol, _ord.submitted_at,
+                        )
+                    else:
+                        self.trading_client.cancel_order_by_id(str(_ord.id))
+                        logging.info(
+                            "🗑  Cancelled stale GTC BUY %s (submitted %s)",
+                            _ord.symbol, _ord.submitted_at,
+                        )
+        except Exception as _se:
+            logging.debug("Stale-entry cancel skipped: %s", _se)
+
+        # ── Repair: attach GTC OCO exits to any naked positions ──────────────
+        try:
+            from risk_reconciler import reprotect_positions as _reprotect
+            _reprotect(self.trading_client, self.params, dry_run=_DRY_RUN)
+        except Exception as _rp:
+            logging.debug("reprotect_positions skipped: %s", _rp)
+
+        # ── Detect: write reconcile status for health monitoring ─────────────
+        try:
+            from risk_reconciler import write_reconcile_status as _write_rec
+            from pathlib import Path as _Path
+            _write_rec(self.trading_client, _Path('logs/reconcile_status.json'))
+        except Exception as _re:
+            logging.debug("Could not write reconcile_status: %s", _re)
 
 if __name__ == "__main__":
     agent = AutonomousAgent()

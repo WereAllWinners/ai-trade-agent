@@ -3,6 +3,9 @@ Unit tests for PR-3: counterfactual SFT rows, DPO wiring, and model rollback.
 """
 import json
 import sys
+import sqlite3
+import tempfile
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -11,6 +14,30 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts' / 'training'))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'finetune'))
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+_SAMPLE_PROMPT_WITH_INDICATORS = (
+    "Analyze AAPL for a potential trade.\n"
+    "RSI(14): 74.5\n"
+    "MACD: -3.20\n"
+    "Volume Ratio: 0.8x\n"
+    "50 MA: $182.00 (+2.3% from current)\n"
+)
+
+_SAMPLE_PROMPT_NO_INDICATORS = "Analyze TSLA for a potential trade. No technical data available."
+
+_BANNED_FRAGMENTS = ('resulted in', '-15.0%', '-13.0%', 'original BUY', 'original SELL')
+
+_REALISTIC_LOSER_PROMPTS = [
+    ("buy",      "RSI(14): 72.0\nMACD: -1.50\nVolume Ratio: 0.9x\n50 MA: $100 (+1% from current)\n"),
+    ("buy_call", "RSI(14): 78.0\nMACD: -5.00\nVolume Ratio: 1.1x\n"),
+    ("sell",     "RSI(14): 25.0\nMACD: +2.30\nVolume Ratio: 0.7x\n"),
+    ("buy",      _SAMPLE_PROMPT_NO_INDICATORS),
+    ("buy_put",  "RSI(14): 28.0\nMACD: +1.80\nVolume Ratio: 0.6x\n"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -25,53 +52,85 @@ class TestCounterfactualOutput:
 
     def test_counterfactual_output_suggests_hold(self):
         from training_data_builder import _build_counterfactual_output
-        result = _build_counterfactual_output('buy', -0.15)
+        result = _build_counterfactual_output('buy', _SAMPLE_PROMPT_WITH_INDICATORS, 0.80, {})
         assert result.startswith('Decision: HOLD')
 
-    def test_counterfactual_output_cites_pnl(self):
+    def test_counterfactual_output_does_not_cite_pnl(self):
+        """Output must NOT contain realized P&L — that leaks future information into training."""
         from training_data_builder import _build_counterfactual_output
-        result = _build_counterfactual_output('buy', -0.15)
-        assert '-15.0%' in result
+        result = _build_counterfactual_output('buy', _SAMPLE_PROMPT_WITH_INDICATORS, 0.80, {})
+        for banned in ('-15.0%', 'resulted in', 'a loss', 'original BUY'):
+            assert banned not in result, f"banned fragment {banned!r} found in output: {result!r}"
 
     def test_counterfactual_output_no_outcome_line(self):
         from training_data_builder import _build_counterfactual_output
-        result = _build_counterfactual_output('buy', -0.10)
+        result = _build_counterfactual_output('buy', _SAMPLE_PROMPT_WITH_INDICATORS, 0.80, {})
         assert 'Outcome:' not in result
         assert 'Reward signal:' not in result
 
     def test_counterfactual_output_three_line_format(self):
         from training_data_builder import _build_counterfactual_output
-        result = _build_counterfactual_output('buy_call', -0.25)
+        result = _build_counterfactual_output('buy_call', _SAMPLE_PROMPT_WITH_INDICATORS, 0.82, {})
         lines = result.strip().split('\n')
         assert lines[0].startswith('Decision:')
         assert lines[1].startswith('Confidence:')
         assert lines[2].startswith('Reasoning:')
         assert len(lines) == 3
 
-    def test_counterfactual_output_when_pnl_none(self):
+    def test_counterfactual_output_cites_indicator_from_prompt(self):
+        """Reasoning must mention a numeric indicator value present in the prompt."""
         from training_data_builder import _build_counterfactual_output
-        result = _build_counterfactual_output('buy', None)
-        assert 'a loss' in result
-        assert result.startswith('Decision: HOLD')
+        result = _build_counterfactual_output('buy', _SAMPLE_PROMPT_WITH_INDICATORS, 0.80, {})
+        # MACD -3.20 or RSI 74.5 should appear — at least one indicator cited
+        assert '-3.20' in result or '74.5' in result or '0.8' in result
+
+    def test_counterfactual_output_fallback_when_no_indicators(self):
+        """When no indicators parse, reasoning is the generic fallback sentence."""
+        from training_data_builder import _build_counterfactual_output
+        result = _build_counterfactual_output('buy', _SAMPLE_PROMPT_NO_INDICATORS, 0.80, {})
+        assert 'sufficient edge' in result
+        # No spurious numbers
+        import re
+        assert not re.search(r'\d+\.\d+%', result)
+
+    def test_counterfactual_confidence_from_calib_map(self):
+        """Confidence is derived from calib_map win_rate, not hardcoded."""
+        from training_data_builder import _build_counterfactual_output
+        # High win-rate bin → low counterfactual confidence (HOLD less certain)
+        calib_high = {'0.70-0.80': {'win_rate': 0.80}}
+        # Low win-rate bin → high counterfactual confidence (HOLD more certain)
+        calib_low  = {'0.70-0.80': {'win_rate': 0.20}}
+        r_high = _build_counterfactual_output('buy', _SAMPLE_PROMPT_NO_INDICATORS, 0.75, calib_high)
+        r_low  = _build_counterfactual_output('buy', _SAMPLE_PROMPT_NO_INDICATORS, 0.75, calib_low)
+        conf_high = float(r_high.split('\n')[1].split(': ')[1])
+        conf_low  = float(r_low.split('\n')[1].split(': ')[1])
+        assert conf_low > conf_high
+
+    def test_counterfactual_confidence_fallback_when_bin_absent(self):
+        """When the confidence bin is absent from calib_map, confidence defaults to 0.70."""
+        from training_data_builder import _build_counterfactual_output
+        result = _build_counterfactual_output('buy', _SAMPLE_PROMPT_NO_INDICATORS, 0.75, {})
+        conf = float(result.split('\n')[1].split(': ')[1])
+        assert conf == pytest.approx(0.70, abs=0.01)
 
     def test_counterfactual_label_not_in_sft_exclude(self):
         """'counterfactual' label must survive the SFT loser filter."""
-        # _SFT_EXCLUDE_LABELS is defined inside load_training_data in fine_tune_llm.py
         _SFT_EXCLUDE_LABELS = {'weak_loser', 'loser', 'strong_loser'}
         assert 'counterfactual' not in _SFT_EXCLUDE_LABELS
 
+    @pytest.mark.parametrize("decision,prompt", _REALISTIC_LOSER_PROMPTS)
+    def test_banned_substring_sweep(self, decision, prompt):
+        """No realistic loser counterfactual should contain P&L-leak substrings."""
+        from training_data_builder import _build_counterfactual_output
+        result = _build_counterfactual_output(decision, prompt, 0.78, {})
+        for frag in _BANNED_FRAGMENTS:
+            assert frag not in result, f"banned {frag!r} in output for decision={decision!r}"
+
 
 class TestCounterfactualEmission:
-    """Counterfactual rows are emitted for losers but not for winners.
-
-    Tests verify the trigger condition (_tiered_label_from_pnl → loser labels)
-    and that the counterfactual hash/output are correctly formed, without
-    relying on the full build_and_store() DB wiring (which uses a module-level
-    default db_path captured at import time, incompatible with tmp_path fixtures).
-    """
+    """Counterfactual rows are emitted for losers but not for winners."""
 
     def test_loser_pnl_produces_loser_label(self):
-        """pnl_pct -13% on a BUY should classify as 'loser' → counterfactual emitted."""
         from training_data_builder import _tiered_label_from_pnl
         label, _ = _tiered_label_from_pnl(-0.13, 'buy')
         assert label in {'strong_loser', 'loser', 'weak_loser'}
@@ -87,24 +146,85 @@ class TestCounterfactualEmission:
         assert label == 'weak_loser'
 
     def test_winner_pnl_does_not_produce_loser_label(self):
-        """pnl_pct +9% → winner; no counterfactual should be emitted."""
         from training_data_builder import _tiered_label_from_pnl
         label, _ = _tiered_label_from_pnl(0.09, 'buy')
         assert label not in {'strong_loser', 'loser', 'weak_loser'}
 
     def test_counterfactual_hash_unique_per_prompt(self):
-        """Two different prompts generate different counterfactual hashes."""
         from training_data_builder import _prompt_hash
         h1 = _prompt_hash('Analyze AAPL today.' + '|counterfactual')
         h2 = _prompt_hash('Analyze TSLA today.' + '|counterfactual')
         assert h1 != h2
 
     def test_counterfactual_row_metadata_example_type(self):
-        """Counterfactual examples must carry example_type='counterfactual'."""
         from training_data_builder import _build_counterfactual_output
-        output = _build_counterfactual_output('buy', -0.13)
-        # The output itself doesn't carry metadata, but the label logic checks the key
-        assert 'HOLD' in output  # confirms the format the metadata will pair with
+        output = _build_counterfactual_output('buy', _SAMPLE_PROMPT_WITH_INDICATORS, 0.80, {})
+        assert 'HOLD' in output
+
+
+class TestRegenerateCounterfactuals:
+    """regenerate_counterfactuals() purges stale rows and rebuilds from loser imitation rows."""
+
+    def _seed_db(self, db_path: Path) -> None:
+        """Seed a minimal DB with 2 old-format counterfactual rows + 2 loser imitation rows."""
+        import db as _db_mod
+        _db_mod.init_db(db_path)
+        from training_data_builder import _prompt_hash
+        now = '2026-01-10T09:00:00'
+
+        for i, symbol in enumerate(['AAPL', 'TSLA']):
+            prompt = f"Analyze {symbol}.\nRSI(14): 75.0\nMACD: -2.00\n"
+            ph = _prompt_hash(prompt)
+            cf_ph = _prompt_hash(prompt + '|counterfactual')
+
+            # imitation (loser) row
+            with _db_mod.get_conn(db_path) as conn:
+                conn.execute("""
+                    INSERT OR IGNORE INTO training_examples
+                    (bot, source, symbol, prompt, ideal_output, label,
+                     confidence, pnl_pct, entry_date, session_id, prompt_hash, generated_at)
+                    VALUES (?, 'paper', ?, ?, 'Decision: BUY\nConfidence: 0.75\nReasoning: x',
+                            'loser', 0.75, -0.15, '2026-01-10', '', ?, ?)
+                """, ('stock', symbol, prompt, ph, now))
+
+                # old-format counterfactual (contains banned string)
+                conn.execute("""
+                    INSERT OR IGNORE INTO training_examples
+                    (bot, source, symbol, prompt, ideal_output, label,
+                     confidence, pnl_pct, entry_date, session_id, prompt_hash, generated_at)
+                    VALUES (?, 'paper', ?, ?, 'Decision: HOLD\nConfidence: 0.90\nReasoning: resulted in -15.0%',
+                            'counterfactual', 0.75, -0.15, '2026-01-10', '', ?, ?)
+                """, ('stock', symbol, prompt, cf_ph, now))
+
+    def test_regenerate_deletes_and_reinserts(self, tmp_path, monkeypatch):
+        db_path = tmp_path / 'trading.db'
+        self._seed_db(db_path)
+
+        import db as _db_mod
+        import training_data_builder as tdb
+        monkeypatch.setattr(_db_mod, 'DB_PATH', db_path)
+
+        deleted, inserted = tdb.regenerate_counterfactuals('stock')
+
+        assert deleted == 2
+        assert inserted == 2
+
+    def test_regenerated_rows_pass_banned_substring_sweep(self, tmp_path, monkeypatch):
+        db_path = tmp_path / 'trading.db'
+        self._seed_db(db_path)
+
+        import db as _db_mod
+        import training_data_builder as tdb
+        monkeypatch.setattr(_db_mod, 'DB_PATH', db_path)
+
+        tdb.regenerate_counterfactuals('stock')
+
+        rows = _db_mod.get_training_examples(label='counterfactual', db_path=db_path)
+        assert len(rows) == 2
+        for row in rows:
+            output = row['ideal_output']
+            for frag in _BANNED_FRAGMENTS:
+                assert frag not in output, f"banned {frag!r} in regenerated row: {output!r}"
 
 
 # ---------------------------------------------------------------------------

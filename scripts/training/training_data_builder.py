@@ -13,6 +13,7 @@ import json
 import hashlib
 import logging
 import argparse
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional
@@ -167,19 +168,108 @@ def _build_ideal_output(decision: str, confidence: float, reasoning: str,
     )
 
 
-def _build_counterfactual_output(decision: str, pnl_pct: float | None) -> str:
-    """Counterfactual SFT target for loser-labeled decisions.
+# Compiled patterns for extracting indicator values from prompt text.
+# Two MA formats are supported with opposite sign conventions; both are
+# normalised internally to "price relative to MA" (positive = above).
+_MACD_RE    = re.compile(r'MACD\s*:\s*([+-]?\d+\.?\d*)', re.IGNORECASE)
+_RSI_RE     = re.compile(r'RSI\s*\(\d+\)\s*:\s*(\d+\.?\d*)', re.IGNORECASE)
+_VOL_RE     = re.compile(r'Volume Ratio\s*:\s*(\d+\.?\d*)x', re.IGNORECASE)
+# Format A: "50 MA: $110 (+5.2% from current)" — the pct is MA-relative-to-price;
+# negate to get price-relative-to-MA.
+_MA_FMT_A   = re.compile(
+    r'\d+[- ](?:day )?MA\s*:.*?\(([+-]?\d+\.?\d*)%\s*from\s+(?:current|price)\)',
+    re.IGNORECASE,
+)
+# Format B: "Price vs 50-day MA: +5.2%" — directly price-relative-to-MA.
+_MA_FMT_B   = re.compile(r'Price vs \d+-?day MA\s*:\s*([+-]?\d+\.?\d*)%', re.IGNORECASE)
 
-    Teaches the model that HOLD was the better call for this prompt context.
-    The output format is identical to imitation targets so the SFT loss treats
-    them uniformly; only the decision and reasoning differ.
+
+def _extract_indicators(prompt: str) -> dict:
+    """Parse indicator values from a prompt string.
+
+    Returns a dict with any subset of: macd, rsi, volume, ma_pct.
+    ma_pct is normalised to price-relative-to-MA (positive = price above MA).
     """
-    pnl_str = f"{pnl_pct:+.1%}" if pnl_pct is not None else "a loss"
+    result: dict = {}
+    m = _MACD_RE.search(prompt)
+    if m:
+        result['macd'] = float(m.group(1))
+    m = _RSI_RE.search(prompt)
+    if m:
+        result['rsi'] = float(m.group(1))
+    m = _VOL_RE.search(prompt)
+    if m:
+        result['volume'] = float(m.group(1))
+    m = _MA_FMT_A.search(prompt)
+    if m:
+        result['ma_pct'] = -float(m.group(1))   # negate: MA above price → price below MA
+    else:
+        m = _MA_FMT_B.search(prompt)
+        if m:
+            result['ma_pct'] = float(m.group(1))
+    return result
+
+
+def _build_counterfactual_output(
+    decision: str,
+    prompt: str,
+    confidence: float,
+    calib_map: dict,
+) -> str:
+    """Forward-looking counterfactual HOLD target for loser-labelled decisions.
+
+    Teaches the model that HOLD was the better call by citing ONLY indicator
+    values visible in the prompt — no realized P&L, no reference to the trade taken.
+
+    Confidence is derived from the calibration map (inverted win-rate of the
+    original decision's confidence bin), not hardcoded.
+    """
+    # Derive HOLD confidence: if that bin lost often, we're highly confident HOLD was right
+    conf_bin = _pick_bin(confidence)
+    if conf_bin and conf_bin in calib_map:
+        cf_conf = max(0.60, min(0.85, 1.0 - float(calib_map[conf_bin]['win_rate'])))
+    else:
+        cf_conf = 0.70
+
+    indicators = _extract_indicators(prompt)
+    is_long    = decision in ('buy', 'buy_call')
+
+    # Select contrary signals in priority order
+    contrary = []
+    if 'macd' in indicators:
+        v = indicators['macd']
+        if is_long and v < 0:
+            contrary.append(f'MACD negative at {v:+.2f}')
+        elif not is_long and v > 0:
+            contrary.append(f'MACD positive at {v:+.2f}')
+    if 'rsi' in indicators:
+        v = indicators['rsi']
+        if is_long and v > 70:
+            contrary.append(f'RSI at {v:.1f} (overbought)')
+        elif not is_long and v < 30:
+            contrary.append(f'RSI at {v:.1f} (oversold — expected bounce)')
+    if 'ma_pct' in indicators:
+        v = indicators['ma_pct']
+        if is_long and v < 0:
+            contrary.append(f'price {v:+.1f}% below the moving average')
+        elif not is_long and v > 0:
+            contrary.append(f'price {v:+.1f}% above the moving average')
+    if 'volume' in indicators:
+        v = indicators['volume']
+        if v < 1.0:
+            contrary.append(f'volume ratio {v:.1f}x (below average)')
+
+    if contrary:
+        signals   = '; '.join(contrary[:2])
+        reasoning = f'Entry risk not justified — {signals}; waiting for a cleaner setup.'
+    else:
+        reasoning = ('Signals do not present a sufficient edge to justify '
+                     'entry risk at this time.')
+
     return (
         f"Decision: HOLD\n"
-        f"Confidence: 0.90\n"
-        f"Reasoning: The original {decision.upper()} resulted in {pnl_str}; "
-        f"indicators did not justify the entry risk at this time."
+        f"Confidence: {cf_conf:.2f}\n"
+        f"Reasoning: {reasoning}"
     )
 
 
@@ -311,7 +401,7 @@ def build_and_store(bot: str) -> tuple[int, int]:
             if cf_ph not in existing_hashes:
                 cf_example = {
                     'input': prompt,
-                    'output': _build_counterfactual_output(decision, pnl_pct),
+                    'output': _build_counterfactual_output(decision, prompt, confidence, calib_map),
                     'label': 'counterfactual',
                     'metadata': {
                         'bot': bot,
@@ -528,8 +618,98 @@ def run(bot: str = 'both') -> None:
     build_portfolio_level_examples()
 
 
+def regenerate_counterfactuals(bot: str = 'both') -> tuple[int, int]:
+    """Purge stale counterfactual rows and regenerate them with the current format.
+
+    Cannot simply DELETE + call build_and_store: the imitation hash for each loser
+    prompt is already present, so build_and_store would skip the counterfactual block
+    entirely. Instead this function queries loser imitation rows directly and builds
+    counterfactual rows in a separate pass.
+
+    Returns (deleted_count, inserted_count).
+    """
+    db_path = _db.DB_PATH
+    _db.init_db(db_path)
+
+    # Step 1: delete all counterfactual rows
+    with _db.get_conn(db_path) as conn:
+        deleted = conn.execute(
+            "DELETE FROM training_examples WHERE label = 'counterfactual'"
+        ).rowcount
+    logging.info("🗑  Deleted %d stale counterfactual rows", deleted)
+
+    # Step 2: query loser imitation rows to regenerate from
+    _LOSER_LABELS = ('strong_loser', 'loser', 'weak_loser')
+    loser_rows: list[dict] = []
+    for lbl in _LOSER_LABELS:
+        loser_rows.extend(_db.get_training_examples(label=lbl, db_path=db_path))
+
+    if not loser_rows:
+        logging.info("No loser rows found — nothing to regenerate")
+        return deleted, 0
+
+    inserted = 0
+    for row in loser_rows:
+        row_bot   = row.get('bot', '')
+        if bot not in ('both', row_bot):
+            continue
+
+        prompt     = row.get('prompt', '')
+        confidence = float(row.get('confidence') or 0.5)
+        if not prompt:
+            continue
+
+        # decision is not a column in training_examples — parse from ideal_output
+        _action_map = {'BUY_CALL': 'buy_call', 'BUY_PUT': 'buy_put',
+                       'BUY': 'buy', 'SELL': 'sell', 'HOLD': 'hold'}
+        decision = 'buy'
+        for _line in (row.get('ideal_output', '') or '').splitlines():
+            if _line.upper().startswith('DECISION:'):
+                _tok = _line.split(':', 1)[1].strip().upper()
+                decision = _action_map.get(_tok, 'buy')
+                break
+
+        calib_map = _db.get_calibration_map(row_bot, db_path=db_path)
+        cf_ph     = _prompt_hash(prompt + '|counterfactual')
+
+        cf_example = {
+            'input':  prompt,
+            'output': _build_counterfactual_output(decision, prompt, confidence, calib_map),
+            'label':  'counterfactual',
+            'metadata': {
+                'bot':          row_bot,
+                'source':       row.get('source', 'paper'),
+                'symbol':       row.get('symbol', ''),
+                'decision':     decision,
+                'confidence':   round(confidence, 4),
+                'pnl_pct':      row.get('pnl_pct'),
+                'reward':       row.get('reward'),
+                'entry_date':   row.get('entry_date', ''),
+                'session_id':   row.get('session_id', ''),
+                'prompt_hash':  cf_ph,
+                'generated_at': datetime.now().isoformat(),
+                'example_type': 'counterfactual',
+            },
+        }
+        if _db.insert_training_example(cf_example, db_path=db_path):
+            inserted += 1
+
+    logging.info("✅ Regenerated %d counterfactual rows from %d loser rows",
+                 inserted, len(loser_rows))
+    return deleted, inserted
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Build enriched fine-tuning examples')
     parser.add_argument('--bot', choices=['stock', 'options', 'both'], default='both')
+    parser.add_argument(
+        '--regenerate-counterfactuals', action='store_true',
+        help='Purge stale counterfactual rows and regenerate them (separate pass, no imitation hash collision)',
+    )
     args = parser.parse_args()
-    run(args.bot)
+    if args.regenerate_counterfactuals:
+        deleted, inserted = regenerate_counterfactuals(args.bot)
+        logging.info("Regeneration complete: deleted=%d inserted=%d", deleted, inserted)
+        run(args.bot)
+    else:
+        run(args.bot)

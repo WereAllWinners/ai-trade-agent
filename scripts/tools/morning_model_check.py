@@ -204,35 +204,82 @@ def check_inference(results: CheckResult, verbose: bool = False) -> None:
         print(f"\n  --- Model response ---\n{response[:600]}\n  ---")
 
 
+def repair_naked_positions(results: CheckResult) -> None:
+    """Run reprotect_positions sweep before counting unprotected positions.
+
+    This ensures the morning count reflects "repair attempted and failed"
+    rather than just "unprotected at last session end."  Failures are
+    warn_only — the broker API may be unavailable pre-market.
+    """
+    import os
+    try:
+        from alpaca.trading.client import TradingClient
+        from risk_reconciler import reprotect_positions, write_reconcile_status
+        api_key = os.getenv('ALPACA_API_KEY') or os.getenv('APCA_API_KEY_ID', '')
+        secret  = os.getenv('ALPACA_SECRET_KEY') or os.getenv('APCA_API_SECRET_KEY', '')
+        if not api_key or not secret:
+            results.add('repair_sweep', False,
+                        'Alpaca credentials not set — skipping repair sweep',
+                        warn_only=True)
+            return
+        paper  = os.getenv('PAPER_TRADING', 'true').lower() != 'false'
+        client = TradingClient(api_key, secret, paper=paper)
+        dry_run = os.getenv('DRY_RUN', 'false').lower() == 'true'
+        summary = reprotect_positions(
+            client,
+            {'stop_loss': -0.07, 'take_profit': 0.15},
+            dry_run=dry_run,
+        )
+        write_reconcile_status(client, _PROJECT_ROOT / 'logs' / 'reconcile_status.json')
+        results.add(
+            'repair_sweep', True,
+            f"Repair sweep: protected={summary['protected']} "
+            f"fractional_skipped={summary['skipped_fractional']} "
+            f"errors={summary['errors']}",
+        )
+    except Exception as e:
+        results.add('repair_sweep', False,
+                    f'Repair sweep failed: {e}',
+                    warn_only=True)
+
+
 def check_reconcile_status(results: CheckResult) -> None:
-    """Verify no unprotected options positions from the last session."""
+    """Verify no unprotected positions remain after the repair sweep."""
     status_path = _PROJECT_ROOT / 'logs' / 'reconcile_status.json'
     if not status_path.exists():
         results.add(
             'reconcile_status', False,
-            'reconcile_status.json not found (options daemon not started yet)',
+            'reconcile_status.json not found (daemons not started yet)',
             warn_only=True,
         )
         return
     try:
         data = json.loads(status_path.read_text())
-        n = int(data.get('unprotected_positions', -1))
         checked_at = data.get('checked_at', 'unknown')
-        if n < 0:
-            results.add(
-                'reconcile_unprotected', False,
-                f'Could not determine protection status (API error) — checked at {checked_at}',
-                warn_only=True,
-            )
-        else:
-            detail = (
-                f'{n} unprotected options position(s) detected — checked at {checked_at}'
-                if n > 0
-                else f'all positions protected — checked at {checked_at}'
-            )
-            results.add('reconcile_unprotected', n == 0, detail)
+
+        # Read new per-class keys; fall back to legacy combined key for old files.
+        n_opts = int(data.get('unprotected_options',
+                              data.get('unprotected_positions', -1)))
+        n_stk  = int(data.get('unprotected_stocks', -1))
+
+        for label, n in (('options', n_opts), ('stocks', n_stk)):
+            if n < 0:
+                results.add(
+                    f'reconcile_{label}', False,
+                    f'Could not determine {label} protection status (API error) '
+                    f'— checked at {checked_at}',
+                    warn_only=True,
+                )
+            else:
+                detail = (
+                    f'{n} unprotected {label} position(s) — checked at {checked_at}'
+                    if n > 0
+                    else f'all {label} positions protected — checked at {checked_at}'
+                )
+                results.add(f'reconcile_{label}', n == 0, detail)
     except Exception as e:
-        results.add('reconcile_status', False, f'Could not read reconcile_status.json: {e}',
+        results.add('reconcile_status', False,
+                    f'Could not read reconcile_status.json: {e}',
                     warn_only=True)
 
 
@@ -281,7 +328,10 @@ def main():
     # 5. Services
     check_service_status(results)
 
-    # 6. Broker-side risk reconciliation
+    # 6. Repair + detect: reprotect naked positions, then verify all protected.
+    # Sequence is deliberate: sweep runs first so a nonzero count after repair
+    # means "tried and failed," not just "not checked yet."
+    repair_naked_positions(results)
     check_reconcile_status(results)
 
     # 7. Inference (optional, GPU-heavy)

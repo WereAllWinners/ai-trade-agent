@@ -278,17 +278,33 @@ def build_prometheus_metrics() -> str:
         lines.append(f'aitrade_portfolio_vetoes_total {len(constraints)} {now_ms}')
 
     # ------------------------------------------------------------------
-    # Broker-side risk reconciliation (C3 — options positions without a SELL)
+    # Broker-side risk reconciliation
     # -1 = API unavailable (unknown), 0 = all protected, N = N unprotected
     # ------------------------------------------------------------------
     reconcile = _read_json_file(_LOGS_DIR / 'reconcile_status.json', {})
     if reconcile:
         gauge(
+            'aitrade_unprotected_options_positions',
+            int(reconcile.get('unprotected_options', -1)),
+            help_text=(
+                'Options positions without any open SELL order. -1 = unknown (API error).'
+            ),
+        )
+        gauge(
+            'aitrade_unprotected_stock_positions',
+            int(reconcile.get('unprotected_stocks', -1)),
+            help_text=(
+                'Stock positions without any open SELL order. -1 = unknown (API error).'
+            ),
+        )
+        # Deprecated: combined count kept for backwards-compat dashboards.
+        gauge(
             'aitrade_unprotected_positions',
             int(reconcile.get('unprotected_positions', -1)),
             help_text=(
-                'Number of options positions without any open SELL order '
-                '(GTC stop or limit). -1 = status unknown (API error).'
+                'DEPRECATED — sum of unprotected options + stocks. '
+                'Use aitrade_unprotected_options_positions and '
+                'aitrade_unprotected_stock_positions instead. -1 = unknown.'
             ),
         )
 

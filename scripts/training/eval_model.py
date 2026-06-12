@@ -40,6 +40,18 @@ _EVAL_DIR           = _PROJECT_ROOT / 'logs' / 'eval'
 _GOLDEN_SET_PATH    = _EVAL_DIR / 'golden_set.jsonl'
 _GOLDEN_BASELINE    = _EVAL_DIR / 'golden_baseline.json'
 
+# Direction class for golden-eval scoring.
+# buy_put and sell are both bearish; buy_call and buy are both bullish.
+# A correct answer requires the same direction class — buy_call vs buy_put
+# must never score as a match.
+_DIRECTION = {
+    'buy':      'bullish',
+    'buy_call': 'bullish',
+    'buy_put':  'bearish',
+    'sell':     'bearish',
+    'hold':     'neutral',
+}
+
 # ---------------------------------------------------------------------------
 # Benchmark scenarios — clear ground-truth direction for each
 # ---------------------------------------------------------------------------
@@ -213,17 +225,21 @@ def _check_format(response: str) -> dict:
 
 
 def _extract_decision(response: str) -> str:
-    """Extract decision from response text."""
+    """Extract decision from response text.
+
+    Lowercases before all substring checks so the model's uppercase output
+    (e.g. 'Decision: BUY_CALL') is handled correctly.  Options-specific
+    tokens (buy_call, buy_put) are checked before the plain 'buy' prefix
+    so they are never swallowed by the shorter match.
+    """
     r = response.lower()
-    # Look for explicit "decision: X" first
     for line in r.splitlines():
         if 'decision:' in line:
-            if 'buy' in line:
-                return 'buy'
-            if 'sell' in line:
-                return 'sell'
-            if 'hold' in line:
-                return 'hold'
+            if 'buy_call' in line: return 'buy_call'
+            if 'buy_put'  in line: return 'buy_put'
+            if 'buy'      in line: return 'buy'
+            if 'sell'     in line: return 'sell'
+            if 'hold'     in line: return 'hold'
     # Fallback: count mentions
     buys  = r.count('buy')
     sells = r.count('sell')
@@ -437,9 +453,12 @@ def run_golden_eval(
             continue
 
         actual = _extract_decision(response)
-        # Direction-normalise options decisions so buy_call/buy_put count as buy
-        norm_expected = 'buy' if expected in ('buy_call', 'buy_put') else expected
-        passed = (actual == norm_expected)
+        # Direction-class comparison: buy_call/buy share 'bullish';
+        # buy_put/sell share 'bearish'. Unknown actual → False, no exception.
+        passed = (
+            _DIRECTION.get(actual) == _DIRECTION.get(expected)
+            and _DIRECTION.get(actual) is not None
+        )
         results.append({
             'prompt_hash': _hash_prompt(prompt),
             'expected':    expected,

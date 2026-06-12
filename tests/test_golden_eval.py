@@ -373,8 +373,8 @@ class TestRunGoldenEval:
         assert r1['pass_rate'] == r2['pass_rate']
         assert [i['passed'] for i in r1['per_item']] == [i['passed'] for i in r2['per_item']]
 
-    def test_buy_call_normalised_to_buy(self, tmp_path):
-        """expected=buy_call counts as correct when model returns BUY."""
+    def test_buy_call_same_direction_class_as_buy(self, tmp_path):
+        """expected=buy_call is bullish; model returning BUY (also bullish) → PASS."""
         from eval_model import run_golden_eval
         items = [{'prompt': 'Options call on NVDA?', 'expected': 'buy_call', 'bot': 'options'}]
         gp = _golden_path(tmp_path, items)
@@ -390,6 +390,109 @@ class TestRunGoldenEval:
             _unpatch_model(mil, orig)
 
         assert result['per_item'][0]['passed'] is True
+
+    # --- Direction-class scoring tests (Session A) ---------------------------
+
+    def test_buy_call_response_matches_buy_call_expected(self, tmp_path):
+        """expected=buy_call, model emits Decision: BUY_CALL (uppercase) → PASS."""
+        from eval_model import run_golden_eval
+        items = [{'prompt': 'Bullish options?', 'expected': 'buy_call', 'bot': 'options'}]
+        gp = _golden_path(tmp_path, items)
+        bp = tmp_path / 'no_baseline.json'
+
+        import model_inference_lora as mil
+        orig = mil.__dict__.get('get_trading_decision')
+        mil.get_trading_decision = lambda p, temperature=0.7, **kw: \
+            'Decision: BUY_CALL\nConfidence: 0.80\nReasoning: bullish setup'
+        try:
+            result = run_golden_eval(None, gp, bp)
+        finally:
+            _unpatch_model(mil, orig)
+
+        assert result['per_item'][0]['passed'] is True
+
+    def test_buy_put_response_matches_buy_put_expected(self, tmp_path):
+        """expected=buy_put, model emits Decision: BUY_PUT → PASS."""
+        from eval_model import run_golden_eval
+        items = [{'prompt': 'Bearish options?', 'expected': 'buy_put', 'bot': 'options'}]
+        gp = _golden_path(tmp_path, items)
+        bp = tmp_path / 'no_baseline.json'
+
+        import model_inference_lora as mil
+        orig = mil.__dict__.get('get_trading_decision')
+        mil.get_trading_decision = lambda p, temperature=0.7, **kw: \
+            'Decision: BUY_PUT\nConfidence: 0.78\nReasoning: bearish setup'
+        try:
+            result = run_golden_eval(None, gp, bp)
+        finally:
+            _unpatch_model(mil, orig)
+
+        assert result['per_item'][0]['passed'] is True
+
+    def test_buy_call_vs_buy_put_is_wrong_direction(self, tmp_path):
+        """REGRESSION: expected=buy_put (bearish) but model says BUY_CALL (bullish) → FAIL.
+
+        This is the direction-collapse case the old normalisation silently passed.
+        """
+        from eval_model import run_golden_eval
+        items = [{'prompt': 'Bearish setup?', 'expected': 'buy_put', 'bot': 'options'}]
+        gp = _golden_path(tmp_path, items)
+        bp = tmp_path / 'no_baseline.json'
+
+        import model_inference_lora as mil
+        orig = mil.__dict__.get('get_trading_decision')
+        mil.get_trading_decision = lambda p, temperature=0.7, **kw: \
+            'Decision: BUY_CALL\nConfidence: 0.80\nReasoning: bullish'
+        try:
+            result = run_golden_eval(None, gp, bp)
+        finally:
+            _unpatch_model(mil, orig)
+
+        assert result['per_item'][0]['passed'] is False
+
+    def test_buy_call_expected_with_plain_buy_response_passes(self, tmp_path):
+        """expected=buy_call (bullish), model returns BUY (also bullish) → PASS."""
+        from eval_model import run_golden_eval
+        items = [{'prompt': 'Options call?', 'expected': 'buy_call', 'bot': 'options'}]
+        gp = _golden_path(tmp_path, items)
+        bp = tmp_path / 'no_baseline.json'
+
+        import model_inference_lora as mil
+        orig = mil.__dict__.get('get_trading_decision')
+        mil.get_trading_decision = lambda p, temperature=0.7, **kw: \
+            'Decision: BUY\nConfidence: 0.75\nReasoning: bullish'
+        try:
+            result = run_golden_eval(None, gp, bp)
+        finally:
+            _unpatch_model(mil, orig)
+
+        assert result['per_item'][0]['passed'] is True
+
+    def test_no_parseable_decision_is_false_no_exception(self, tmp_path):
+        """Unparseable model output → passed=False, no KeyError or exception."""
+        from eval_model import run_golden_eval
+        items = [{'prompt': 'Buy AAPL?', 'expected': 'buy', 'bot': 'stock'}]
+        gp = _golden_path(tmp_path, items)
+        bp = tmp_path / 'no_baseline.json'
+
+        import model_inference_lora as mil
+        orig = mil.__dict__.get('get_trading_decision')
+        mil.get_trading_decision = lambda p, temperature=0.7, **kw: \
+            'Sorry, I cannot process this request.'
+        try:
+            result = run_golden_eval(None, gp, bp)
+        finally:
+            _unpatch_model(mil, orig)
+
+        item = result['per_item'][0]
+        assert item['passed'] is False
+        assert item.get('error') is None  # no exception stored
+
+    def test_extract_decision_lowercases_uppercase_options_input(self):
+        """_extract_decision handles the model's uppercase BUY_CALL / BUY_PUT output."""
+        from eval_model import _extract_decision
+        assert _extract_decision('Decision: BUY_CALL\nConfidence: 0.80\nReasoning: r') == 'buy_call'
+        assert _extract_decision('Decision: BUY_PUT\nConfidence: 0.78\nReasoning: r')  == 'buy_put'
 
     def test_no_baseline_no_veto(self, tmp_path):
         """When baseline is absent, golden_veto is always False regardless of pass_rate."""
