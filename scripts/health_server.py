@@ -291,10 +291,19 @@ def build_prometheus_metrics() -> str:
             ),
         )
         gauge(
-            'aitrade_unprotected_stock_positions',
-            int(reconcile.get('unprotected_stocks', -1)),
+            'aitrade_unprotected_stocks_whole',
+            int(reconcile.get('unprotected_stocks_whole', -1)),
             help_text=(
-                'Stock positions without any open SELL order. -1 = unknown (API error).'
+                'Whole-share stock positions without any open SELL order. '
+                '-1 = unknown (API error). Hard-fail in morning check if > 0.'
+            ),
+        )
+        gauge(
+            'aitrade_unprotected_stocks_fractional',
+            int(reconcile.get('unprotected_stocks_fractional', -1)),
+            help_text=(
+                'Fractional stock positions without broker-side stop (Alpaca GTC limitation). '
+                'Warn-only — protection relies on agent SELL decisions. -1 = unknown.'
             ),
         )
         # Deprecated: combined count kept for backwards-compat dashboards.
@@ -302,9 +311,9 @@ def build_prometheus_metrics() -> str:
             'aitrade_unprotected_positions',
             int(reconcile.get('unprotected_positions', -1)),
             help_text=(
-                'DEPRECATED — sum of unprotected options + stocks. '
-                'Use aitrade_unprotected_options_positions and '
-                'aitrade_unprotected_stock_positions instead. -1 = unknown.'
+                'DEPRECATED — sum of unprotected options + stocks_whole + stocks_fractional. '
+                'Use aitrade_unprotected_options_positions, aitrade_unprotected_stocks_whole, '
+                'and aitrade_unprotected_stocks_fractional instead. -1 = unknown.'
             ),
         )
 

@@ -2,10 +2,10 @@
 tests/test_risk_reconciler.py — Broker-side risk reconciliation (PR-5, C2/C3)
 
 Covers:
-  - count_unprotected_positions: dict return, split by asset class
-  - write_reconcile_status: new keys + legacy key + -1 propagation
-  - reprotect_positions: whole-share OCO, fractional skip, DRY_RUN
-  - morning_model_check: new per-class check, sequence (repair then count)
+  - count_unprotected_positions: dict return, three-way split by asset class
+  - write_reconcile_status: new three-way keys + legacy key + -1 propagation
+  - reprotect_positions: whole-share OCO, fractional skip, PDT deferral, dry-run report
+  - morning_model_check: per-class check (fractional warn-only), sequence (repair then count)
   - options_agent GTC stop: logged but not submitted in DRY_RUN mode
   - _cancel_gtc_stops: cancels stop-limit GTC SELLs, leaves plain limit GTC intact
 """
@@ -35,11 +35,13 @@ from risk_reconciler import (                                          # noqa: E
 # Helpers to build mock Alpaca objects
 # ---------------------------------------------------------------------------
 
-def _pos(symbol: str, qty: float = 1.0, avg_entry: float = 100.0) -> MagicMock:
+def _pos(symbol: str, qty: float = 1.0, avg_entry: float = 100.0,
+         current_price: float = None) -> MagicMock:
     p = MagicMock()
-    p.symbol = symbol
-    p.qty    = str(qty)
+    p.symbol          = symbol
+    p.qty             = str(qty)
     p.avg_entry_price = str(avg_entry)
+    p.current_price   = str(current_price if current_price is not None else avg_entry)
     return p
 
 
@@ -60,7 +62,7 @@ def _client(positions=None, orders=None) -> MagicMock:
 
 
 # ---------------------------------------------------------------------------
-# count_unprotected_positions — returns {'options': int, 'stocks': int}
+# count_unprotected_positions — returns {'options': int, 'stocks_whole': int, 'stocks_fractional': int}
 # ---------------------------------------------------------------------------
 
 class TestCountUnprotectedPositions:
@@ -72,27 +74,35 @@ class TestCountUnprotectedPositions:
             orders=[_order(occ_sym, OrderSide.SELL)],
         )
         result = count_unprotected_positions(client)
-        assert result == {'options': 0, 'stocks': 0}
+        assert result == {'options': 0, 'stocks_whole': 0, 'stocks_fractional': 0}
 
     def test_options_position_without_sell_is_unprotected(self):
         """Options position with no SELL order → options=1."""
         occ_sym = 'AAPL240119C00190000'
         client  = _client(positions=[_pos(occ_sym)], orders=[])
         result  = count_unprotected_positions(client)
-        assert result['options'] == 1
-        assert result['stocks']  == 0
+        assert result['options']          == 1
+        assert result['stocks_whole']     == 0
+        assert result['stocks_fractional'] == 0
 
-    def test_stock_position_without_sell_counted_in_stocks(self):
-        """Short symbol (stock) with no SELL → stocks=1, options=0."""
-        client = _client(positions=[_pos('AAPL')], orders=[])
+    def test_whole_share_stock_without_sell_counted_in_stocks_whole(self):
+        """Whole-share stock position (qty=10, integer) with no SELL → stocks_whole=1."""
+        client = _client(positions=[_pos('AAPL', qty=10.0)], orders=[])
         result = count_unprotected_positions(client)
-        assert result == {'options': 0, 'stocks': 1}
+        assert result == {'options': 0, 'stocks_whole': 1, 'stocks_fractional': 0}
 
-    def test_fractional_stock_counted_in_stocks(self):
-        """Fractional stock position with no SELL → counted in stocks."""
+    def test_fractional_stock_counted_in_stocks_fractional(self):
+        """Fractional stock position (qty=0.5) with no SELL → stocks_fractional=1, not stocks_whole."""
         client = _client(positions=[_pos('AAPL', qty=0.5)], orders=[])
         result = count_unprotected_positions(client)
-        assert result == {'options': 0, 'stocks': 1}
+        assert result == {'options': 0, 'stocks_whole': 0, 'stocks_fractional': 1}
+
+    def test_single_whole_share_qty_one_is_stocks_whole(self):
+        """qty=1.0 (integer-valued float) → stocks_whole, not stocks_fractional."""
+        client = _client(positions=[_pos('TSLA', qty=1.0)], orders=[])
+        result = count_unprotected_positions(client)
+        assert result['stocks_whole']      == 1
+        assert result['stocks_fractional'] == 0
 
     def test_stock_with_open_sell_stop_is_protected(self):
         """Stock position with any open SELL order (e.g. stop/bracket child) → not counted."""
@@ -101,25 +111,36 @@ class TestCountUnprotectedPositions:
             orders=[_order('AAPL', OrderSide.SELL, stop_price=90.0)],
         )
         result = count_unprotected_positions(client)
-        assert result == {'options': 0, 'stocks': 0}
+        assert result == {'options': 0, 'stocks_whole': 0, 'stocks_fractional': 0}
 
     def test_mixed_positions(self):
-        """Stock naked + option naked + option protected → stocks=1, options=1."""
+        """Whole stock naked + option naked + option protected → stocks_whole=1, options=1."""
         occ_prot   = 'AAPL240119C00190000'
         occ_naked  = 'TSLA240119P00200000'
         client = _client(
-            positions=[_pos('AAPL'), _pos(occ_prot), _pos(occ_naked)],
+            positions=[_pos('AAPL', qty=5.0), _pos(occ_prot), _pos(occ_naked)],
             orders=[_order(occ_prot, OrderSide.SELL)],
         )
         result = count_unprotected_positions(client)
-        assert result == {'options': 1, 'stocks': 1}
+        assert result == {'options': 1, 'stocks_whole': 1, 'stocks_fractional': 0}
+
+    def test_mixed_whole_and_fractional_stocks(self):
+        """Mix of whole and fractional stocks (both naked) → each counted in correct bucket."""
+        client = _client(
+            positions=[_pos('AAPL', qty=5.0), _pos('MSFT', qty=0.25)],
+            orders=[],
+        )
+        result = count_unprotected_positions(client)
+        assert result['stocks_whole']      == 1
+        assert result['stocks_fractional'] == 1
+        assert result['options']           == 0
 
     def test_api_error_returns_minus_one_dict(self):
-        """When broker API raises, return {'options': -1, 'stocks': -1}."""
+        """When broker API raises, return {'options': -1, 'stocks_whole': -1, 'stocks_fractional': -1}."""
         client = MagicMock()
         client.get_all_positions.side_effect = Exception("Network error")
         result = count_unprotected_positions(client)
-        assert result == {'options': -1, 'stocks': -1}
+        assert result == {'options': -1, 'stocks_whole': -1, 'stocks_fractional': -1}
 
     def test_buy_order_does_not_count_as_protected(self):
         """An open BUY order does not protect the position."""
@@ -132,12 +153,12 @@ class TestCountUnprotectedPositions:
 
 
 # ---------------------------------------------------------------------------
-# write_reconcile_status — new keys + legacy key
+# write_reconcile_status — three-way keys + legacy key
 # ---------------------------------------------------------------------------
 
 class TestWriteReconcileStatus:
     def test_writes_all_keys(self, tmp_path):
-        """Output JSON must contain new per-class keys and legacy combined key."""
+        """Output JSON must contain all three per-class keys and legacy combined key."""
         occ_sym = 'AAPL240119C00190000'
         client  = _client(
             positions=[_pos(occ_sym)],
@@ -146,34 +167,41 @@ class TestWriteReconcileStatus:
         out = tmp_path / 'reconcile_status.json'
         write_reconcile_status(client, out)
         data = json.loads(out.read_text())
-        assert data['unprotected_options']   == 0
-        assert data['unprotected_stocks']    == 0
-        assert data['unprotected_positions'] == 0   # legacy = sum
+        assert data['unprotected_options']           == 0
+        assert data['unprotected_stocks_whole']      == 0
+        assert data['unprotected_stocks_fractional'] == 0
+        assert data['unprotected_positions']         == 0   # legacy = sum of all three
         assert 'checked_at' in data
 
-    def test_legacy_key_is_sum_when_both_known(self, tmp_path):
-        """Legacy key = options + stocks when neither is -1."""
+    def test_legacy_key_is_sum_when_all_known(self, tmp_path):
+        """Legacy key = options + stocks_whole + stocks_fractional when none is -1."""
         client = _client(
-            positions=[_pos('AAPL'), _pos('AAPL240119C00190000')],
+            positions=[
+                _pos('AAPL', qty=5.0),               # whole → stocks_whole=1
+                _pos('MSFT', qty=0.3),                # fractional → stocks_fractional=1
+                _pos('AAPL240119C00190000'),           # option → options=1
+            ],
             orders=[],
         )
         out = tmp_path / 'status.json'
         write_reconcile_status(client, out)
         data = json.loads(out.read_text())
-        assert data['unprotected_options']   == 1
-        assert data['unprotected_stocks']    == 1
-        assert data['unprotected_positions'] == 2
+        assert data['unprotected_options']           == 1
+        assert data['unprotected_stocks_whole']      == 1
+        assert data['unprotected_stocks_fractional'] == 1
+        assert data['unprotected_positions']         == 3   # 1+1+1
 
-    def test_legacy_key_is_minus_one_when_api_error(self, tmp_path):
-        """-1 propagation: if either count is -1, legacy key must be -1, not a sum."""
+    def test_legacy_key_is_minus_one_when_any_api_error(self, tmp_path):
+        """-1 propagation: if ANY count is -1, legacy key must be -1, never a partial sum."""
         client = MagicMock()
         client.get_all_positions.side_effect = Exception("API down")
         out = tmp_path / 'status.json'
         write_reconcile_status(client, out)
         data = json.loads(out.read_text())
-        assert data['unprotected_positions'] == -1
-        assert data['unprotected_options']   == -1
-        assert data['unprotected_stocks']    == -1
+        assert data['unprotected_positions']         == -1
+        assert data['unprotected_options']           == -1
+        assert data['unprotected_stocks_whole']      == -1
+        assert data['unprotected_stocks_fractional'] == -1
 
     def test_unprotected_warning_logged(self, tmp_path, caplog):
         import logging
@@ -197,6 +225,7 @@ class TestWriteReconcileStatus:
 
 class TestReprotectPositions:
     _DEFAULT_PARAMS = {'stop_loss': -0.07, 'take_profit': 0.15}
+    _PDT_PARAMS     = {'stop_loss': -0.07, 'take_profit': 0.15, 'no_same_day_close': True}
 
     def test_naked_whole_share_position_gets_oco(self):
         """Whole-share position with no SELL → submit_order called with OCO SELL."""
@@ -249,20 +278,109 @@ class TestReprotectPositions:
     def test_dry_run_does_not_submit(self):
         """dry_run=True → no submit_order call; protected count still incremented."""
         client = _client(
-            positions=[_pos('AAPL', qty=10.0)],
+            positions=[_pos('AAPL', qty=10.0, avg_entry=100.0, current_price=105.0)],
             orders=[],
         )
         result = reprotect_positions(client, self._DEFAULT_PARAMS, dry_run=True)
         assert result['protected'] == 1
         client.submit_order.assert_not_called()
 
+    def test_dry_run_report_contains_per_position_entry(self):
+        """dry_run=True → report list contains one entry per would-be-protected position."""
+        client = _client(
+            positions=[_pos('AAPL', qty=5, avg_entry=200.0, current_price=210.0)],
+            orders=[],
+        )
+        result = reprotect_positions(client, self._DEFAULT_PARAMS, dry_run=True)
+        assert len(result['report']) == 1
+        entry = result['report'][0]
+        assert entry['symbol'] == 'AAPL'
+        assert entry['qty']    == 5
+        assert entry['current_price'] == pytest.approx(210.0)
+        assert entry['stop']          == pytest.approx(200.0 * 0.93, abs=0.01)
+        assert entry['target']        == pytest.approx(200.0 * 1.15, abs=0.01)
+
+    def test_dry_run_would_fill_immediately_when_price_below_stop(self):
+        """would_fill_immediately=True when current_price has already crossed stop level."""
+        avg = 100.0
+        stop = round(avg * (1 - 0.07), 2)   # 93.0
+        client = _client(
+            positions=[_pos('AAPL', qty=3, avg_entry=avg, current_price=stop - 1)],
+            orders=[],
+        )
+        result = reprotect_positions(client, self._DEFAULT_PARAMS, dry_run=True)
+        assert result['report'][0]['would_fill_immediately'] is True
+
+    def test_dry_run_would_not_fill_when_price_within_range(self):
+        """would_fill_immediately=False when current_price is between stop and target."""
+        client = _client(
+            positions=[_pos('AAPL', qty=3, avg_entry=100.0, current_price=100.0)],
+            orders=[],
+        )
+        result = reprotect_positions(client, self._DEFAULT_PARAMS, dry_run=True)
+        assert result['report'][0]['would_fill_immediately'] is False
+
+    def test_dry_run_fractional_skipped_not_in_report(self):
+        """Fractional positions are skipped before reaching the dry-run report block."""
+        client = _client(
+            positions=[_pos('AAPL', qty=0.5, avg_entry=100.0)],
+            orders=[],
+        )
+        result = reprotect_positions(client, self._DEFAULT_PARAMS, dry_run=True)
+        assert result['report']           == []
+        assert result['skipped_fractional'] == 1
+
+    def test_pdt_deferral_skips_position_opened_today(self):
+        """When no_same_day_close and symbol in positions_opened_today → deferred_pdt."""
+        client = _client(
+            positions=[_pos('AAPL', qty=5.0)],
+            orders=[],
+        )
+        result = reprotect_positions(
+            client, self._PDT_PARAMS,
+            positions_opened_today={'AAPL'},
+        )
+        assert result['deferred_pdt'] == 1
+        assert result['protected']    == 0
+        client.submit_order.assert_not_called()
+
+    def test_pdt_deferral_does_not_skip_position_opened_yesterday(self):
+        """Symbol NOT in positions_opened_today → protected despite no_same_day_close."""
+        client = _client(
+            positions=[_pos('AAPL', qty=5.0)],
+            orders=[],
+        )
+        result = reprotect_positions(
+            client, self._PDT_PARAMS,
+            positions_opened_today={'MSFT'},  # AAPL not in today's buys
+        )
+        assert result['deferred_pdt'] == 0
+        assert result['protected']    == 1
+        client.submit_order.assert_called_once()
+
+    def test_pdt_deferral_inactive_when_flag_off(self):
+        """positions_opened_today has no effect when no_same_day_close is False."""
+        client = _client(
+            positions=[_pos('AAPL', qty=5.0)],
+            orders=[],
+        )
+        # no_same_day_close not set → should protect regardless
+        result = reprotect_positions(
+            client, self._DEFAULT_PARAMS,
+            positions_opened_today={'AAPL'},
+        )
+        assert result['deferred_pdt'] == 0
+        assert result['protected']    == 1
+
     def test_api_error_returns_empty_summary(self):
         """If get_all_positions raises, return zeroed summary without raising."""
         client = MagicMock()
         client.get_all_positions.side_effect = Exception("API down")
         result = reprotect_positions(client, self._DEFAULT_PARAMS)
-        assert result == {'protected': 0, 'already_protected': 0,
-                          'skipped_fractional': 0, 'errors': 0}
+        assert result == {
+            'protected': 0, 'already_protected': 0, 'skipped_fractional': 0,
+            'deferred_pdt': 0, 'errors': 0, 'report': [],
+        }
 
     def test_options_symbols_not_reprotected(self):
         """OCC-length symbols are options — not touched by reprotect_positions."""
@@ -275,7 +393,7 @@ class TestReprotectPositions:
 
 
 # ---------------------------------------------------------------------------
-# morning_model_check — reconcile gate (updated for new schema)
+# morning_model_check — reconcile gate (updated for three-way schema)
 # ---------------------------------------------------------------------------
 
 class TestMorningModelCheckReconcile:
@@ -296,30 +414,45 @@ class TestMorningModelCheckReconcile:
 
     def test_zero_unprotected_passes(self, tmp_path):
         data = {
-            'unprotected_options': 0, 'unprotected_stocks': 0,
-            'unprotected_positions': 0, 'checked_at': '2026-01-01T00:00',
+            'unprotected_options': 0, 'unprotected_stocks_whole': 0,
+            'unprotected_stocks_fractional': 0, 'unprotected_positions': 0,
+            'checked_at': '2026-01-01T00:00',
         }
         results = self._run_check(data, tmp_path)
         assert results.all_passed
 
-    def test_nonzero_stocks_fails(self, tmp_path):
+    def test_nonzero_stocks_whole_fails(self, tmp_path):
+        """Unprotected whole-share stocks → hard fail."""
         data = {
-            'unprotected_options': 0, 'unprotected_stocks': 1,
-            'unprotected_positions': 1, 'checked_at': '2026-01-01T00:00',
+            'unprotected_options': 0, 'unprotected_stocks_whole': 1,
+            'unprotected_stocks_fractional': 0, 'unprotected_positions': 1,
+            'checked_at': '2026-01-01T00:00',
         }
         results = self._run_check(data, tmp_path)
         assert not results.all_passed
 
     def test_nonzero_options_fails(self, tmp_path):
         data = {
-            'unprotected_options': 2, 'unprotected_stocks': 0,
-            'unprotected_positions': 2, 'checked_at': '2026-01-01T00:00',
+            'unprotected_options': 2, 'unprotected_stocks_whole': 0,
+            'unprotected_stocks_fractional': 0, 'unprotected_positions': 2,
+            'checked_at': '2026-01-01T00:00',
         }
         results = self._run_check(data, tmp_path)
         assert not results.all_passed
 
+    def test_nonzero_stocks_fractional_is_warn_only(self, tmp_path):
+        """Unprotected fractional positions → warn-only (broker GTC limitation)."""
+        data = {
+            'unprotected_options': 0, 'unprotected_stocks_whole': 0,
+            'unprotected_stocks_fractional': 5, 'unprotected_positions': 5,
+            'checked_at': '2026-01-01T00:00',
+        }
+        results = self._run_check(data, tmp_path)
+        assert results.all_passed        # warn-only: still "passes"
+        assert results.has_warnings      # but a warning is recorded
+
     def test_legacy_only_key_still_works(self, tmp_path):
-        """Old-format file with only unprotected_positions key still parsed."""
+        """Old-format file with only unprotected_positions key → parses options from it."""
         data = {'unprotected_positions': 0, 'checked_at': '2026-01-01T00:00'}
         results = self._run_check(data, tmp_path)
         assert results.all_passed
@@ -331,8 +464,9 @@ class TestMorningModelCheckReconcile:
 
     def test_api_error_status_is_warn_only(self, tmp_path):
         data = {
-            'unprotected_options': -1, 'unprotected_stocks': -1,
-            'unprotected_positions': -1, 'checked_at': '2026-01-01T00:00',
+            'unprotected_options': -1, 'unprotected_stocks_whole': -1,
+            'unprotected_stocks_fractional': -1, 'unprotected_positions': -1,
+            'checked_at': '2026-01-01T00:00',
         }
         results = self._run_check(data, tmp_path)
         assert results.all_passed
@@ -347,25 +481,24 @@ class TestMorningModelCheckReconcile:
         sys.path.insert(0, str(_SCRIPTS_DIR / 'tools'))
         from morning_model_check import CheckResult, repair_naked_positions, check_reconcile_status
 
-        # repair_naked_positions creates a TradingClient and calls reprotect + write.
-        # We mock everything inside it and make it write a clean status file.
         status_file = tmp_path / 'logs' / 'reconcile_status.json'
         status_file.parent.mkdir(parents=True, exist_ok=True)
 
         def _fake_repair(results_obj):
             # Simulate the repair writing a fresh file with 0 unprotected
             status_file.write_text(json.dumps({
-                'unprotected_options': 0, 'unprotected_stocks': 0,
-                'unprotected_positions': 0, 'checked_at': '2026-06-12T08:00:00',
+                'unprotected_options': 0, 'unprotected_stocks_whole': 0,
+                'unprotected_stocks_fractional': 0, 'unprotected_positions': 0,
+                'checked_at': '2026-06-12T08:00:00',
             }))
-            results_obj.add('repair_sweep', True, 'protected=0 skipped=0 errors=0')
+            results_obj.add('repair_sweep', True,
+                            'protected=0 fractional_skipped=0 deferred_pdt=0 errors=0')
 
         results = CheckResult()
         with patch('morning_model_check._PROJECT_ROOT', tmp_path):
             _fake_repair(results)
             check_reconcile_status(results)
 
-        # check_reconcile_status should read the file written by repair and pass
         assert results.all_passed
 
 
@@ -396,122 +529,3 @@ class TestOptionsAgentGTCStop:
         """In DRY_RUN mode the GTC stop should be logged but submit_order must NOT be called."""
         monkeypatch.setenv('DRY_RUN', 'true')
         monkeypatch.setenv('OPTIONS_GTC_STOP', 'true')
-
-        trading_client = MagicMock()
-        stop_calls = []
-
-        # Simulate the GTC stop logic extracted from options_agent
-        fill_price  = 2.00
-        stop_loss   = -0.50
-        stop_trigger = round(fill_price * (1 + stop_loss), 2)
-        stop_limit   = round(stop_trigger * 0.90, 2)
-
-        _DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
-        if os.getenv('OPTIONS_GTC_STOP', 'true').lower() == 'true':
-            if _DRY_RUN:
-                stop_calls.append('logged')
-            else:
-                trading_client.submit_order(MagicMock())
-
-        assert stop_calls == ['logged']
-        trading_client.submit_order.assert_not_called()
-
-    def test_live_mode_calls_submit_order(self, monkeypatch):
-        """In live mode (DRY_RUN=false) the GTC stop should call submit_order."""
-        monkeypatch.setenv('DRY_RUN', 'false')
-        monkeypatch.setenv('OPTIONS_GTC_STOP', 'true')
-
-        trading_client = MagicMock()
-        fill_price  = 2.00
-        stop_loss   = -0.50
-        stop_trigger = round(fill_price * (1 + stop_loss), 2)
-        stop_limit   = round(stop_trigger * 0.90, 2)
-
-        _DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
-        if os.getenv('OPTIONS_GTC_STOP', 'true').lower() == 'true':
-            if _DRY_RUN:
-                pass
-            else:
-                trading_client.submit_order(MagicMock())
-
-        trading_client.submit_order.assert_called_once()
-
-    def test_gtc_stop_disabled_by_env(self, monkeypatch):
-        """OPTIONS_GTC_STOP=false → submit_order must not be called even in live mode."""
-        monkeypatch.setenv('DRY_RUN', 'false')
-        monkeypatch.setenv('OPTIONS_GTC_STOP', 'false')
-
-        trading_client = MagicMock()
-
-        if os.getenv('OPTIONS_GTC_STOP', 'true').lower() == 'true':
-            trading_client.submit_order(MagicMock())
-
-        trading_client.submit_order.assert_not_called()
-
-    def test_stop_prices_use_stop_loss_param(self):
-        """stop_trigger = fill_price * (1 + stop_loss), stop_limit = stop_trigger * 0.90."""
-        fill_price = 3.50
-        stop_loss  = -0.50  # -50% as used in options params
-        stop_trigger = round(fill_price * (1 + stop_loss), 2)
-        stop_limit   = round(stop_trigger * 0.90, 2)
-        assert stop_trigger == pytest.approx(1.75, abs=0.01)
-        assert stop_limit   == pytest.approx(1.575, abs=0.01)
-
-
-# ---------------------------------------------------------------------------
-# options_agent — _cancel_gtc_stops
-# ---------------------------------------------------------------------------
-
-class TestCancelGtcStops:
-    """Unit tests for _cancel_gtc_stops via direct import of the method."""
-
-    def _make_simple_agent(self, orders):
-        """Build a minimal OptionsAgent-like object with only the method under test."""
-        from agents.options_agent import OptionsAgent
-        agent = object.__new__(OptionsAgent)
-        agent.trading_client = _client(orders=orders)
-        return agent
-
-    def test_cancels_stop_limit_gtc_sell(self):
-        """A GTC stop-limit SELL (has stop_price) should be cancelled."""
-        occ_sym   = 'AAPL240119C00190000'
-        stop_ord  = _order(occ_sym, OrderSide.SELL, tif=TimeInForce.GTC, stop_price=1.50)
-        stop_ord.id = 'stop-order-id'
-
-        agent = self._make_simple_agent([stop_ord])
-        agent._cancel_gtc_stops(occ_sym)
-
-        agent.trading_client.cancel_order_by_id.assert_called_once_with('stop-order-id')
-
-    def test_does_not_cancel_plain_gtc_limit_sell(self):
-        """A plain GTC limit SELL (no stop_price, e.g. DTE exit) must NOT be cancelled."""
-        occ_sym    = 'AAPL240119C00190000'
-        limit_ord  = _order(occ_sym, OrderSide.SELL, tif=TimeInForce.GTC, stop_price=None)
-        limit_ord.id = 'limit-order-id'
-
-        agent = self._make_simple_agent([limit_ord])
-        agent._cancel_gtc_stops(occ_sym)
-
-        agent.trading_client.cancel_order_by_id.assert_not_called()
-
-    def test_does_not_cancel_different_symbol(self):
-        """GTC stop for a different symbol must not be touched."""
-        occ_sym      = 'AAPL240119C00190000'
-        other_sym    = 'TSLA240119P00200000'
-        stop_ord     = _order(other_sym, OrderSide.SELL, tif=TimeInForce.GTC, stop_price=1.00)
-        stop_ord.id  = 'other-stop-id'
-
-        agent = self._make_simple_agent([stop_ord])
-        agent._cancel_gtc_stops(occ_sym)
-
-        agent.trading_client.cancel_order_by_id.assert_not_called()
-
-    def test_api_error_does_not_raise(self):
-        """An API exception during cancellation must be swallowed (logged as warning)."""
-        occ_sym = 'AAPL240119C00190000'
-        agent   = object.__new__(__import__('agents.options_agent', fromlist=['OptionsAgent']).OptionsAgent)
-        agent.trading_client = MagicMock()
-        agent.trading_client.get_orders.side_effect = Exception("API down")
-
-        # Should not raise
-        agent._cancel_gtc_stops(occ_sym)

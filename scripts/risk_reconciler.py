@@ -3,7 +3,7 @@
 risk_reconciler.py — Detect and repair unprotected positions.
 
 Three responsibilities:
-  1. count_unprotected_positions  — returns {'options': int, 'stocks': int}
+  1. count_unprotected_positions  — returns {'options': int, 'stocks_whole': int, 'stocks_fractional': int}
   2. write_reconcile_status       — writes JSON snapshot for health monitoring
   3. reprotect_positions          — attaches GTC OCO exits to naked stock positions
 
@@ -14,6 +14,7 @@ Broker API limitation (confirmed 2026-06-12):
 
 Usage (standalone):
     python3 scripts/risk_reconciler.py
+    python3 scripts/risk_reconciler.py --dry-run   # eyeball report before real run
 """
 import json
 import logging
@@ -33,7 +34,7 @@ _DEFAULT_STATUS_PATH = _PROJECT_ROOT / 'logs' / 'reconcile_status.json'
 def count_unprotected_positions(trading_client) -> dict:
     """Count positions without any open SELL order, split by asset class.
 
-    Returns {'options': int, 'stocks': int}.
+    Returns {'options': int, 'stocks_whole': int, 'stocks_fractional': int}.
     Each value is -1 independently when the broker API is unavailable so callers
     can distinguish "zero unprotected" from "unknown state."
     """
@@ -46,51 +47,67 @@ def count_unprotected_positions(trading_client) -> dict:
 
         protected = {o.symbol for o in open_orders if o.side == OrderSide.SELL}
 
-        options_unprotected = sum(
-            1 for p in positions
-            if len(p.symbol) > 10 and p.symbol not in protected
-        )
-        stocks_unprotected = sum(
-            1 for p in positions
-            if len(p.symbol) <= 10 and p.symbol not in protected
-        )
-        return {'options': options_unprotected, 'stocks': stocks_unprotected}
+        options_unprotected = 0
+        stocks_whole        = 0
+        stocks_fractional   = 0
+
+        for p in positions:
+            sym = p.symbol
+            qty = float(p.qty)
+            if len(sym) > 10:
+                if sym not in protected:
+                    options_unprotected += 1
+            else:
+                if sym not in protected:
+                    if qty == int(qty) and int(qty) > 0:
+                        stocks_whole += 1
+                    else:
+                        stocks_fractional += 1
+
+        return {
+            'options':          options_unprotected,
+            'stocks_whole':     stocks_whole,
+            'stocks_fractional': stocks_fractional,
+        }
     except Exception as e:
         logging.warning("Could not count unprotected positions: %s", e)
-        return {'options': -1, 'stocks': -1}
+        return {'options': -1, 'stocks_whole': -1, 'stocks_fractional': -1}
 
 
 def write_reconcile_status(trading_client, path: Path = _DEFAULT_STATUS_PATH) -> None:
     """Write unprotected position counts and timestamp to *path* as JSON.
 
     Schema:
-      unprotected_options   — options positions without a SELL order (-1 = API error)
-      unprotected_stocks    — stock positions without a SELL order (-1 = API error)
-      unprotected_positions — deprecated legacy key; -1 if either count is -1, else sum
-      checked_at            — ISO timestamp
+      unprotected_options        — options positions without a SELL order (-1 = API error)
+      unprotected_stocks_whole   — whole-share stock positions without a SELL order (-1 = API error)
+      unprotected_stocks_fractional — fractional positions (always unprotectable, warn-only)
+      unprotected_positions      — deprecated legacy key; -1 if ANY count is -1, else sum of all three
+      checked_at                 — ISO timestamp
 
     Callers should wrap this in try/except so a broker API hiccup never blocks the
     trading session loop.
     """
     counts = count_unprotected_positions(trading_client)
-    n_opts = counts['options']
-    n_stk  = counts['stocks']
+    n_opts  = counts['options']
+    n_whole = counts['stocks_whole']
+    n_frac  = counts['stocks_fractional']
 
-    # Legacy key: -1 if either individual count is unknown; never sum with -1.
-    if n_opts == -1 or n_stk == -1:
+    # Legacy key: -1 if ANY individual count is unknown; never sum with -1.
+    if n_opts == -1 or n_whole == -1 or n_frac == -1:
         legacy = -1
     else:
-        legacy = n_opts + n_stk
+        legacy = n_opts + n_whole + n_frac
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
-        'unprotected_options':   n_opts,
-        'unprotected_stocks':    n_stk,
-        'unprotected_positions': legacy,
+        'unprotected_options':           n_opts,
+        'unprotected_stocks_whole':      n_whole,
+        'unprotected_stocks_fractional': n_frac,
+        'unprotected_positions':         legacy,  # deprecated: sum of all three
         'checked_at': datetime.now().isoformat(),
     }))
 
-    for label, n in (('options', n_opts), ('stocks', n_stk)):
+    for label, n in (('options', n_opts), ('stocks_whole', n_whole), ('stocks_fractional', n_frac)):
         if n > 0:
             logging.warning(
                 "⚠️  RECONCILE: %d unprotected %s position(s) — broker-side stop missing", n, label
@@ -101,7 +118,12 @@ def write_reconcile_status(trading_client, path: Path = _DEFAULT_STATUS_PATH) ->
             logging.warning("⚠️  RECONCILE: could not determine %s protection status (API error)", label)
 
 
-def reprotect_positions(trading_client, params: dict, dry_run: bool = False) -> dict:
+def reprotect_positions(
+    trading_client,
+    params: dict,
+    dry_run: bool = False,
+    positions_opened_today: 'set | None' = None,
+) -> dict:
     """Attach GTC OCO exit orders to naked stock positions.
 
     For whole-share quantities: submits a GTC OCO SELL (take_profit limit +
@@ -112,18 +134,31 @@ def reprotect_positions(trading_client, params: dict, dry_run: bool = False) -> 
     stop/stop-limit). These positions are counted in 'skipped_fractional' and
     logged; no broker-side order is submitted.
 
-    Returns a summary dict:
-      protected          — new OCO orders submitted
-      already_protected  — positions that already had a SELL order (skipped)
-      skipped_fractional — fractional positions (no GTC stop available)
-      errors             — positions where submit_order raised
+    When params['no_same_day_close'] is True and a symbol appears in
+    positions_opened_today, the position is deferred (counted in 'deferred_pdt')
+    to avoid same-day round-trip PDT violations.
+
+    When dry_run=True, no orders are submitted but the 'report' list in the
+    returned dict is populated with per-position details for human review:
+      {symbol, qty, current_price, stop, target, would_fill_immediately: bool}
+
+    Returns:
+      protected            — new OCO orders submitted (or would-be in dry_run)
+      already_protected    — positions that already had a SELL order (skipped)
+      skipped_fractional   — fractional positions (no GTC stop available)
+      deferred_pdt         — positions skipped due to same-day PDT deferral
+      errors               — positions where submit_order raised
+      report               — list of per-position dicts (dry_run=True only)
     """
     from alpaca.trading.requests import (
         GetOrdersRequest, LimitOrderRequest, StopLossRequest, TakeProfitRequest,
     )
     from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
-    summary = {'protected': 0, 'already_protected': 0, 'skipped_fractional': 0, 'errors': 0}
+    summary: dict = {
+        'protected': 0, 'already_protected': 0, 'skipped_fractional': 0,
+        'deferred_pdt': 0, 'errors': 0, 'report': [],
+    }
 
     try:
         positions   = trading_client.get_all_positions()
@@ -136,6 +171,7 @@ def reprotect_positions(trading_client, params: dict, dry_run: bool = False) -> 
 
     stop_loss_pct   = float(params.get('stop_loss',   -0.07))
     take_profit_pct = float(params.get('take_profit',  0.15))
+    no_same_day     = bool(params.get('no_same_day_close', False))
 
     for pos in positions:
         symbol = pos.symbol
@@ -146,10 +182,10 @@ def reprotect_positions(trading_client, params: dict, dry_run: bool = False) -> 
             summary['already_protected'] += 1
             continue
 
-        qty           = float(pos.qty)
-        avg_entry     = float(pos.avg_entry_price)
-        stop_price    = round(avg_entry * (1 + stop_loss_pct),   2)
-        target_price  = round(avg_entry * (1 + take_profit_pct), 2)
+        qty          = float(pos.qty)
+        avg_entry    = float(pos.avg_entry_price)
+        stop_price   = round(avg_entry * (1 + stop_loss_pct),   2)
+        target_price = round(avg_entry * (1 + take_profit_pct), 2)
 
         is_fractional = (qty != int(qty))
         if is_fractional:
@@ -161,10 +197,32 @@ def reprotect_positions(trading_client, params: dict, dry_run: bool = False) -> 
             summary['skipped_fractional'] += 1
             continue
 
-        if dry_run:
+        # PDT deferral: skip positions opened today when same-day close is disallowed.
+        if no_same_day and positions_opened_today and symbol in positions_opened_today:
             logging.info(
-                "[DRY RUN] Would submit GTC OCO SELL %d %s — stop=$%.2f target=$%.2f",
-                int(qty), symbol, stop_price, target_price,
+                "⏭️  REPROTECT: deferring %s (opened today, no_same_day_close active)", symbol
+            )
+            summary['deferred_pdt'] += 1
+            continue
+
+        if dry_run:
+            try:
+                current_price = float(pos.current_price)
+            except Exception:
+                current_price = avg_entry
+            would_fill = current_price <= stop_price or current_price >= target_price
+            summary['report'].append({
+                'symbol':               symbol,
+                'qty':                  int(qty),
+                'current_price':        current_price,
+                'stop':                 stop_price,
+                'target':               target_price,
+                'would_fill_immediately': would_fill,
+            })
+            logging.info(
+                "[DRY RUN] Would submit GTC OCO SELL %d %s — stop=$%.2f target=$%.2f "
+                "(current=$%.2f would_fill_immediately=%s)",
+                int(qty), symbol, stop_price, target_price, current_price, would_fill,
             )
             summary['protected'] += 1
             continue
@@ -198,7 +256,13 @@ def reprotect_positions(trading_client, params: dict, dry_run: bool = False) -> 
 
 def main():
     import os
+    import argparse
     from alpaca.trading.client import TradingClient
+
+    parser = argparse.ArgumentParser(description='Risk reconciler — count and repair naked positions')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Show what would be submitted without placing orders')
+    args = parser.parse_args()
 
     api_key = os.getenv('ALPACA_API_KEY') or os.getenv('APCA_API_KEY_ID', '')
     secret  = os.getenv('ALPACA_SECRET_KEY') or os.getenv('APCA_API_SECRET_KEY', '')
@@ -209,9 +273,30 @@ def main():
         sys.exit(1)
 
     client = TradingClient(api_key, secret, paper=paper)
-    write_reconcile_status(client, _DEFAULT_STATUS_PATH)
-    data = json.loads(_DEFAULT_STATUS_PATH.read_text())
-    print(json.dumps(data, indent=2))
+
+    if args.dry_run:
+        params = {
+            'stop_loss':   float(os.getenv('STOP_LOSS_PCT',   '-0.07')),
+            'take_profit': float(os.getenv('TAKE_PROFIT_PCT',  '0.15')),
+        }
+        summary = reprotect_positions(client, params, dry_run=True)
+        print(f"\nDry-run report ({len(summary['report'])} positions would be protected):\n")
+        for entry in summary['report']:
+            flag = ' ⚠️  WOULD FILL' if entry['would_fill_immediately'] else ''
+            print(
+                f"  {entry['symbol']:12s}  qty={entry['qty']:4d}  "
+                f"cur=${entry['current_price']:8.2f}  "
+                f"stop=${entry['stop']:8.2f}  target=${entry['target']:8.2f}{flag}"
+            )
+        print(f"\nSummary: protected={summary['protected']}  "
+              f"already_protected={summary['already_protected']}  "
+              f"skipped_fractional={summary['skipped_fractional']}  "
+              f"deferred_pdt={summary['deferred_pdt']}  "
+              f"errors={summary['errors']}")
+    else:
+        write_reconcile_status(client, _DEFAULT_STATUS_PATH)
+        data = json.loads(_DEFAULT_STATUS_PATH.read_text())
+        print(json.dumps(data, indent=2))
 
 
 if __name__ == '__main__':

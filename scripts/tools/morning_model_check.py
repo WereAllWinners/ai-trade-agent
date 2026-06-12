@@ -235,6 +235,7 @@ def repair_naked_positions(results: CheckResult) -> None:
             'repair_sweep', True,
             f"Repair sweep: protected={summary['protected']} "
             f"fractional_skipped={summary['skipped_fractional']} "
+            f"deferred_pdt={summary['deferred_pdt']} "
             f"errors={summary['errors']}",
         )
     except Exception as e:
@@ -244,7 +245,12 @@ def repair_naked_positions(results: CheckResult) -> None:
 
 
 def check_reconcile_status(results: CheckResult) -> None:
-    """Verify no unprotected positions remain after the repair sweep."""
+    """Verify no unprotected positions remain after the repair sweep.
+
+    Hard fail: options > 0 or stocks_whole > 0 (these must have broker-side stops).
+    Warn-only: stocks_fractional > 0 (GTC stop unsupported for fractional — known limitation).
+    Warn-only: any count == -1 (API unavailable at check time).
+    """
     status_path = _PROJECT_ROOT / 'logs' / 'reconcile_status.json'
     if not status_path.exists():
         results.add(
@@ -257,26 +263,52 @@ def check_reconcile_status(results: CheckResult) -> None:
         data = json.loads(status_path.read_text())
         checked_at = data.get('checked_at', 'unknown')
 
-        # Read new per-class keys; fall back to legacy combined key for old files.
-        n_opts = int(data.get('unprotected_options',
-                              data.get('unprotected_positions', -1)))
-        n_stk  = int(data.get('unprotected_stocks', -1))
+        # Prefer the three-way split keys; fall back to legacy for old-format files.
+        n_opts  = int(data.get('unprotected_options',
+                               data.get('unprotected_positions', -1)))
+        n_whole = int(data.get('unprotected_stocks_whole', -1))
+        n_frac  = int(data.get('unprotected_stocks_fractional', -1))
 
-        for label, n in (('options', n_opts), ('stocks', n_stk)):
-            if n < 0:
-                results.add(
-                    f'reconcile_{label}', False,
-                    f'Could not determine {label} protection status (API error) '
-                    f'— checked at {checked_at}',
-                    warn_only=True,
-                )
-            else:
-                detail = (
-                    f'{n} unprotected {label} position(s) — checked at {checked_at}'
-                    if n > 0
-                    else f'all {label} positions protected — checked at {checked_at}'
-                )
-                results.add(f'reconcile_{label}', n == 0, detail)
+        # options: hard fail if > 0
+        if n_opts < 0:
+            results.add('reconcile_options', False,
+                        f'Could not determine options protection status (API error) '
+                        f'— checked at {checked_at}', warn_only=True)
+        else:
+            detail = (
+                f'{n_opts} unprotected options position(s) — checked at {checked_at}'
+                if n_opts > 0
+                else f'all options positions protected — checked at {checked_at}'
+            )
+            results.add('reconcile_options', n_opts == 0, detail)
+
+        # stocks_whole: hard fail if > 0
+        if n_whole < 0:
+            results.add('reconcile_stocks_whole', False,
+                        f'Could not determine whole-share stock protection status (API error) '
+                        f'— checked at {checked_at}', warn_only=True)
+        else:
+            detail = (
+                f'{n_whole} unprotected whole-share stock position(s) — checked at {checked_at}'
+                if n_whole > 0
+                else f'all whole-share stocks protected — checked at {checked_at}'
+            )
+            results.add('reconcile_stocks_whole', n_whole == 0, detail)
+
+        # stocks_fractional: always warn-only (Alpaca GTC limitation)
+        if n_frac < 0:
+            results.add('reconcile_stocks_fractional', False,
+                        f'Could not determine fractional stock protection status (API error) '
+                        f'— checked at {checked_at}', warn_only=True)
+        elif n_frac > 0:
+            results.add('reconcile_stocks_fractional', False,
+                        f'{n_frac} fractional position(s) unprotected (broker GTC stop '
+                        f'unsupported — agent SELL is the backstop) — checked at {checked_at}',
+                        warn_only=True)
+        else:
+            results.add('reconcile_stocks_fractional', True,
+                        f'no unprotected fractional positions — checked at {checked_at}')
+
     except Exception as e:
         results.add('reconcile_status', False,
                     f'Could not read reconcile_status.json: {e}',
