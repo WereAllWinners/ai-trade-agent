@@ -299,6 +299,14 @@ You are an expert financial trading advisor with knowledge from the world's best
         try:
             print(f"\n🔀 Merging LoRA → BF16 for vLLM serving: {merged_dir}")
             model.save_pretrained_merged(merged_dir, tokenizer, save_method="merged_16bit")
+            # Verify the dir was actually written — unsloth can return without raising
+            # when the base model is bitsandbytes-quantized and the merge fails internally.
+            if not Path(merged_dir).is_dir():
+                raise RuntimeError(
+                    f"save_pretrained_merged returned without creating {merged_dir} "
+                    f"(silent no-op — bitsandbytes base may not support merged_16bit; "
+                    f"check FINETUNE_PYTHON env for a venv with full 16-bit model support)"
+                )
             print(f"✅ Merged model saved: {merged_dir}")
         except Exception as e:
             print(f"⚠️  Merge step failed ({e}) — LoRA adapter still saved; vLLM will serve the previous merged model until next successful merge")

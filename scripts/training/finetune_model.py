@@ -63,14 +63,18 @@ def _run_promoter(finetune_dir: Path, adapters_before: set) -> None:
         try:
             meta = json.loads(metadata_file.read_text())
             candidate = Path(meta.get('merged_dir', ''))
-            if candidate.is_absolute() and candidate.exists():
+            # fine_tune_llm.py writes a relative path; resolve against project root.
+            # The original is_absolute() check always failed for relative paths.
+            if not candidate.is_absolute():
+                candidate = _PROJECT_ROOT / candidate
+            if candidate.is_dir():
                 merged_path = str(candidate)
         except Exception as _meta_err:
             logging.warning("Could not read training_metadata.json: %s", _meta_err)
 
     if merged_path is None:
         merged_candidate = finetune_dir / new_adapter.name.replace('_lora_', '_lora_merged_bf16_')
-        if merged_candidate.exists():
+        if merged_candidate.is_dir():
             merged_path = str(merged_candidate)
 
     if merged_path:
