@@ -298,6 +298,22 @@ You are an expert financial trading advisor with knowledge from the world's best
         merged_dir = output_dir.replace('_lora_', '_lora_merged_bf16_')
         try:
             print(f"\n🔀 Merging LoRA → BF16 for vLLM serving: {merged_dir}")
+            # unsloth's check_local_model_exists() only checks CWD-relative paths, never
+            # ~/.cache/huggingface/hub/. Without a CWD-relative symlink the BF16 base is
+            # invisible and merge_and_overwrite_lora silently returns None.
+            # Safe to create after import: the symlink only matters during the merge call.
+            _bf16_snapshot = (
+                Path.home()
+                / ".cache/huggingface/hub"
+                / "models--unsloth--qwen2.5-32b-instruct"
+                / "snapshots"
+                / "1b0051a19648244a48734e6cef41bb825ac2a0b0"
+            )
+            _sym = _FINETUNE_DIR.parent / "unsloth" / "qwen2.5-32b-instruct"
+            if _bf16_snapshot.is_dir() and not _sym.exists():
+                _sym.parent.mkdir(exist_ok=True)
+                os.symlink(str(_bf16_snapshot.resolve()), str(_sym))
+                print(f"  → created BF16 symlink: {_sym.relative_to(_FINETUNE_DIR.parent)}")
             model.save_pretrained_merged(merged_dir, tokenizer, save_method="merged_16bit")
             # Verify the dir was actually written — unsloth can return without raising
             # when the base model is bitsandbytes-quantized and the merge fails internally.
