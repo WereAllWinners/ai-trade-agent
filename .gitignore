@@ -19,8 +19,8 @@ logs/
 # Keep curated knowledge base files (committed to repo)
 !knowledge/*.jsonl
 
-# Model files
-finetune/
+# Model files — ignore checkpoint dirs/symlinks, not training scripts
+finetune/finance_qwen_32b*
 *.safetensors
 *.bin
 *.gguf
