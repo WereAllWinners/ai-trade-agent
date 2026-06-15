@@ -377,13 +377,20 @@ def insert_training_example(rec: dict, source: str = 'paper', db_path: Path = DB
              :entry_date, :session_id, :prompt_hash, :generated_at)
     """
     meta = rec.get('metadata', {})
+    _label = rec.get('label') or None
+    if not _label:
+        raise ValueError(
+            f"insert_training_example: blank/null label for "
+            f"symbol={meta.get('symbol', rec.get('symbol', '?'))!r} source={source!r} "
+            f"— caller must set label before inserting"
+        )
     row = {
         'bot':          meta.get('bot', rec.get('bot', '')),
         'source':       meta.get('source', rec.get('source', source)),
         'symbol':       meta.get('symbol', ''),
         'prompt':       rec.get('input', rec.get('prompt', '')),
         'ideal_output': rec.get('output', rec.get('ideal_output', '')),
-        'label':        rec.get('label', ''),
+        'label':        _label,
         'confidence':   meta.get('confidence'),
         'pnl_pct':      meta.get('pnl_pct'),
         'entry_date':   meta.get('entry_date'),

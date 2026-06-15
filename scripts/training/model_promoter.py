@@ -242,13 +242,15 @@ def _write_promotion_record(
     replay_current: dict | None = None,
     replay_verdict: bool | None = None,
     merged_model: str | None = None,
+    merged_model_promoted: bool = False,
 ) -> None:
     record: dict = {
-        'decided_at':    datetime.now().isoformat(),
-        'promoted':      promoted,
-        'candidate':     candidate_path,
-        'current':       current_path,
-        'merged_model':  str(Path(merged_model).resolve()) if merged_model else None,
+        'decided_at':           datetime.now().isoformat(),
+        'promoted':             promoted,
+        'candidate':            candidate_path,
+        'current':              current_path,
+        'merged_model':         str(Path(merged_model).resolve()) if merged_model else None,
+        'merged_model_promoted': merged_model_promoted,
         'candidate_scores': {k: candidate_result.get(k)
                              for k in ('pass_rate', 'directional_acc', 'format_score', 'grade')},
         'current_scores':   {k: current_result.get(k)
@@ -318,6 +320,7 @@ def promote(candidate_path: str, merged_path: str = None) -> bool:
         _write_promotion_record(
             promoted=False, candidate_path=candidate_path, current_path=current_path,
             candidate_result=candidate_result, current_result=current_result,
+            merged_model=merged_path, merged_model_promoted=False,
         )
         return False
 
@@ -346,6 +349,7 @@ def promote(candidate_path: str, merged_path: str = None) -> bool:
         _write_promotion_record(
             promoted=False, candidate_path=candidate_path, current_path=current_path,
             candidate_result=candidate_result, current_result=current_result,
+            merged_model=merged_path, merged_model_promoted=False,
         )
         return False
 
@@ -470,7 +474,8 @@ def promote(candidate_path: str, merged_path: str = None) -> bool:
         candidate_result=candidate_result, current_result=current_result,
         replay_candidate=replay_candidate, replay_current=replay_current,
         replay_verdict=replay_verdict,
-        merged_model=merged_path if promoted else None,
+        merged_model=merged_path,
+        merged_model_promoted=promoted and merged_path is not None,
     )
     return promoted
 

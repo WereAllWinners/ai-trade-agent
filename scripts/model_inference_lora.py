@@ -134,12 +134,12 @@ def get_trading_decision(prompt, max_new_tokens=200, temperature=0.7):
                 with _INFERENCE_LOCK:
                     model_inputs = model_inputs_cpu.to(model.device)
                     with torch.no_grad():
+                        _greedy = temperature == 0.0
                         generated_ids = model.generate(
                             **model_inputs,
                             max_new_tokens=max_new_tokens,
-                            temperature=temperature,
-                            do_sample=True,
-                            top_p=0.9,
+                            do_sample=not _greedy,
+                            **({} if _greedy else {'temperature': temperature, 'top_p': 0.9}),
                             pad_token_id=tokenizer.eos_token_id
                         )
                     generated_ids = [

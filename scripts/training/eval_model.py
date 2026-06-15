@@ -306,7 +306,7 @@ def run_eval(adapter_path: str | None = None) -> dict:
         logging.info(f"  Running: {name} (expected: {expected.upper()})")
         t0 = time.time()
         try:
-            response = get_trading_decision(prompt)
+            response = get_trading_decision(prompt, temperature=0.0)
             latency = time.time() - t0
         except Exception as e:
             logging.error(f"  Inference failed: {e}")

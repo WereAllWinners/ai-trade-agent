@@ -315,15 +315,67 @@ def check_reconcile_status(results: CheckResult) -> None:
                     warn_only=True)
 
 
+def _check_vllm_staleness(results: CheckResult, merged_latest: Path) -> None:
+    """Warn if vLLM was started before merged_latest was last repointed."""
+    try:
+        out = subprocess.run(
+            ['systemctl', 'show', 'ai-inference-server.service',
+             '--property=ActiveEnterTimestamp'],
+            capture_output=True, text=True, timeout=5,
+        )
+        ts_str = out.stdout.strip().split('=', 1)[-1].strip()
+        if not ts_str or ts_str.lower() == 'n/a':
+            return  # service never started — nothing to check
+        # Systemd format: "Sun 2026-06-15 01:30:00 UTC" — strip leading weekday
+        parts = ts_str.split(' ', 1)
+        if len(parts) == 2 and len(parts[0]) == 3:
+            ts_str = parts[1]
+        from datetime import timezone as _tz
+        service_start = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S %Z')
+        if service_start.tzinfo is None:
+            service_start = service_start.replace(tzinfo=_tz.utc)
+        symlink_mtime = datetime.fromtimestamp(
+            os.lstat(str(merged_latest)).st_mtime, tz=_tz.utc,
+        )
+        if service_start < symlink_mtime:
+            delta_min = int((symlink_mtime - service_start).total_seconds() // 60)
+            results.add(
+                'vllm_model_freshness', False,
+                f"vLLM started {delta_min}m before symlink was repointed — "
+                f"restart ai-inference-server to load the current merged model",
+                warn_only=True,
+            )
+        else:
+            results.add('vllm_model_freshness', True,
+                        'vLLM started after last symlink repoint — serving current model')
+    except Exception as e:
+        results.add('vllm_model_freshness', False,
+                    f'could not check vLLM staleness: {e}', warn_only=True)
+
+
 def check_merged_symlink_alignment(results: CheckResult) -> None:
-    """Verify that finance_qwen_32b_merged_latest points to the path in the latest promotion record."""
+    """
+    Verify finance_qwen_32b_merged_latest alignment with the latest promotion record.
+
+    Hard fail:
+      - merged_model_promoted=true  AND symlink != recorded path  (promoted model not served)
+      - merged_model_promoted=false AND symlink == recorded path  (serving a declined model)
+    Warn-only:
+      - merged_model is null (no merge to check)
+      - merged_model_promoted field absent in record (old format — intent unknown)
+      - vLLM service predates symlink repoint (stale serve, needs restart)
+    """
+    from alerts import send_alert, AlertLevel
+
     merged_latest = _PROJECT_ROOT / 'finetune' / 'finance_qwen_32b_merged_latest'
     if not merged_latest.is_symlink():
         results.add('merged_symlink', False,
                     f'{merged_latest.name} is missing — vLLM may be serving an outdated model',
                     warn_only=True)
         return
+
     actual = merged_latest.resolve()
+
     promo_files = sorted(
         (_PROJECT_ROOT / 'logs' / 'eval').glob('promotion_*.json'),
         key=lambda f: f.stat().st_mtime,
@@ -333,25 +385,64 @@ def check_merged_symlink_alignment(results: CheckResult) -> None:
                     'no promotion record found — cannot verify alignment',
                     warn_only=True)
         return
+
     try:
         promo = json.loads(promo_files[-1].read_text())
     except Exception as e:
         results.add('merged_symlink_alignment', False,
                     f'could not read promotion record: {e}', warn_only=True)
         return
+
     recorded = promo.get('merged_model')
     if not recorded:
         results.add('merged_symlink_alignment', True,
-                    'promotion record has no merged_model field — run after next fine-tune',
+                    'promotion record has no merged_model — run after next fine-tune',
                     warn_only=True)
         return
-    aligned = actual == Path(recorded).resolve()
-    results.add(
-        'merged_symlink_alignment',
-        aligned,
-        f"readlink={actual.name} {'==' if aligned else '!='} promoted={Path(recorded).name}",
-        warn_only=not aligned,
-    )
+
+    was_promoted = promo.get('merged_model_promoted')  # None for old-format records
+    recorded_resolved = Path(recorded).resolve()
+    aligned = actual == recorded_resolved
+
+    if was_promoted is None:
+        # Old-format record: merged_model_promoted absent — can't determine intent, warn only
+        results.add(
+            'merged_symlink_alignment',
+            aligned,
+            f"readlink={actual.name} {'==' if aligned else '!='} recorded={recorded_resolved.name} "
+            f"(old record — merged_model_promoted absent, warn-only)",
+            warn_only=True,
+        )
+    elif was_promoted:
+        # Candidate was promoted — symlink MUST point at the recorded (promoted) path
+        if aligned:
+            results.add('merged_symlink_alignment', True,
+                        f"readlink={actual.name} == promoted={recorded_resolved.name}")
+        else:
+            msg = (
+                f"merged_latest → {actual.name} but promoted model is "
+                f"{recorded_resolved.name} — vLLM is NOT serving the promoted model"
+            )
+            send_alert(AlertLevel.CRITICAL, 'merged_symlink_mismatch_promoted', msg)
+            results.add('merged_symlink_alignment', False, msg)
+    else:
+        # Candidate was declined — symlink must NOT point at the declined model
+        if aligned:
+            msg = (
+                f"merged_latest → {actual.name} but this model was DECLINED — "
+                f"vLLM is serving a model that failed evaluation"
+            )
+            send_alert(AlertLevel.CRITICAL, 'merged_symlink_serving_declined', msg)
+            results.add('merged_symlink_alignment', False, msg)
+        else:
+            results.add(
+                'merged_symlink_alignment', True,
+                f"readlink={actual.name} (declined model {recorded_resolved.name} not served — correct)",
+            )
+
+    # Cross-check: warn if vLLM started before symlink was last repointed
+    if os.getenv('INFERENCE_BACKEND', 'ollama').lower() == 'vllm':
+        _check_vllm_staleness(results, merged_latest)
 
 
 def check_service_status(results: CheckResult) -> None:

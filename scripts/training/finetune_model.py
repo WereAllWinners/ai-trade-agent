@@ -13,7 +13,13 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # scripts/training/ for tdb imports
 from training import FINETUNE_PYTHON as _FINETUNE_PYTHON, FINETUNE_PTXAS as _FINETUNE_PTXAS
+from training_data_builder import (  # noqa: E402
+    _HOLD_TEACHING_LABELS,
+    _SFT_TRAIN_LABELS,
+    _SFT_MAX_HOLD_SHARE,
+)
 
 _SCRIPTS_DIR  = Path(__file__).resolve().parent.parent
 _PROJECT_ROOT = _SCRIPTS_DIR.parent
@@ -23,8 +29,62 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
+_GPU_TEMP_LIMIT   = 75   # °C — skip training above this to prevent thermal shutdown
+_MIN_TAKE_TRADE   = int(os.getenv('FINETUNE_MIN_TAKE_TRADE', '40'))
+_MIN_TOTAL_SFT    = int(os.getenv('FINETUNE_MIN_TOTAL_SFT',  '200'))
+_TAKE_TRADE_LABELS: frozenset[str] = frozenset({'winner', 'strong_winner'})
 
-_GPU_TEMP_LIMIT = 75   # °C — skip training above this to prevent thermal shutdown
+
+def _cadence_gate(training_data_path: Path, bot: str = 'stock') -> bool:
+    """Return True iff fine-tuning should proceed.
+
+    Reads the SFT-only file (training_data_sft.json / options_training_data_sft.json).
+    Counts only from that file so the denominator matches what SFTTrainer will see.
+
+    Fires (returns False) when any condition is unmet:
+      take_trade < _MIN_TAKE_TRADE  — binding at current volume
+      hold_share > _SFT_MAX_HOLD_SHARE
+      total_sft  < _MIN_TOTAL_SFT   — informational floor
+
+    A fired gate is the correct outcome when data is insufficient.  The log line
+    surfaces the reason; no error is raised, no subprocess is launched.
+    """
+    if not training_data_path.exists():
+        logging.info("⏳ %s: SFT file not found — waiting for training data", bot)
+        return False
+
+    with open(training_data_path) as f:
+        sft_data = json.load(f)
+
+    if not sft_data:
+        logging.info("⏳ %s: SFT file is empty — waiting for training data", bot)
+        return False
+
+    total_sft   = len(sft_data)
+    take_trade  = sum(1 for ex in sft_data if ex.get('label') in _TAKE_TRADE_LABELS)
+    hold_n      = sum(1 for ex in sft_data if ex.get('label') in _HOLD_TEACHING_LABELS)
+    hold_share  = hold_n / total_sft if total_sft else 0.0
+
+    reasons = []
+    if take_trade < _MIN_TAKE_TRADE:
+        reasons.append(f"take_trade={take_trade} < {_MIN_TAKE_TRADE}")
+    if hold_share > _SFT_MAX_HOLD_SHARE:
+        reasons.append(f"hold_share={hold_share:.1%} > {_SFT_MAX_HOLD_SHARE:.0%}")
+    if total_sft < _MIN_TOTAL_SFT:
+        reasons.append(f"total_sft={total_sft} < {_MIN_TOTAL_SFT}")
+
+    if reasons:
+        logging.warning(
+            "fine-tune SKIPPED (%s): %s.  Accumulating; current model retained.",
+            bot, ", ".join(reasons),
+        )
+        return False
+
+    logging.info(
+        "✅ Cadence gate PASSED (%s): take_trade=%d, hold_share=%.1f%%, total_sft=%d",
+        bot, take_trade, 100 * hold_share, total_sft,
+    )
+    return True
 
 
 def _gpu_temp() -> int | None:
@@ -104,18 +164,16 @@ def finetune_model(training_data_path: Path) -> None:
         logging.warning(f"🌡️  GPU at {temp}°C — skipping fine-tune to prevent thermal shutdown (limit: {_GPU_TEMP_LIMIT}°C)")
         return
 
-    if not training_data_path.exists():
-        logging.info("⏳ No training data yet - waiting for more trades")
-        return
+    # Infer bot name from filename for gate logging.
+    bot = 'options' if 'options' in training_data_path.name else 'stock'
+
+    if not _cadence_gate(training_data_path, bot):
+        return   # gate fires — reason already logged; do not launch subprocess
 
     with open(training_data_path) as f:
         training_data = json.load(f)
 
-    if len(training_data) < 5:
-        logging.info(f"⏳ Need at least 5 examples, have {len(training_data)} - waiting for more trades")
-        return
-
-    logging.info(f"📚 {len(training_data)} training examples found — starting full fine-tune")
+    logging.info(f"📚 {len(training_data)} SFT examples — starting full fine-tune")
 
     # Build DPO preference pairs from labelled outcomes before SFT training.
     dpo_script = _PROJECT_ROOT / 'finetune' / 'build_dpo_dataset.py'
@@ -172,7 +230,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--data',
         type=Path,
-        default=_PROJECT_ROOT / 'finetune' / 'data' / 'training_data.json',
+        default=_PROJECT_ROOT / 'finetune' / 'data' / 'training_data_sft.json',
         help='Path to training data JSON (default: stock training data)',
     )
     args = parser.parse_args()

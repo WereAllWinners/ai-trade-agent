@@ -120,7 +120,7 @@ def _rerun_decision(prompt: str, adapter_path: str | None = None) -> dict:
         from model_inference_lora import get_trading_decision, parse_decision
         if adapter_path:
             os.environ['LORA_ADAPTER_PATH'] = adapter_path
-        response = get_trading_decision(prompt)
+        response = get_trading_decision(prompt, temperature=0.0)
         return parse_decision(response)
     except Exception as e:
         logging.debug("_rerun_decision failed: %s", e)

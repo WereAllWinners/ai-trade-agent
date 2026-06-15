@@ -254,70 +254,94 @@ class TestShouldTrain:
 # ===========================================================================
 
 class TestBuildDpoPairs:
-    def _make_example(self, label, symbol='AAPL', pnl=0.10, conf=0.80, decision='buy'):
+    """Session 3 rewrite: loser→CF pairs + weak→strong gap-gated pairs.
+
+    Old API (winner→loser, synthetic pairs, _preference_weight) has been removed.
+    """
+
+    def _row(self, label, symbol='AAPL', pnl=None, bot='stock', prompt=None, ideal_output=None):
+        p = prompt or f'Analyze {symbol} for a potential trade. RSI: 72. MACD: -3.'
+        out = ideal_output or (
+            f'Decision: BUY\nConfidence: 0.80\nReasoning: Momentum signal confirmed for {symbol}.'
+        )
         return {
-            'bot': 'stock',
-            'symbol': symbol,
-            'prompt': f'Analyze {symbol} for trading.',
-            'ideal_output': f'Decision: BUY\nConfidence: {conf:.2f}\nReasoning: test\nOutcome: winner.',
-            'label': label,
-            'confidence': conf,
-            'pnl_pct': pnl,
-            'entry_date': '2024-06-01',
-            'session_id': 'sess-1',
+            'bot': bot, 'source': 'paper', 'symbol': symbol,
+            'prompt': p, 'ideal_output': out,
+            'label': label, 'confidence': 0.80, 'pnl_pct': pnl,
+            'entry_date': '2026-06-15', 'session_id': '',
             'prompt_hash': f'hash-{label}-{symbol}',
+            'generated_at': '2026-06-15T00:00:00', 'reward': None,
         }
 
-    def test_real_pair_formed_for_matching_symbol(self):
-        from build_dpo_dataset import build_dpo_pairs
-        examples = [
-            self._make_example('winner',  'AAPL', pnl=0.10),
-            self._make_example('loser',   'AAPL', pnl=-0.12),
-        ]
-        with patch('build_dpo_dataset._db') as mock_db:
-            mock_db.init_db = MagicMock()
-            mock_db.get_training_examples.return_value = examples
-            pairs, real, synthetic = build_dpo_pairs()
-        assert real == 1
-        assert synthetic == 0
-        assert len(pairs) == 1
-        assert pairs[0]['symbol'] == 'AAPL'
+    def _cf_row(self, prompt, symbol='AAPL'):
+        return self._row(
+            'counterfactual', symbol=symbol, prompt=prompt,
+            ideal_output=(
+                'Decision: HOLD\nConfidence: 0.80\n'
+                'Reasoning: Entry risk outweighs setup — MACD negative.'
+            ),
+        )
 
-    def test_synthetic_pair_when_no_matching_loser(self):
+    def _call(self, examples):
         from build_dpo_dataset import build_dpo_pairs
-        examples = [
-            self._make_example('winner', 'TSLA', pnl=0.15),
-        ]
         with patch('build_dpo_dataset._db') as mock_db:
             mock_db.init_db = MagicMock()
             mock_db.get_training_examples.return_value = examples
-            pairs, real, synthetic = build_dpo_pairs()
-        assert synthetic == 1
-        assert real == 0
+            return build_dpo_pairs()
+
+    def test_loser_cf_pair_formed(self):
+        """A loser with a matching CF (same prompt) → one loser→CF pair."""
+        prompt = 'Analyze AAPL for a potential trade. RSI: 72. MACD: -3.'
+        loser = self._row('loser', pnl=-0.12, prompt=prompt,
+                          ideal_output='Decision: BUY\nConfidence: 0.75\nReasoning: Signal fired.')
+        cf    = self._cf_row(prompt)
+
+        pairs, stats = self._call([loser, cf])
+
+        assert stats['loser_cf_pairs'] == 1
+        assert len(pairs) == 1
+        assert pairs[0]['pair_type'] == 'loser_counterfactual'
+        assert pairs[0]['rejected'].endswith('<|im_end|>')
+        assert pairs[0]['chosen'].endswith('<|im_end|>')
+
+    def test_loser_without_cf_produces_no_pair(self):
+        """A loser whose prompt has no matching CF → zero pairs, skipped_no_cf += 1."""
+        loser = self._row('loser', pnl=-0.12,
+                          ideal_output='Decision: BUY\nConfidence: 0.75\nReasoning: Signal fired.')
+
+        pairs, stats = self._call([loser])
+
+        assert pairs == []
+        assert stats['skipped_no_cf'] >= 1
 
     def test_empty_examples_returns_empty(self):
-        from build_dpo_dataset import build_dpo_pairs
-        with patch('build_dpo_dataset._db') as mock_db:
-            mock_db.init_db = MagicMock()
-            mock_db.get_training_examples.return_value = []
-            pairs, real, synthetic = build_dpo_pairs()
+        """No training examples → empty pairs, all stat counters zero."""
+        pairs, stats = self._call([])
         assert pairs == []
+        assert stats['total'] == 0
 
-    def test_preference_weight_calculation(self):
-        from build_dpo_dataset import _preference_weight
-        assert _preference_weight(0.10, 0.80) == pytest.approx(0.08, rel=1e-4)
-        assert _preference_weight(None, 0.80) == 0.0
-        assert _preference_weight(0.10, None) == pytest.approx(0.05, rel=1e-4)
+    def test_weak_strong_pair_built_when_gap_sufficient(self):
+        """SW pnl=+30%, WW pnl=+10% → gap=0.20 ≥ 0.08 → weak→strong pair created."""
+        prompt = 'Analyze MSFT for a potential trade.'
+        sw = self._row('strong_winner', symbol='MSFT', pnl=+0.30, prompt=prompt, bot='stock',
+                       ideal_output='Decision: BUY\nConfidence: 0.92\nReasoning: Strong momentum breakout.')
+        ww = self._row('weak_winner',   symbol='MSFT', pnl=+0.10, prompt=prompt, bot='stock',
+                       ideal_output='Decision: BUY\nConfidence: 0.70\nReasoning: Early signal; pending.')
 
-    def test_chosen_contains_winner_output(self):
-        from build_dpo_dataset import build_dpo_pairs
-        examples = [
-            self._make_example('strong_winner', 'GOOG', pnl=0.32),
-        ]
-        with patch('build_dpo_dataset._db') as mock_db:
-            mock_db.init_db = MagicMock()
-            mock_db.get_training_examples.return_value = examples
-            pairs, _, _ = build_dpo_pairs()
-        assert 'Decision: BUY' in pairs[0]['chosen']
-        # Rejected should differ from chosen
-        assert pairs[0]['chosen'] != pairs[0]['rejected']
+        pairs, stats = self._call([sw, ww])
+
+        ws = [p for p in pairs if p.get('pair_type') == 'weak_to_strong_winner']
+        assert len(ws) >= 1, f"Expected weak→strong pair, stats={stats}"
+        assert ws[0]['chosen'] != ws[0]['rejected']
+
+    def test_chosen_and_rejected_always_differ(self):
+        """chosen == rejected is rejected by the hard guard."""
+        prompt = 'Analyze AAPL for a potential trade. RSI: 72. MACD: -3.'
+        shared_output = 'Decision: BUY\nConfidence: 0.75\nReasoning: Signal fired.'
+        loser = self._row('loser', pnl=-0.12, prompt=prompt, ideal_output=shared_output)
+        cf    = self._row('counterfactual', prompt=prompt, ideal_output=shared_output)
+
+        pairs, stats = self._call([loser, cf])
+
+        assert pairs == []
+        assert stats['skipped_guard_violations'] >= 1

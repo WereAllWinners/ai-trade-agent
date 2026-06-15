@@ -311,7 +311,7 @@ class OptionsDaemon:
             logging.warning("⚠️  Options fine-tune aborted — inference server still live")
             return
         try:
-            training_data_path = str(_SCRIPTS_DIR.parent / 'finetune' / 'data' / 'options_training_data.json')
+            training_data_path = str(_SCRIPTS_DIR.parent / 'finetune' / 'data' / 'options_training_data_sft.json')
 
             if not os.path.exists(training_data_path):
                 logging.info("🎓 No options training data yet - skipping fine-tuning")

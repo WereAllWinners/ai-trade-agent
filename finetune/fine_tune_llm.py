@@ -26,6 +26,14 @@ from transformers import TrainingArguments
 _FINETUNE_DIR   = Path(__file__).resolve().parent
 _DPO_PAIRS_PATH = _FINETUNE_DIR / 'data' / 'dpo_pairs.jsonl'
 
+# Import the single-source-of-truth SFT label set from training_data_builder.
+# Both this filter and the tripwire denominator in training_data_builder.py use
+# _SFT_TRAIN_LABELS so they can never silently diverge.
+_SCRIPTS_TRAINING = _FINETUNE_DIR.parent / 'scripts' / 'training'
+if str(_SCRIPTS_TRAINING) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_TRAINING))
+from training_data_builder import _SFT_TRAIN_LABELS  # noqa: E402
+
 
 class DPOStageTrainer:
     """DPO training stage using properly-formed preference pairs from build_dpo_dataset.py.
@@ -152,12 +160,12 @@ You are an expert financial trading advisor with knowledge from the world's best
                     "label": ex.get("label")
                 })
 
-        _SFT_EXCLUDE_LABELS = {'weak_loser', 'loser', 'strong_loser'}
         before = len(all_examples)
-        all_examples = [ex for ex in all_examples if ex.get('label') not in _SFT_EXCLUDE_LABELS]
+        all_examples = [ex for ex in all_examples if ex.get('label') in _SFT_TRAIN_LABELS]
         filtered = before - len(all_examples)
-        print(f"🔍 SFT label filter: removed {filtered} loser examples "
-              f"({filtered/max(before,1):.1%} of total); {len(all_examples)} remain for training")
+        print(f"🔍 SFT label filter: {len(all_examples)} imitation examples "
+              f"({filtered} excluded — losers/weak_winner/missed_opportunity/other); "
+              f"{len(all_examples)/max(before,1):.1%} of JSON retained")
 
         print(f"\n✅ Total formatted examples: {len(all_examples)}")
         if len(all_examples) == 0:

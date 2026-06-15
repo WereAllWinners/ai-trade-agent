@@ -113,10 +113,10 @@ class TestCounterfactualOutput:
         conf = float(result.split('\n')[1].split(': ')[1])
         assert conf == pytest.approx(0.70, abs=0.01)
 
-    def test_counterfactual_label_not_in_sft_exclude(self):
-        """'counterfactual' label must survive the SFT loser filter."""
-        _SFT_EXCLUDE_LABELS = {'weak_loser', 'loser', 'strong_loser'}
-        assert 'counterfactual' not in _SFT_EXCLUDE_LABELS
+    def test_counterfactual_label_in_sft_imitation_set(self):
+        """'counterfactual' must be in _SFT_IMITATION_LABELS so it reaches SFT training."""
+        from training_data_builder import _SFT_IMITATION_LABELS
+        assert 'counterfactual' in _SFT_IMITATION_LABELS
 
     @pytest.mark.parametrize("decision,prompt", _REALISTIC_LOSER_PROMPTS)
     def test_banned_substring_sweep(self, decision, prompt):
@@ -476,3 +476,156 @@ class TestModelPromoterRollback:
         assert result is True
         # Should roll back to adapter1, not the rejected adapter2
         assert latest.resolve() == adapter1.resolve()
+
+
+# ---------------------------------------------------------------------------
+# Session 3 Step 2 — DPO pair builder (loser→CF + weak→strong)
+# ---------------------------------------------------------------------------
+
+_LOSER_OUT  = "Decision: BUY\nConfidence: 0.75\nReasoning: Momentum signal fired; indicators mixed."
+_CF_OUT     = "Decision: HOLD\nConfidence: 0.80\nReasoning: Entry risk outweighs setup — MACD negative."
+_SW_OUT     = "Decision: BUY\nConfidence: 0.92\nReasoning: Strong momentum; RSI exiting oversold zone."
+_WW_OUT     = "Decision: BUY\nConfidence: 0.70\nReasoning: Early momentum; confirmation still pending."
+_SW_OUT_2   = "Decision: BUY\nConfidence: 0.88\nReasoning: Breakout confirmed; volume surge supporting."
+
+
+def _make_row(label, prompt, ideal_output, pnl_pct=None, bot='stock', symbol='AAPL'):
+    return {
+        'id': 1, 'bot': bot, 'source': 'paper', 'symbol': symbol,
+        'prompt': prompt, 'ideal_output': ideal_output,
+        'label': label, 'confidence': 0.80, 'pnl_pct': pnl_pct,
+        'entry_date': '2026-06-15', 'session_id': '',
+        'prompt_hash': f'hash_{label}_{symbol}_{prompt[:6]}',
+        'generated_at': '2026-06-15T00:00:00', 'reward': None,
+    }
+
+
+class TestBuildDPOPairs:
+    """Session 3 Step 2: build_dpo_pairs produces loser→CF and weak→strong pairs."""
+
+    def _call(self, examples):
+        import build_dpo_dataset as bdd
+        with patch.object(bdd._db, 'get_training_examples', return_value=examples), \
+             patch.object(bdd._db, 'init_db'):
+            return bdd.build_dpo_pairs()
+
+    def test_loser_cf_pair_has_correct_chosen_rejected(self):
+        """A loser row paired with a matching CF: rejected=loser output, chosen=CF output."""
+        import build_dpo_dataset as bdd
+        prompt = "Analyze AAPL for a potential trade. RSI: 72. MACD: -3.20."
+        loser = _make_row('loser', prompt, _LOSER_OUT, pnl_pct=-0.15)
+        cf    = _make_row('counterfactual', prompt, _CF_OUT)
+
+        pairs, stats = self._call([loser, cf])
+
+        assert stats['loser_cf_pairs'] == 1, f"Expected 1 pair, got {stats}"
+        assert len(pairs) == 1
+        pair = pairs[0]
+        assert pair['rejected'].endswith(_LOSER_OUT + '<|im_end|>'), \
+               "rejected should contain the loser's ideal_output"
+        assert pair['chosen'].endswith(_CF_OUT + '<|im_end|>'), \
+               "chosen should be the CF HOLD output"
+        assert pair['pair_type'] == 'loser_counterfactual'
+
+    def test_loser_without_matching_cf_skipped(self):
+        """A loser with no CF sharing its prompt produces zero pairs."""
+        prompt_loser = "Analyze AAPL for a potential trade."
+        prompt_cf    = "Analyze TSLA for a potential trade."  # different prompt
+        loser = _make_row('loser', prompt_loser, _LOSER_OUT, pnl_pct=-0.15)
+        cf    = _make_row('counterfactual', prompt_cf, _CF_OUT)
+
+        pairs, stats = self._call([loser, cf])
+
+        assert stats['loser_cf_pairs'] == 0
+        assert stats['skipped_no_cf'] >= 1
+
+    def test_weak_strong_pair_above_gap_threshold_created(self):
+        """SW pnl=+30%, WW pnl=+10%: gap=0.20 ≥ _DPO_MIN_GAP(0.08) → pair created."""
+        import build_dpo_dataset as bdd
+        prompt = "Analyze MSFT for a potential trade."
+        sw = _make_row('strong_winner', prompt, _SW_OUT,  pnl_pct=+0.30, bot='stock', symbol='MSFT')
+        ww = _make_row('weak_winner',   prompt, _WW_OUT, pnl_pct=+0.10, bot='stock', symbol='MSFT')
+
+        pairs, stats = self._call([sw, ww])
+
+        ws_pairs = [p for p in pairs if p.get('pair_type') == 'weak_to_strong_winner']
+        assert len(ws_pairs) >= 1, f"Expected weak→strong pair (gap=0.20), stats={stats}"
+        assert ws_pairs[0]['chosen'].endswith(_SW_OUT + '<|im_end|>')
+        assert ws_pairs[0]['rejected'].endswith(_WW_OUT + '<|im_end|>')
+
+    def test_weak_strong_pair_below_gap_threshold_skipped(self):
+        """SW pnl=+12%, WW pnl=+10%: gap=0.02 < _DPO_MIN_GAP(0.08) → no pair."""
+        prompt = "Analyze MSFT for a potential trade."
+        sw = _make_row('strong_winner', prompt, _SW_OUT,  pnl_pct=+0.12, bot='stock', symbol='MSFT')
+        ww = _make_row('weak_winner',   prompt, _WW_OUT, pnl_pct=+0.10, bot='stock', symbol='MSFT')
+
+        pairs, stats = self._call([sw, ww])
+
+        ws_pairs = [p for p in pairs if p.get('pair_type') == 'weak_to_strong_winner']
+        assert len(ws_pairs) == 0, f"Gap=0.02 is below threshold — no pair expected, got {ws_pairs}"
+        assert stats['skipped_gap_below_threshold'] >= 1
+
+    def test_cross_bot_weak_strong_not_paired(self):
+        """SW bot='stock' and WW bot='options' must NOT be paired (same-bot rule)."""
+        prompt = "Analyze AAPL for a potential trade."
+        sw = _make_row('strong_winner', prompt, _SW_OUT,  pnl_pct=+0.30, bot='stock')
+        ww = _make_row('weak_winner',   prompt, _WW_OUT, pnl_pct=+0.10, bot='options')
+
+        pairs, stats = self._call([sw, ww])
+
+        ws_pairs = [p for p in pairs if p.get('pair_type') == 'weak_to_strong_winner']
+        assert len(ws_pairs) == 0, "Cross-bot weak→strong pairing must be rejected"
+
+    def test_chosen_equals_rejected_guard_skips_pair(self):
+        """If CF output == loser output, the pair is rejected by the guard."""
+        prompt = "Analyze AAPL for a potential trade. RSI: 72. MACD: -3."
+        loser = _make_row('loser', prompt, _LOSER_OUT, pnl_pct=-0.15)
+        cf    = _make_row('counterfactual', prompt, _LOSER_OUT)  # same output as loser
+
+        pairs, stats = self._call([loser, cf])
+
+        assert stats['loser_cf_pairs'] == 0
+        assert stats['skipped_guard_violations'] >= 1
+
+    def test_fewer_than_min_pairs_logs_warning(self, caplog):
+        """When < _DPO_MIN_PAIRS pairs are generated, a warning is logged."""
+        import logging
+        import build_dpo_dataset as bdd
+
+        # 1 loser + 1 CF → 1 pair, below MIN_DPO_PAIRS (8)
+        prompt = "Analyze AAPL for a potential trade. RSI: 72."
+        examples = [
+            _make_row('loser', prompt, _LOSER_OUT, pnl_pct=-0.15),
+            _make_row('counterfactual', prompt, _CF_OUT),
+        ]
+        with caplog.at_level(logging.WARNING):
+            pairs, stats = self._call(examples)
+
+        assert stats['total'] < bdd._DPO_MIN_PAIRS
+        assert any('DPO' in r.getMessage() or 'pair' in r.getMessage().lower()
+                   for r in caplog.records if r.levelno >= logging.WARNING), \
+               "Expected a warning about insufficient DPO pairs"
+
+    def test_all_cfs_available_to_dpo_regardless_of_sft_cap(self):
+        """DPO builder reads directly from DB — all CFs are available, not capped at SFT limit.
+
+        The SFT cap (_COUNTERFACTUAL_SFT_CAP=30) is applied inside build_and_store only.
+        build_dpo_pairs calls get_training_examples independently and sees the full pool.
+        """
+        base_prompt = "Analyze {sym} for a potential trade. RSI: 72. MACD: -3."
+        examples = []
+        for i in range(60):
+            sym    = f'SYM{i:02d}'
+            prompt = base_prompt.format(sym=sym)
+            loser_out = (f"Decision: BUY\nConfidence: 0.75\n"
+                         f"Reasoning: Momentum signal fired; variant {i}.")
+            cf_out    = (f"Decision: HOLD\nConfidence: 0.80\n"
+                         f"Reasoning: Entry risk outweighs setup — MACD negative; variant {i}.")
+            examples.append(_make_row('loser', prompt, loser_out, pnl_pct=-0.15, symbol=sym))
+            examples.append(_make_row('counterfactual', prompt, cf_out, symbol=sym))
+
+        pairs, stats = self._call(examples)
+
+        assert stats['loser_cf_pairs'] == 60, \
+            (f"DPO builder must see all 60 CFs from DB "
+             f"(SFT cap of 30 must not affect DPO). Got {stats['loser_cf_pairs']}")

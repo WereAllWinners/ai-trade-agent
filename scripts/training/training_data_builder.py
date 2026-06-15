@@ -35,7 +35,7 @@ MIN_CONFIDENCE      = 0.70
 HOLD_DAYS_FALLBACK  = 5
 
 # New tiered thresholds
-STRONG_WIN_PCT      = 0.30
+STRONG_WIN_PCT      = 0.20  # lowered from 0.30; at 30% zero rows qualify; at 20% ~7 rows
 WIN_PCT             = 0.08
 WEAK_WIN_PCT        = 0.005
 WEAK_LOSS_PCT       = -0.005
@@ -47,6 +47,56 @@ import random
 _MISSED_OPP_EXCESS   = float(os.getenv('TDB_MISSED_OPP_EXCESS', '0.03'))
 _HALF_LIFE_DAYS      = float(os.getenv('TDB_HALF_LIFE_DAYS', '45'))
 _MAX_EXAMPLES        = int(os.getenv('TDB_MAX_EXAMPLES', '5000'))
+
+# Labels whose ideal_output is a worthy imitation target for SFT.
+# Excluded: weak_winner (borderline noise), missed_opportunity (teaches wrong hold),
+# constraint_block (risk-plumbing, not a trading decision — capped separately),
+# loser-family (used for DPO, not SFT imitation).
+_SFT_IMITATION_LABELS: frozenset[str] = frozenset({
+    'strong_winner',   # large positive outcome — rare but high-value exemplar
+    'winner',          # solid positive outcome
+    'correct_hold',    # SPY-excess-validated genuine hold (NOT constraint_block)
+    'counterfactual',  # HOLD-teaching row derived from a loser prompt
+})
+
+# Loser-family rows are kept in the JSON for DPO pairing but excluded from SFT.
+_DPO_LABELS: frozenset[str] = frozenset({'weak_loser', 'loser', 'strong_loser'})
+
+# constraint_block is excluded from _SFT_IMITATION_LABELS to prevent 2,000+ near-
+# duplicate portfolio-rejection rows from dominating the gradient (teaches HOLD
+# boilerplate, not trading). A small semantically-deduplicated sample is exported
+# so the model learns the constraint-rejection format without losing trading signal.
+# Per-type cap: at most _CONSTRAINT_BLOCK_PER_TYPE_CAP examples per semantic type
+# (e.g. "correlation_cap_breached", "sector_cap_breached") so all 2,293 correlation-
+# cap variants don't crowd out other constraint lessons.
+# Global ceiling: _CONSTRAINT_BLOCK_SFT_CAP guards against future constraint types.
+_CONSTRAINT_BLOCK_PER_TYPE_CAP: int = int(os.getenv('TDB_CONSTRAINT_BLOCK_PER_TYPE_CAP', '4'))
+_CONSTRAINT_BLOCK_SFT_CAP:      int = int(os.getenv('TDB_CONSTRAINT_BLOCK_SFT_CAP', '12'))
+
+# Counterfactual cap for SFT: all 599 CFs stay in the DB and reach the DPO builder
+# unchanged.  Only _COUNTERFACTUAL_SFT_CAP semantically-distinct examples enter the
+# SFT JSON, selected by signal pattern so the 30 cover the variety of
+# "looked tradeable but wasn't" rather than 30 identical MACD-negative HOLD lessons.
+# Without this cap the Session-4 SFT set was 86% HOLD-teaching (599/695).
+_COUNTERFACTUAL_SFT_CAP: int = int(os.getenv('TDB_COUNTERFACTUAL_SFT_CAP', '30'))
+
+# SFT HOLD-teaching share tripwire.
+# (counterfactual + correct_hold + constraint_block) / total_sft > threshold → WARNING.
+# The threshold is intentionally below 70% so the Session-4 state (94%) would have
+# failed immediately and Session 3 would have run before any fine-tune.
+_SFT_MAX_HOLD_SHARE: float = float(os.getenv('TDB_SFT_MAX_HOLD_SHARE', '0.65'))
+
+# All labels that teach "decline / hold" rather than "take the trade".
+# Used by the tripwire and by Session 5's cadence gate.
+_HOLD_TEACHING_LABELS: frozenset[str] = frozenset({
+    'counterfactual', 'correct_hold', 'constraint_block',
+})
+
+# Single source of truth for the SFT training label set.
+# Imported by fine_tune_llm.py (filter at load time) and used by the tripwire
+# denominator so neither can silently drift from the other.  Two copies of the same
+# label set is exactly how the denominator bug was introduced.
+_SFT_TRAIN_LABELS: frozenset[str] = _SFT_IMITATION_LABELS | frozenset({'constraint_block'})
 
 # Module-level SPY cache so repeated HOLD lookups don't re-fetch the same window
 _SPY_RETURN_CACHE: dict = {}
@@ -168,6 +218,180 @@ def _build_ideal_output(decision: str, confidence: float, reasoning: str,
     )
 
 
+def _is_clean_ideal_output(s: str) -> bool:
+    """Return True iff s is a valid 3-line Decision/Confidence/Reasoning block.
+
+    Rejects:
+    - Markdown code fences (```)
+    - Duplicate Decision: lines (old ideal_output smuggled in as Reasoning)
+    - Any line count other than exactly 3
+    - Lines out of expected order
+    """
+    if not s or '```' in s:
+        return False
+    lines = s.splitlines()
+    if len(lines) != 3:
+        return False
+    if s.lower().count('decision:') != 1:
+        return False
+    return (
+        lines[0].lower().startswith('decision:')
+        and lines[1].lower().startswith('confidence:')
+        and lines[2].lower().startswith('reasoning:')
+    )
+
+
+_CONSTRAINT_BLOCK_MARKERS = (
+    'blocked due to',
+    'correctly blocked',
+    'sector cap',
+    'portfolio constraint',
+    'review position sizing',
+)
+
+
+def _is_constraint_block(s: str) -> bool:
+    """True iff s is a portfolio-constraint rejection, not a genuine trading decision.
+
+    Used by the export guard (to cap constraint_block in SFT) and by Session 4
+    regeneration to correctly re-label the 2,211 historical correct_hold rows that
+    were actually portfolio-constraint blocks.
+    """
+    if not s:
+        return False
+    lower = s.lower()
+    return any(marker in lower for marker in _CONSTRAINT_BLOCK_MARKERS)
+
+
+def _constraint_semantic_key(ideal_output: str) -> str:
+    """Return the semantic constraint TYPE for per-type deduplication.
+
+    Maps all correlation-cap variants ("already has 3 positions", "has 5 positions")
+    to the same key regardless of the varying count N.  New constraint types that
+    don't match the known patterns fall back to a digit-normalized reasoning snippet
+    so they still group correctly within their own type.
+    """
+    lower = (ideal_output or '').lower()
+    if 'correlation cap' in lower:
+        return 'correlation_cap_breached'
+    if 'sector cap' in lower:
+        return 'sector_cap_breached'
+    if 'pdt' in lower:
+        return 'pdt_limit'
+    # Generic fallback: extract and normalize the Reasoning line
+    for line in lower.splitlines():
+        if line.startswith('reasoning:'):
+            reason = line.split(':', 1)[1].strip()
+            key = re.sub(r'\d+\.?\d*', 'N', reason)
+            return re.sub(r'\s+', ' ', key).strip()[:80]
+    key = re.sub(r'\d+\.?\d*', 'N', lower[:120])
+    return re.sub(r'\s+', ' ', key).strip()
+
+
+def _counterfactual_semantic_key(ideal_output: str) -> str:
+    """Semantic key for SFT-dedup of counterfactual HOLD rows.
+
+    Groups by the PRIMARY contrary signal cited in the reasoning, so the
+    _COUNTERFACTUAL_SFT_CAP sample covers distinct "why not to enter" patterns
+    rather than 30 identical "MACD negative" lessons.
+
+    Pattern priority mirrors _build_counterfactual_output's signal ordering
+    (MACD → RSI → MA → volume → fallback).
+    """
+    for line in (ideal_output or '').splitlines():
+        if not line.lower().startswith('reasoning:'):
+            continue
+        r = line.split(':', 1)[1].strip().lower()
+        if 'sufficient edge' in r or not r.startswith('entry risk'):
+            return 'no_indicators'
+        # Strip "entry risk not justified — " prefix
+        body = r.split('—', 1)[-1].strip() if '—' in r else r
+        # Take just the first signal (before the first ";")
+        first = body.split(';')[0].strip()
+        if 'macd negative' in first:
+            return 'macd_neg'
+        if 'macd positive' in first:
+            return 'macd_pos'
+        if 'rsi' in first and 'overbought' in first:
+            return 'rsi_overbought'
+        if 'rsi' in first and 'oversold' in first:
+            return 'rsi_oversold'
+        if 'below the moving average' in first:
+            return 'price_below_ma'
+        if 'above the moving average' in first:
+            return 'price_above_ma'
+        if 'volume ratio' in first:
+            return 'volume_low'
+        # Fallback: digit-normalised first 30 chars of the primary signal
+        key = re.sub(r'[+-]?\d+\.?\d*', 'N', first[:30])
+        return re.sub(r'\s+', '_', key.strip())[:30]
+    return 'no_reasoning'
+
+
+# ---------------------------------------------------------------------------
+# Extraction helpers for regeneration (Session 4)
+# ---------------------------------------------------------------------------
+
+def _extract_decision(ideal_output: str) -> str:
+    """Parse decision action from the first Decision: line of an ideal_output."""
+    _amap = {'BUY': 'buy', 'SELL': 'sell', 'HOLD': 'hold',
+             'BUY_CALL': 'buy_call', 'BUY_PUT': 'buy_put'}
+    for line in (ideal_output or '').splitlines():
+        if line.lower().startswith('decision:'):
+            tok = line.split(':', 1)[1].strip().upper()
+            return _amap.get(tok, 'hold')
+    return 'hold'
+
+
+def _extract_reasoning_clean(ideal_output: str) -> str:
+    """Extract clean reasoning text from a contaminated ideal_output.
+
+    Handles three contamination patterns found in historical rows:
+    - 4-line format: 'Decision/Confidence/Reasoning/Outcome' → strip Outcome suffix
+    - Dup-decision embedding: Reasoning contains a nested 'Decision: X Reasoning: <real>'
+    - Triple/quadruple embedding: multiple nested levels → take rightmost Reasoning: segment
+
+    In all cases the Outcome/Reward-signal trailer is stripped from the tail.
+    """
+    reasoning_line = ''
+    for line in (ideal_output or '').splitlines():
+        if line.lower().startswith('reasoning:'):
+            reasoning_line = line.split(':', 1)[1].strip()
+            break
+
+    if not reasoning_line:
+        return 'Analysis based on available market indicators.'
+
+    # Unwrap all levels of "Decision: ... Reasoning: <actual>" embedding
+    parts = re.split(r'(?i)reasoning:\s*', reasoning_line)
+    # Take the last non-empty segment (rightmost = real reasoning after all embedding)
+    actual = next((p.strip() for p in reversed(parts) if p.strip()), reasoning_line)
+
+    # Strip trailing Outcome / Reward-signal line appended to the Reasoning field
+    m = re.search(r'\s*\n?(?:outcome|reward\s+signal|result)\s*:', actual, re.IGNORECASE)
+    if m:
+        actual = actual[:m.start()].strip()
+
+    return actual if actual else 'Analysis based on available market indicators.'
+
+
+def _clean_constraint_ideal_output(ideal_output: str) -> str:
+    """Return a 3-line version of a constraint-block ideal_output.
+
+    Historical constraint rows have a 4th 'Outcome: ...' line appended.  Keep only
+    Decision, Confidence, and Reasoning — strip Outcome and anything after it.
+    """
+    kept: list[str] = []
+    for line in (ideal_output or '').splitlines():
+        ll = line.lower().lstrip()
+        if ll.startswith('outcome:') or ll.startswith('reward'):
+            break
+        kept.append(line)
+    result = '\n'.join(kept[:3])
+    return result if _is_clean_ideal_output(result) else ideal_output
+
+
+# ---------------------------------------------------------------------------
 # Compiled patterns for extracting indicator values from prompt text.
 # Two MA formats are supported with opposite sign conventions; both are
 # normalised internally to "price relative to MA" (positive = above).
@@ -439,13 +663,38 @@ def build_and_store(bot: str) -> tuple[int, int]:
     _EXPORT_SEED = int(os.getenv('TDB_EXPORT_SEED', '42'))
     _export_rng  = random.Random(_EXPORT_SEED)
 
+    # constraint_block and counterfactual are handled by separate capped pools below;
+    # exclude them from the primary EXPORT_LABELS check so they can't slip through.
+    _EXPORT_LABELS = (_SFT_IMITATION_LABELS | _DPO_LABELS) - {'counterfactual'}
+
     candidates = []
+    _constraint_pool: list[dict] = []
+    _cf_pool:         list[dict] = []   # all CFs available to DPO; SFT gets a capped sample
+    _skipped_blank_label = 0
+    _skipped_contaminated = 0
+    _skipped_taxonomy = 0
     for e in all_examples:
+        if not e.get('label'):
+            _skipped_blank_label += 1
+            continue
+        if not _is_clean_ideal_output(e.get('ideal_output', '')):
+            _skipped_contaminated += 1
+            continue
+        label = e['label']
+        if label == 'constraint_block':
+            _constraint_pool.append(e)
+            continue
+        if label == 'counterfactual':
+            _cf_pool.append(e)
+            continue
+        if label not in _EXPORT_LABELS:
+            _skipped_taxonomy += 1
+            continue
         w = _weight_for(e)
         candidates.append({
             'input':  e['prompt'],
             'output': e['ideal_output'],
-            'label':  e['label'],
+            'label':  label,
             'weight': round(w, 6),
             'metadata': {
                 'bot':          e['bot'],
@@ -459,6 +708,14 @@ def build_and_store(bot: str) -> tuple[int, int]:
                 'example_type': e.get('example_type', 'imitation'),
             }
         })
+
+    if _skipped_blank_label:
+        logging.warning("⚠️  SFT export: skipped %d rows with blank/null label", _skipped_blank_label)
+    if _skipped_contaminated:
+        logging.warning("⚠️  SFT export: skipped %d rows with contaminated ideal_output", _skipped_contaminated)
+    if _skipped_taxonomy:
+        logging.info("SFT export: skipped %d rows with taxonomy-excluded labels "
+                     "(weak_winner, missed_opportunity, etc.)", _skipped_taxonomy)
 
     # Probabilistic inclusion: each example retained with probability = weight
     exportable = [ex for ex in candidates if _export_rng.random() < ex['weight']]
@@ -497,18 +754,129 @@ def build_and_store(bot: str) -> tuple[int, int]:
             logging.info("  [export] %s: %d / %d retained (%.0f%%)", bkt, kept, total,
                          100 * kept / total)
 
-    filename = 'training_data.json' if bot == 'stock' else 'options_training_data.json'
-    output_path = _DATA_DIR / filename
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Constraint-block semantic cap: per-semantic-type cap + global ceiling.
+    # Step 0 found 2,293 blocks collapse to 2 types (correlation cap, sector cap).
+    # String-only dedup would export 30 near-identical correlation-cap variants.
+    # Semantic grouping caps each TYPE at _CONSTRAINT_BLOCK_PER_TYPE_CAP, giving
+    # surface variation within a type without burning the SFT budget on one rule.
+    _constraint_pool.sort(key=_weight_for, reverse=True)
+    _cb_type_counts:  dict[str, int] = {}
+    _cb_seen_strings: set[str]       = set()
+    _cb_selected:     list[dict]     = []
+    for e in _constraint_pool:
+        if len(_cb_selected) >= _CONSTRAINT_BLOCK_SFT_CAP:
+            break
+        out = e.get('ideal_output', '')
+        if out in _cb_seen_strings:
+            continue
+        sem_key = _constraint_semantic_key(out)
+        if _cb_type_counts.get(sem_key, 0) >= _CONSTRAINT_BLOCK_PER_TYPE_CAP:
+            continue
+        _cb_seen_strings.add(out)
+        _cb_type_counts[sem_key] = _cb_type_counts.get(sem_key, 0) + 1
+        _cb_selected.append({
+            'input':  e['prompt'],
+            'output': out,
+            'label':  e['label'],
+            'weight': 1.0,
+            'metadata': {
+                'bot':          e['bot'],
+                'symbol':       e['symbol'],
+                'confidence':   e['confidence'],
+                'pnl_pct':      e['pnl_pct'],
+                'reward':       e.get('reward'),
+                'entry_date':   e['entry_date'],
+                'session_id':   e['session_id'],
+                'prompt_hash':  e['prompt_hash'],
+                'example_type': 'constraint_block',
+            }
+        })
+    exportable.extend(_cb_selected)
+    if _constraint_pool:
+        logging.info(
+            "SFT export: constraint_block %d/%d (types: %s, per_type_cap=%d, global_cap=%d)",
+            len(_cb_selected), len(_constraint_pool),
+            dict(_cb_type_counts), _CONSTRAINT_BLOCK_PER_TYPE_CAP, _CONSTRAINT_BLOCK_SFT_CAP,
+        )
 
-    with open(output_path, 'w') as f:
+    # Counterfactual SFT cap: semantically-distinct sample only.
+    # ALL _cf_pool rows remain available to the DPO builder (nothing is deleted).
+    # We sort by recency weight so the 30 selected are recent AND diverse.
+    _cf_pool.sort(key=_weight_for, reverse=True)
+    _cf_seen_keys: set[str]   = set()
+    _cf_selected:  list[dict] = []
+    for e in _cf_pool:
+        if len(_cf_selected) >= _COUNTERFACTUAL_SFT_CAP:
+            break
+        out     = e.get('ideal_output', '')
+        sem_key = _counterfactual_semantic_key(out)
+        if sem_key in _cf_seen_keys:
+            continue
+        _cf_seen_keys.add(sem_key)
+        _cf_selected.append({
+            'input':  e['prompt'],
+            'output': out,
+            'label':  e['label'],
+            'weight': round(_weight_for(e), 6),
+            'metadata': {
+                'bot':          e['bot'],
+                'symbol':       e['symbol'],
+                'confidence':   e['confidence'],
+                'pnl_pct':      e['pnl_pct'],
+                'reward':       e.get('reward'),
+                'entry_date':   e['entry_date'],
+                'session_id':   e['session_id'],
+                'prompt_hash':  e['prompt_hash'],
+                'example_type': 'counterfactual',
+            }
+        })
+    exportable.extend(_cf_selected)
+    logging.info(
+        "SFT export: counterfactual %d/%d (semantic keys: %s, cap=%d)",
+        len(_cf_selected), len(_cf_pool), sorted(_cf_seen_keys), _COUNTERFACTUAL_SFT_CAP,
+    )
+
+    # ── HOLD-share tripwire ────────────────────────────────────────────────────
+    # An SFT set where most examples teach HOLD/decline cannot build a useful
+    # trading policy — it creates a do-nothing model. Log at WARNING and the
+    # cadence gate (Session 5) will refuse to fine-tune on a failing SFT set.
+    _hold_count = sum(1 for ex in exportable if ex.get('label') in _HOLD_TEACHING_LABELS)
+    _total_sft  = sum(1 for ex in exportable if ex.get('label') in _SFT_TRAIN_LABELS)
+    _hold_share = _hold_count / _total_sft if _total_sft else 0.0
+    if _hold_share > _SFT_MAX_HOLD_SHARE:
+        logging.warning(
+            "⚠️  SFT TRIPWIRE FAIL: HOLD-teaching share %.1f%% (%d/%d) exceeds %.0f%% ceiling. "
+            "SFT teaches do-nothing. Accumulate more take-trade examples before fine-tuning.",
+            100 * _hold_share, _hold_count, _total_sft, 100 * _SFT_MAX_HOLD_SHARE,
+        )
+    else:
+        logging.info(
+            "  [tripwire] HOLD-share %.1f%% (%d/%d) — within %.0f%% ceiling ✓",
+            100 * _hold_share, _hold_count, _total_sft, 100 * _SFT_MAX_HOLD_SHARE,
+        )
+
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # SFT-only file: physically contains only _SFT_TRAIN_LABELS rows.
+    # fine_tune_llm.py reads this file; its line-166 label filter is now belt-and-suspenders
+    # (drops 0 rows in the normal case; a guard if the file is ever corrupt or misrouted).
+    sft_only = [ex for ex in exportable if ex.get('label') in _SFT_TRAIN_LABELS]
+    sft_filename = 'training_data_sft.json' if bot == 'stock' else 'options_training_data_sft.json'
+    with open(_DATA_DIR / sft_filename, 'w') as f:
+        json.dump(sft_only, f, indent=2)
+
+    # Combined archive: all labels (loser-family included) — for debugging and DPO inspection.
+    # DO NOT feed this file to fine_tune_llm.py or finetune_model.py.
+    archive_filename = ('training_data_archive.json' if bot == 'stock'
+                        else 'options_training_data_archive.json')
+    with open(_DATA_DIR / archive_filename, 'w') as f:
         json.dump(exportable, f, indent=2)
 
     logging.info(
-        "✅ %s: +%d new examples → %d exported (probabilistic, of %d total)",
-        bot.capitalize(), added, len(exportable), len(all_examples),
+        "✅ %s: +%d new examples → %d SFT rows / %d archive rows (of %d total in DB)",
+        bot.capitalize(), added, len(sft_only), len(exportable), len(all_examples),
     )
-    return added, len(exportable)
+    return added, len(sft_only)
 
 
 def build_portfolio_level_examples() -> int:
@@ -574,7 +942,7 @@ def build_portfolio_level_examples() -> int:
                 f"the {cap_str} sector cap. Adding {symbol} would have worsened concentration risk. "
                 f"Next time, route capital to under-represented sectors or wait for rebalancing."
             )
-            label = 'correct_hold'
+            label = 'constraint_block'
         else:
             output = (
                 f"Decision: HOLD\n"
@@ -582,7 +950,7 @@ def build_portfolio_level_examples() -> int:
                 f"Reasoning: Trade was blocked due to: {reason}. "
                 f"Review position sizing and sector limits before retrying."
             )
-            label = 'correct_hold'
+            label = 'constraint_block'
 
         example = {
             'input': prompt,
@@ -618,7 +986,8 @@ def run(bot: str = 'both') -> None:
     build_portfolio_level_examples()
 
 
-def regenerate_counterfactuals(bot: str = 'both') -> tuple[int, int]:
+def regenerate_counterfactuals(bot: str = 'both',
+                               db_path: 'Path | str | None' = None) -> tuple[int, int]:
     """Purge stale counterfactual rows and regenerate them with the current format.
 
     Cannot simply DELETE + call build_and_store: the imitation hash for each loser
@@ -626,9 +995,11 @@ def regenerate_counterfactuals(bot: str = 'both') -> tuple[int, int]:
     entirely. Instead this function queries loser imitation rows directly and builds
     counterfactual rows in a separate pass.
 
+    db_path defaults to the live DB.  Pass a copy path for Session-4 dry-runs.
+
     Returns (deleted_count, inserted_count).
     """
-    db_path = _db.DB_PATH
+    db_path = Path(db_path) if db_path else _db.DB_PATH
     _db.init_db(db_path)
 
     # Step 1: delete all counterfactual rows
@@ -699,6 +1070,171 @@ def regenerate_counterfactuals(bot: str = 'both') -> tuple[int, int]:
     return deleted, inserted
 
 
+def regenerate_historical(db_path: 'Path | str', dry_run: bool = False) -> dict:
+    """Regenerate contaminated historical rows using the current Session-2 taxonomy.
+
+    Operates exclusively against db_path.  All writes run inside a single
+    transaction; any exception triggers a full rollback so a partial pass cannot
+    leave the DB half-rewritten.
+
+    What this function does:
+    - Selects every row where ideal_output fails _is_clean_ideal_output.
+    - For rows whose ideal_output is constraint-block content (including the 2,262
+      historical correct_hold rows): relabels to 'constraint_block' and strips the
+      'Outcome:' trailer from the ideal_output.
+    - For clean-format rows mislabeled as correct_hold but containing constraint
+      content: relabels to 'constraint_block' (no ideal_output change needed).
+    - For traded rows (BUY/SELL): recomputes label via _tiered_label_from_pnl with
+      the current thresholds (STRONG_WIN_PCT=0.20, sell-side sign convention).
+    - For genuine hold rows (HOLD, non-constraint): keeps label as correct_hold,
+      rebuilds clean ideal_output by extracting reasoning from the contaminated string.
+    - Leaves unrecoverable rows untouched (blank label; no pnl_pct and not a
+      constraint block; rebuilt ideal_output still fails validation).
+    - After writes, calls regenerate_counterfactuals to refresh counterfactual rows
+      for all loser-family rows.
+
+    dry_run=True computes and logs the projected distribution without any writes.
+
+    Returns dict with keys: updated, skipped, label_changes, new_labels,
+                            cf_deleted, cf_inserted (last two are 0 in dry-run).
+    """
+    from collections import Counter
+    db_path = Path(db_path)
+    _db.init_db(db_path)
+
+    all_rows = _db.get_training_examples(db_path=db_path)
+    logging.info("regenerate_historical: %d total rows in %s", len(all_rows), db_path)
+
+    updates: list[tuple[int, str, str]] = []   # (id, new_label, new_ideal_output)
+    skipped_ids:  list[int] = []
+    skip_reasons: Counter   = Counter()
+    label_changes: Counter  = Counter()         # (old_label, new_label) → count
+
+    for row in all_rows:
+        ideal    = row.get('ideal_output', '') or ''
+        old_label = (row.get('label', '') or '').strip()
+        row_id   = row['id']
+
+        # ── Already clean: only need a label fix for clean constraint-block rows ─
+        if _is_clean_ideal_output(ideal):
+            if old_label == 'correct_hold' and _is_constraint_block(ideal):
+                updates.append((row_id, 'constraint_block', ideal))
+                label_changes[(old_label, 'constraint_block')] += 1
+            # else: clean AND correctly labeled → leave untouched
+            continue
+
+        # ── No label → unrecoverable ─────────────────────────────────────────────
+        if not old_label:
+            skipped_ids.append(row_id)
+            skip_reasons['blank_label'] += 1
+            continue
+
+        decision   = _extract_decision(ideal)
+        confidence = float(row.get('confidence') or 0.75)
+
+        # ── Constraint-block content ──────────────────────────────────────────────
+        if _is_constraint_block(ideal):
+            new_label = 'constraint_block'
+            new_ideal = _clean_constraint_ideal_output(ideal)
+            if not _is_clean_ideal_output(new_ideal):
+                skipped_ids.append(row_id)
+                skip_reasons['constraint_strip_failed'] += 1
+                continue
+            updates.append((row_id, new_label, new_ideal))
+            label_changes[(old_label, new_label)] += 1
+            continue
+
+        # ── Genuine HOLD ─────────────────────────────────────────────────────────
+        if decision == 'hold':
+            reasoning = _extract_reasoning_clean(ideal)
+            new_ideal = _build_ideal_output(decision, confidence, reasoning, old_label)
+            if not _is_clean_ideal_output(new_ideal):
+                skipped_ids.append(row_id)
+                skip_reasons['hold_rebuild_failed'] += 1
+                continue
+            updates.append((row_id, old_label, new_ideal))
+            label_changes[(old_label, old_label)] += 1
+            continue
+
+        # ── Traded rows (BUY / SELL / options) ───────────────────────────────────
+        pnl_pct = row.get('pnl_pct')
+        if pnl_pct is None:
+            skipped_ids.append(row_id)
+            skip_reasons['no_pnl_pct'] += 1
+            continue
+
+        new_label, _ = _tiered_label_from_pnl(float(pnl_pct), decision)
+        reasoning     = _extract_reasoning_clean(ideal)
+        new_ideal     = _build_ideal_output(decision, confidence, reasoning, new_label)
+        if not _is_clean_ideal_output(new_ideal):
+            skipped_ids.append(row_id)
+            skip_reasons['traded_rebuild_failed'] += 1
+            continue
+
+        updates.append((row_id, new_label, new_ideal))
+        label_changes[(old_label, new_label)] += 1
+
+    new_label_dist = Counter(new_label for (_, new_label, _) in updates)
+    # Include unchanged clean rows in distribution for completeness
+    clean_unchanged = Counter(
+        (row.get('label', '') or '').strip()
+        for row in all_rows
+        if _is_clean_ideal_output(row.get('ideal_output', '') or '')
+        and not (
+            (row.get('label', '') or '').strip() == 'correct_hold'
+            and _is_constraint_block(row.get('ideal_output', '') or '')
+        )
+    )
+
+    logging.info("regenerate_historical: %d rows to update, %d unrecoverable (skipped)",
+                 len(updates), len(skipped_ids))
+    logging.info("  Skip reasons: %s", dict(skip_reasons))
+    logging.info("  Label changes (old→new): %s",
+                 {f"{o}→{n}": c for (o, n), c in sorted(label_changes.items())})
+    logging.info("  New label distribution (updated rows): %s", dict(new_label_dist))
+    logging.info("  Unchanged clean rows: %s", dict(clean_unchanged))
+
+    if dry_run:
+        logging.info("DRY RUN — no writes performed against %s", db_path)
+        return {
+            'updated': len(updates),
+            'skipped': len(skipped_ids),
+            'skip_reasons': dict(skip_reasons),
+            'label_changes': {f"{o}→{n}": c for (o, n), c in label_changes.items()},
+            'new_labels': dict(new_label_dist),
+            'unchanged_clean': dict(clean_unchanged),
+            'cf_deleted': 0,
+            'cf_inserted': 0,
+        }
+
+    # ── Write — single transaction, rollback on any exception ─────────────────
+    try:
+        with _db.get_conn(db_path) as conn:
+            for row_id, new_label, new_ideal in updates:
+                conn.execute(
+                    "UPDATE training_examples SET label = ?, ideal_output = ? WHERE id = ?",
+                    (new_label, new_ideal, row_id),
+                )
+        logging.info("✅ regenerate_historical: wrote %d updates to %s", len(updates), db_path)
+    except Exception:
+        logging.error("❌ regenerate_historical: transaction failed — DB left unchanged", exc_info=True)
+        raise
+
+    # ── Refresh counterfactuals for all loser-family rows ─────────────────────
+    cf_deleted, cf_inserted = regenerate_counterfactuals('both', db_path=db_path)
+
+    return {
+        'updated': len(updates),
+        'skipped': len(skipped_ids),
+        'skip_reasons': dict(skip_reasons),
+        'label_changes': {f"{o}→{n}": c for (o, n), c in label_changes.items()},
+        'new_labels': dict(new_label_dist),
+        'unchanged_clean': dict(clean_unchanged),
+        'cf_deleted': cf_deleted,
+        'cf_inserted': cf_inserted,
+    }
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Build enriched fine-tuning examples')
     parser.add_argument('--bot', choices=['stock', 'options', 'both'], default='both')
@@ -706,8 +1242,25 @@ if __name__ == '__main__':
         '--regenerate-counterfactuals', action='store_true',
         help='Purge stale counterfactual rows and regenerate them (separate pass, no imitation hash collision)',
     )
+    parser.add_argument(
+        '--regenerate-historical', action='store_true',
+        help='Regenerate contaminated historical rows with current Session-2 taxonomy (use with --db)',
+    )
+    parser.add_argument(
+        '--db', default=None,
+        help='DB path for --regenerate-historical (required; never defaults to live DB)',
+    )
+    parser.add_argument(
+        '--dry-run', action='store_true',
+        help='With --regenerate-historical: compute projected distribution without writing',
+    )
     args = parser.parse_args()
-    if args.regenerate_counterfactuals:
+    if args.regenerate_historical:
+        if not args.db:
+            parser.error('--regenerate-historical requires --db <path>')
+        stats = regenerate_historical(args.db, dry_run=args.dry_run)
+        logging.info("regenerate_historical complete: %s", stats)
+    elif args.regenerate_counterfactuals:
         deleted, inserted = regenerate_counterfactuals(args.bot)
         logging.info("Regeneration complete: deleted=%d inserted=%d", deleted, inserted)
         run(args.bot)
