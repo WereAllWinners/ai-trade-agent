@@ -28,7 +28,7 @@ except Exception:
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import _pathfix  # noqa: F401
 from model_inference_lora import get_trading_decision, parse_decision, _generate_base_model
-from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
+from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed, set_alert_source
 import news_fetcher
 import unusual_flow_scanner
 import economic_calendar
@@ -321,6 +321,7 @@ class OptionsAgent:
 
         self.paper_sim = PaperMarketSimulator(paper=_paper)
         self._paper    = _paper
+        set_alert_source('paper' if _paper else 'live')
 
         # Portfolio-level guards (sector cap + correlation limit)
         self.overseer = PortfolioOverseer(self.trading_client)

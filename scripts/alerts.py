@@ -36,6 +36,17 @@ _ALERTS_LOG.parent.mkdir(parents=True, exist_ok=True)
 
 log = logging.getLogger(__name__)
 
+# Agent-level source tag written into every alert record.
+# Set once at agent init via set_alert_source() so no individual call site
+# needs to remember. Separate daemon processes are isolated, so this is safe.
+_ALERT_SOURCE: str = 'unknown'
+
+
+def set_alert_source(source: str) -> None:
+    """Set the source tag for all alerts from this process ('paper' or 'live')."""
+    global _ALERT_SOURCE
+    _ALERT_SOURCE = source
+
 
 class AlertLevel(str, Enum):
     INFO = 'INFO'
@@ -63,6 +74,7 @@ def send_alert(level: AlertLevel, event: str, message: str, data: dict = None) -
         'event': event,
         'message': message,
         'host': socket.gethostname(),
+        'source': _ALERT_SOURCE,
     }
     if data:
         record['data'] = data

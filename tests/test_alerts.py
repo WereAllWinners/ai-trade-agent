@@ -154,3 +154,61 @@ class TestSendAlertCallsTelegram:
             send_alert(AlertLevel.INFO, 'test', 'msg')  # must not raise
 
         assert len(written) == 1
+
+
+# ── source tagging ─────────────────────────────────────────────────────────────
+
+class TestAlertSourceTagging:
+    """send_alert() writes source='live'|'paper' set by set_alert_source()."""
+
+    def _emit(self) -> dict:
+        """Emit one alert and return the written record."""
+        written = []
+        with patch('alerts._write_to_log', side_effect=lambda r: written.append(r)), \
+             patch('alerts._send_email'), \
+             patch('alerts._send_telegram'):
+            send_alert(AlertLevel.INFO, 'test_source', 'checking source field')
+        assert written, "send_alert must call _write_to_log"
+        return written[0]
+
+    def test_live_agent_emits_source_live(self):
+        """set_alert_source('live') → every record carries source='live'."""
+        alerts.set_alert_source('live')
+        try:
+            record = self._emit()
+            assert record.get('source') == 'live', (
+                f"Expected source='live', got {record.get('source')!r}"
+            )
+        finally:
+            alerts.set_alert_source('unknown')
+
+    def test_paper_agent_emits_source_paper(self):
+        """set_alert_source('paper') → every record carries source='paper'."""
+        alerts.set_alert_source('paper')
+        try:
+            record = self._emit()
+            assert record.get('source') == 'paper', (
+                f"Expected source='paper', got {record.get('source')!r}"
+            )
+        finally:
+            alerts.set_alert_source('unknown')
+
+    def test_source_present_in_record_without_set(self):
+        """source field always present (default 'unknown') — never missing from log."""
+        alerts.set_alert_source('unknown')
+        record = self._emit()
+        assert 'source' in record, "source field must always be present in alert record"
+
+    def test_trade_failed_alert_carries_source(self):
+        """alert_trade_failed() convenience wrapper also carries the source tag."""
+        from alerts import alert_trade_failed
+        alerts.set_alert_source('live')
+        try:
+            written = []
+            with patch('alerts._write_to_log', side_effect=lambda r: written.append(r)), \
+                 patch('alerts._send_email'), \
+                 patch('alerts._send_telegram'):
+                alert_trade_failed('StockAgent', 'OXY', 'bracket rejected 42210000')
+            assert written[0].get('source') == 'live'
+        finally:
+            alerts.set_alert_source('unknown')

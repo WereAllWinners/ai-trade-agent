@@ -23,7 +23,7 @@ import _pathfix  # noqa: F401
 
 from model_inference_lora import get_trading_decision, parse_decision, load_model_once, _generate_base_model
 from stock_discovery import StockDiscovery
-from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed
+from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_failed, set_alert_source
 import news_fetcher
 import economic_calendar
 import db as _db
@@ -330,6 +330,7 @@ class AutonomousAgent:
         self._last_order_id: str | None = None
         self._session_regime: str | None = None
         self._paper             = _paper
+        set_alert_source('paper' if _paper else 'live')
 
         # Decision logging — unique ID per process run for replay correlation
         self.session_id = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -605,6 +606,7 @@ class AutonomousAgent:
                     return False
                 shares = float(position.qty)
                 avg_entry_price = float(position.avg_entry_price)
+                position_value = shares * current_price  # defined for the sanity check below
             else:
                 # Proactive PDT check — count today's round trips before another buy
                 if not self.pdt_blocked:
@@ -695,11 +697,10 @@ class AutonomousAgent:
             target_price = round(fill_price * (1 + self.params['take_profit']), 2)
 
             no_bracket = (
-                shares != int(shares)  # fractional — Alpaca rejects bracket
-                or (
-                    not _ALLOW_SAME_DAY_STOP_OUT
-                    and self.params.get('no_same_day_close')
-                )
+                side == OrderSide.SELL          # exits are plain orders, never bracketed
+                or shares != int(shares)        # fractional — Alpaca rejects bracket
+                or (not _ALLOW_SAME_DAY_STOP_OUT
+                    and self.params.get('no_same_day_close'))
             )
             if no_bracket:
                 order = MarketOrderRequest(
@@ -708,11 +709,14 @@ class AutonomousAgent:
                     side=side,
                     time_in_force=TimeInForce.DAY,
                 )
-                logging.info(
-                    f"📋 {'Fractional' if shares != int(shares) else 'PDT-safe'} order — "
-                    f"no bracket (stop ${stop_price:.2f} / target ${target_price:.2f} "
-                    f"— reprotect sweep will attach OCO next session)"
-                )
+                if side == OrderSide.SELL:
+                    logging.info(f"📋 Exit order — plain market sell {shares} {symbol}")
+                else:
+                    logging.info(
+                        f"📋 {'Fractional' if shares != int(shares) else 'PDT-safe'} order — "
+                        f"no bracket (stop ${stop_price:.2f} / target ${target_price:.2f} "
+                        f"— reprotect sweep will attach OCO next session)"
+                    )
             else:
                 order = LimitOrderRequest(
                     symbol=symbol,
