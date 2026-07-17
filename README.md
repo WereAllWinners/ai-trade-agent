@@ -1,6 +1,6 @@
 # AI Trade Agent
 
-Autonomous AI-powered trading system with dual agents for stocks and options, featuring self-improving capabilities through daily model fine-tuning. Runs 24/7 on an NVIDIA GB10 Grace Blackwell (128 GB unified memory).
+Autonomous AI-powered trading system with dual agents for stocks and options, featuring self-improving capabilities through periodic model fine-tuning. Runs 24/7 on an NVIDIA GB10 Grace Blackwell (128 GB unified memory).
 
 ## Architecture Overview
 
