@@ -1,0 +1,19 @@
+[Unit]
+Description=Expiry Sentinel — alerts on long option positions approaching expiration, regardless of daemon state (R1 WI-3)
+# Deliberately NO After=/Requires= on any trading bot unit — auto-exercise
+# risk exists independent of whether the daemon that would normally close
+# the position is running. That's the exact gap this backstop closes.
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/zgx/personal-projects/ai-trade-agent
+TimeoutStartSec=120s
+
+EnvironmentFile=/home/zgx/personal-projects/ai-trade-agent/.env
+
+ExecStart=/home/zgx/personal-projects/ai-trade-agent/venv/bin/python \
+    /home/zgx/personal-projects/ai-trade-agent/scripts/tools/expiry_sentinel.py
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-expiry-sentinel

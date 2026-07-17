@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the expiry sentinel daily, pre-market (R1 WI-3)
+
+[Timer]
+OnCalendar=*-*-* 08:00:00
+# Catch up on boot if the box was off past a scheduled run, rather than
+# silently skipping a day's check.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
