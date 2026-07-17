@@ -26,7 +26,7 @@ import logging
 import os
 import smtplib
 import socket
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from enum import Enum
 from pathlib import Path
@@ -85,6 +85,108 @@ def send_alert(level: AlertLevel, event: str, message: str, data: dict = None) -
     _log_to_stderr(level, event, message)
     _send_email(level, event, message, record)
     _send_telegram(full_message)
+
+
+# ---------------------------------------------------------------------------
+# Per-day dedup (sprint02 D5b/D6a)
+# ---------------------------------------------------------------------------
+
+_ALERT_DEDUP_PATH = Path(__file__).resolve().parent.parent / 'logs' / 'alert_dedup.json'
+
+
+def alert_once_per_day(condition_key: str, send_fn) -> bool:
+    """Call send_fn() at most once per calendar day for a given condition_key.
+
+    Several degraded-but-fail-open conditions (a dead Finnhub key, a low-yield
+    discovery scan) need to stay loud without becoming spam: this process
+    restarts roughly every 30 minutes, so a naive "once per session" guard on
+    a persistently failing condition means ~13 alerts/day — indistinguishable
+    from noise. State is a small JSON file mapping condition_key -> last-
+    alerted date, per-service-suffixed (paper and live don't share dedup
+    state, matching D4.1's shared-file isolation).
+
+    Returns True if send_fn was actually called (first time today for this
+    key), False if suppressed as a same-day duplicate.
+    """
+    from service_suffix import suffixed_path
+    path = suffixed_path(_ALERT_DEDUP_PATH)
+    today = datetime.now().date().isoformat()
+
+    state = {}
+    try:
+        if path.exists():
+            state = json.loads(path.read_text())
+    except Exception:
+        state = {}
+
+    if state.get(condition_key) == today:
+        return False
+
+    send_fn()
+
+    state[condition_key] = today
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, indent=2))
+    except Exception as e:
+        log.warning(f"alerts: could not persist dedup state for {condition_key}: {e}")
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Timestamp-based backoff (R1 WI-2) — alert_once_per_day's calendar-day
+# granularity doesn't fit a 15-minute-cadence watchdog; this is a sibling
+# with the same shape (shared dedup-file idiom, fail-open on persistence
+# errors) but a duration-based window instead of a date string.
+# ---------------------------------------------------------------------------
+
+_ALERT_BACKOFF_PATH = Path(__file__).resolve().parent.parent / 'logs' / 'alert_backoff.json'
+
+
+def alert_with_backoff(condition_key: str, send_fn, min_interval_hours: float = 6.0) -> bool:
+    """Call send_fn() immediately the first time condition_key is seen, then
+    at most once per min_interval_hours after that — "repeat with backoff,
+    not once" for conditions serious enough that a single alert isn't enough
+    but a 15-minute-cadence resend would be spam.
+
+    Unlike alert_once_per_day, this is deliberately NOT service-suffixed via
+    suffixed_path() — callers that check multiple accounts in one process
+    (the watchdog checks both paper and live) must make condition_key itself
+    account-unique (e.g. include the unit name or 'paper'/'live' in the key);
+    suffixed_path() reads the *process's* ambient PAPER_TRADING env var,
+    which is wrong for a dual-account single process. One shared state file,
+    disambiguated by key content instead.
+
+    Returns True if send_fn was actually called, False if suppressed as
+    still within the backoff window.
+    """
+    state = {}
+    try:
+        if _ALERT_BACKOFF_PATH.exists():
+            state = json.loads(_ALERT_BACKOFF_PATH.read_text())
+    except Exception:
+        state = {}
+
+    last_str = state.get(condition_key)
+    if last_str:
+        try:
+            last = datetime.fromisoformat(last_str)
+            if datetime.now() - last < timedelta(hours=min_interval_hours):
+                return False
+        except Exception:
+            pass  # unparsable state -> treat as never-alerted, fail toward alerting
+
+    send_fn()
+
+    state[condition_key] = datetime.now().isoformat()
+    try:
+        _ALERT_BACKOFF_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _ALERT_BACKOFF_PATH.write_text(json.dumps(state, indent=2))
+    except Exception as e:
+        log.warning(f"alerts: could not persist backoff state for {condition_key}: {e}")
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +464,61 @@ def alert_trade_executed(agent_name: str, symbol: str, action: str,
     send_alert(AlertLevel.INFO, 'trade_executed', message, data=data)
 
 
+def alert_exit_failed(agent_name: str, symbol: str, order_id: str,
+                      broker_status: str, intended_reason: str,
+                      filled_qty: float = 0) -> None:
+    """R1 WI-4/5: an exit order did not reach a filled terminal state —
+    the position may still be open and unprotected. This is exactly the
+    event that went silent in the 2026-07 incident (NVDA/AAPL exits logged
+    as complete while the real orders expired unfilled); firing this alert
+    is the fix."""
+    send_alert(
+        AlertLevel.CRITICAL,
+        'exit_failed',
+        f"{agent_name}: exit for {symbol} did NOT fill — broker status "
+        f"'{broker_status}' (intended: {intended_reason}). Position may "
+        f"still be open and unprotected.",
+        data={'agent': agent_name, 'symbol': symbol, 'order_id': order_id,
+              'broker_status': broker_status, 'intended_reason': intended_reason,
+              'filled_qty': filled_qty},
+    )
+
+
+def alert_service_down_with_positions(unit_name: str, account_label: str, bot: str,
+                                      positions: list, orders: list) -> None:
+    """R1 WI-2: a trading service is stopped while its account still holds
+    open positions or orders in its instrument class — nothing is watching
+    them. This is the exact condition that let the 2026-07 auto-exercise
+    incident go unnoticed for 10.5 days."""
+    symbols = sorted({p.symbol for p in positions} | {o.symbol for o in orders})
+    send_alert(
+        AlertLevel.CRITICAL,
+        'service_down_with_positions',
+        f"{unit_name} ({account_label}/{bot}) is stopped but holds "
+        f"{len(positions)} position(s) and {len(orders)} open order(s): "
+        f"{', '.join(symbols)}. Nothing is monitoring them.",
+        data={'unit': unit_name, 'account': account_label, 'bot': bot,
+              'position_count': len(positions), 'order_count': len(orders),
+              'symbols': symbols},
+    )
+
+
+def alert_cash_negative(account_label: str, cash: float, non_marginable_buying_power: float) -> None:
+    """R1 WI-7: the account's cash invariant (cash >= 0 and
+    non_marginable_buying_power >= 0) has been breached — the exact failure
+    mode of the 2026-07 incident. Paired with a HALT_BUYS flag write by the
+    caller; clearing is manual only."""
+    send_alert(
+        AlertLevel.CRITICAL,
+        'cash_negative',
+        f"{account_label} account cash invariant breached: cash=${cash:,.2f} "
+        f"non_marginable_buying_power=${non_marginable_buying_power:,.2f}. "
+        f"HALT_BUYS flag set — manual clear required.",
+        data={'account': account_label, 'cash': cash,
+              'non_marginable_buying_power': non_marginable_buying_power},
+    )
+
+
 def alert_trade_failed(agent_name: str, symbol: str, error: str) -> None:
     send_alert(
         AlertLevel.WARNING,
@@ -451,6 +608,58 @@ def _send_readiness_email(agent_name: str, scorecard: str, verdict: str,
         log.info(f"alerts: readiness email sent to {recipients}")
     except Exception as e:
         log.error(f"alerts: readiness email failed ({e})")
+
+
+def alert_macro_calendar_stale(reason: str) -> None:
+    """The static macro event calendar (data/macro_event_calendar.json) has
+    run out of future-dated events (sprint04 F1.3). Fails open — trading
+    proceeds, the macro-halt guard just can't see today's events — but that
+    degraded state must be visible. Deduped to once/calendar day."""
+    alert_once_per_day('macro_calendar_stale', lambda: send_alert(
+        AlertLevel.WARNING, 'macro_calendar_stale',
+        f"Macro event calendar is stale — trading proceeds fail-open, but "
+        f"FOMC/NFP/CPI halt guard is blind until this is fixed: {reason}",
+        data={'reason': reason},
+    ))
+
+
+def alert_discovery_low_yield(n_discovered: int, floor: int) -> None:
+    """A completed scan yielded fewer opportunities than the cacheable floor
+    (sprint02 D6a) — often a symptom of an upstream data-source outage
+    (pandas/read_html breakage, yfinance rate-limiting). Deduped to
+    once/calendar day per service."""
+    alert_once_per_day('discovery_low_yield', lambda: send_alert(
+        AlertLevel.WARNING, 'discovery_low_yield',
+        f"Discovery scan yielded only {n_discovered} opportunities (floor={floor}) "
+        f"— result not cached, but check for an upstream data-source outage.",
+        data={'n_discovered': n_discovered, 'floor': floor},
+    ))
+
+
+def alert_yfinance_batch_chunk_failure(pct_empty: float, chunk_size: int) -> None:
+    """A batched yfinance history fetch (sprint04 F3) came back mostly empty
+    for an entire chunk — classified as an infrastructure-level failure
+    (rate limit / network blip / Yahoo outage), not evidence any individual
+    symbol in the chunk is delisted. Deduped to once/calendar day per
+    service so a bad morning doesn't spam alerts per-chunk."""
+    alert_once_per_day('yfinance_batch_chunk_failure', lambda: send_alert(
+        AlertLevel.WARNING, 'yfinance_batch_chunk_failure',
+        f"yfinance batch fetch chunk ({chunk_size} symbols) returned "
+        f"{pct_empty:.0%} empty — treating as infrastructure failure, not "
+        f"symbol death; no delisted-counter changes recorded for this chunk.",
+        data={'pct_empty': pct_empty, 'chunk_size': chunk_size},
+    ))
+
+
+def alert_discovery_curated_fetch_failed() -> None:
+    """All three curated index fetches (S&P 500 / NASDAQ 100 / Dow 30) failed
+    in one scan — the universe falls back to the hardcoded popular-stocks
+    list only (sprint02 D6a). Deduped to once/calendar day per service."""
+    alert_once_per_day('discovery_curated_fetch_failed', lambda: send_alert(
+        AlertLevel.WARNING, 'discovery_curated_fetch_failed',
+        "All curated index fetches (S&P 500 / NASDAQ 100 / Dow 30) failed — "
+        "discovery universe fell back to the hardcoded popular-stocks list only.",
+    ))
 
 
 if __name__ == '__main__':

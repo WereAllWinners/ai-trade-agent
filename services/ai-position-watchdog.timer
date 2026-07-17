@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the position watchdog every 15 minutes (R1 WI-2)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+# If the box was off/asleep past a scheduled run, catch up on boot rather
+# than silently skipping — same reasoning as the expiry sentinel's timer.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=Position Watchdog — detects a stopped trading service that still holds open positions/orders (R1 WI-2)
+# Deliberately NO After=/Requires= on any trading bot unit — this must keep
+# working precisely when those services are down. That's the whole point.
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/zgx/personal-projects/ai-trade-agent
+TimeoutStartSec=120s
+
+# Load environment variables from .env (email/SMTP alert config; the script
+# loads Alpaca credentials itself via dotenv_values() for both .env and
+# .env.live, not via this EnvironmentFile).
+EnvironmentFile=/home/zgx/personal-projects/ai-trade-agent/.env
+
+ExecStart=/home/zgx/personal-projects/ai-trade-agent/venv/bin/python \
+    /home/zgx/personal-projects/ai-trade-agent/scripts/tools/position_watchdog.py
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-position-watchdog
