@@ -33,6 +33,7 @@ import news_fetcher
 import unusual_flow_scanner
 import economic_calendar
 import db as _db
+import halt_buys
 from portfolio_overseer import PortfolioOverseer
 from allocation_controller import AllocationController
 from paper_market_simulator import PaperMarketSimulator
@@ -874,6 +875,21 @@ Reasoning: <one sentence explaining the key signal>"""
 
             # Clean up stale cross-bot reservations before re-checking cash
             _db.cleanup_stale_reservations(max_age_seconds=120)
+
+            # R1 WI-7: HALT_BUYS flag — set by position_watchdog.py on a cash
+            # invariant breach (cash < 0 or non_marginable_buying_power < 0),
+            # the exact failure mode of the 2026-07 incident. Fail-closed:
+            # an unreadable flag state blocks buys too. Manual clear only —
+            # see docs/operations.md. This does not touch the existing cash
+            # gate below; it's a small, independent, guarded addition ahead
+            # of it, not a restructure.
+            _halt_flag = halt_buys.flag_path(getattr(self, '_paper', True))
+            if halt_buys.is_halt_active(_halt_flag):
+                logging.critical(
+                    f"🛑 HALT_BUYS flag active ({_halt_flag}) — refusing BUY {symbol}. "
+                    f"Manual clear required (see docs/operations.md)."
+                )
+                return False
 
             # Re-fetch live cash + subtract any active cross-bot reservations.
             # available_capital was computed earlier and can be stale if the stock

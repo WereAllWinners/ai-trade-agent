@@ -1,6 +1,5 @@
 """
-tests/test_position_watchdog.py — R1 WI-2 (WI-7's cash-invariant extension
-is added in tests/test_position_watchdog.py by a later work item; not here).
+tests/test_position_watchdog.py — R1 WI-2 + WI-7 (cash invariant)
 
 Covers:
   - all services active -> no alerts, no exposure check attempted
@@ -9,6 +8,9 @@ Covers:
   - service down, account fetch raises -> WARNING alert (degraded info,
     never silently treated as clean)
   - unit not installed ('not_found') -> skipped entirely, not an alert
+  - WI-7: cash invariant breach -> CRITICAL alert + HALT_BUYS flag written;
+    healthy -> no flag; check runs unconditionally per account, independent
+    of service state
 """
 import sys
 from pathlib import Path
@@ -136,3 +138,92 @@ class TestDryRun:
         )
         assert exit_code == 1  # still reports what it would have done
         assert not mock_backoff.called
+
+
+def _account(cash, non_marginable_buying_power):
+    a = MagicMock()
+    a.cash = str(cash)
+    a.non_marginable_buying_power = str(non_marginable_buying_power)
+    return a
+
+
+class TestCashInvariant:
+    def _run_cash_only(self, cash, nmbp, dry_run=False, account_error=None):
+        """All services active (isolates the cash-invariant path from the
+        service-exposure path, which is already covered above)."""
+        paper_client = MagicMock()
+        paper_client.get_all_positions.return_value = []
+        paper_client.get_orders.return_value = []
+        if account_error is not None:
+            paper_client.get_account.side_effect = account_error
+        else:
+            paper_client.get_account.return_value = _account(cash, nmbp)
+
+        with patch('position_watchdog._build_clients', return_value={'paper': paper_client}), \
+             patch('position_watchdog.service_state', return_value='active'), \
+             patch('position_watchdog._alerts.alert_with_backoff') as mock_backoff, \
+             patch('position_watchdog._alerts.alert_cash_negative') as mock_alert_cash, \
+             patch('position_watchdog._halt_buys.write_halt_flag') as mock_write_flag:
+            exit_code = position_watchdog.run(dry_run=dry_run)
+        return exit_code, mock_backoff, mock_alert_cash, mock_write_flag
+
+    def test_healthy_cash_no_flag_no_alert(self):
+        exit_code, mock_backoff, mock_alert_cash, mock_write_flag = self._run_cash_only(
+            cash=1000.0, nmbp=1000.0,
+        )
+        assert exit_code == 0
+        assert not mock_backoff.called
+        assert not mock_write_flag.called
+
+    def test_negative_cash_breach_writes_flag_and_alerts(self):
+        exit_code, mock_backoff, mock_alert_cash, mock_write_flag = self._run_cash_only(
+            cash=-58736.66, nmbp=57881.84,  # the exact incident numbers
+        )
+        assert exit_code == 1
+        assert mock_backoff.called
+        mock_write_flag.assert_called_once()
+        flag_path_arg = mock_write_flag.call_args[0][0]
+        assert 'live' not in flag_path_arg.name  # paper account -> paper flag path
+
+    def test_negative_non_marginable_buying_power_also_breaches(self):
+        """Both halves of the invariant matter independently -- cash could
+        be technically non-negative while non_marginable_buying_power still
+        signals a problem."""
+        exit_code, _, _, mock_write_flag = self._run_cash_only(cash=100.0, nmbp=-1.0)
+        assert exit_code == 1
+        assert mock_write_flag.called
+
+    def test_dry_run_does_not_write_flag(self):
+        exit_code, mock_backoff, _, mock_write_flag = self._run_cash_only(
+            cash=-100.0, nmbp=-100.0, dry_run=True,
+        )
+        assert exit_code == 1  # still reports what it would have done
+        assert not mock_write_flag.called
+        assert not mock_backoff.called
+
+    def test_account_fetch_error_does_not_crash_or_falsely_clear(self):
+        """An error checking cash must not be silently treated as healthy --
+        it logs and moves on (no flag written since a breach was never
+        confirmed, but the run doesn't crash and doesn't write a false
+        'clean' signal anywhere)."""
+        exit_code, _, _, mock_write_flag = self._run_cash_only(
+            cash=None, nmbp=None, account_error=Exception('API down'),
+        )
+        assert exit_code == 0
+        assert not mock_write_flag.called
+
+    def test_live_account_uses_live_flag_path(self):
+        live_client = MagicMock()
+        live_client.get_all_positions.return_value = []
+        live_client.get_orders.return_value = []
+        live_client.get_account.return_value = _account(-500.0, -500.0)
+
+        with patch('position_watchdog._build_clients', return_value={'live': live_client}), \
+             patch('position_watchdog.service_state', return_value='active'), \
+             patch('position_watchdog._alerts.alert_with_backoff'), \
+             patch('position_watchdog._halt_buys.write_halt_flag') as mock_write_flag:
+            position_watchdog.run()
+
+        mock_write_flag.assert_called_once()
+        flag_path_arg = mock_write_flag.call_args[0][0]
+        assert flag_path_arg.name == 'halt_buys_live.flag'

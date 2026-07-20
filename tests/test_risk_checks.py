@@ -202,6 +202,50 @@ class TestAutonomousAgentRisk:
         assert result is False
         agent.trading_client.submit_order.assert_not_called()
 
+    def test_buy_refused_when_halt_flag_active(self):
+        """R1 WI-7: execute_trade must refuse a BUY outright when the
+        HALT_BUYS flag is active, before ever reaching the cash checks."""
+        agent = self._make_agent()
+        mock_account = MagicMock()
+        mock_account.cash = '10500'  # would otherwise clearly pass the cash gate
+        agent.trading_client.get_account.return_value = mock_account
+
+        decision = {'decision': 'buy', 'confidence': 0.80, 'reasoning': 'test', 'current_price': 100.0}
+
+        with patch('autonomous_agent.halt_buys.is_halt_active', return_value=True):
+            result = agent.execute_trade('AAPL', decision, 100_000.0, 9_500.0)
+
+        assert result is False
+        agent.trading_client.submit_order.assert_not_called()
+
+    def test_buy_proceeds_when_halt_flag_clear(self):
+        """Sanity complement: an explicitly clear flag must not block a BUY
+        that would otherwise succeed (guards against the gate being
+        accidentally fail-open-inverted)."""
+        agent = self._make_agent()
+        mock_order = MagicMock()
+        mock_order.id = 'order-123'
+        agent.trading_client.submit_order.return_value = mock_order
+        mock_account = MagicMock()
+        mock_account.cash = '10500'
+        agent.trading_client.get_account.return_value = mock_account
+
+        decision = {'decision': 'buy', 'confidence': 0.80, 'reasoning': 'test', 'current_price': 100.0}
+
+        with patch('autonomous_agent.halt_buys.is_halt_active', return_value=False), \
+             patch('builtins.open', MagicMock()), \
+             patch('autonomous_agent.alert_trade_executed'), \
+             patch('autonomous_agent._db') as mock_db:
+            mock_db.cleanup_stale_reservations = MagicMock()
+            mock_db.get_total_reserved = MagicMock(return_value=0.0)
+            mock_db.reserve_cash = MagicMock(return_value=1)
+            mock_db.release_cash = MagicMock()
+            mock_db.insert_trade = MagicMock()
+            result = agent.execute_trade('AAPL', decision, 100_000.0, 9_500.0)
+
+        assert result is True
+        agent.trading_client.submit_order.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # Backtester metric calculations (fully offline)

@@ -28,6 +28,7 @@ import _pathfix  # noqa: F401
 from alpaca.trading.client import TradingClient
 from trading_service_registry import TRADING_UNITS, bot_positions, service_state
 import alerts as _alerts
+import halt_buys as _halt_buys
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -79,6 +80,21 @@ def check_exposure(positions, orders, bot: str) -> dict:
     return {'state': 'exposed', 'positions': bot_pos, 'orders': bot_ord}
 
 
+def check_cash_invariant(client, account_label: str) -> dict:
+    """The account's own hard safety invariant: cash >= 0 and
+    non_marginable_buying_power >= 0. Breaching either is the exact failure
+    mode of the 2026-07 incident (cash went to -$58,736.66 while
+    non_marginable_buying_power stayed positive — margin/RegT buying-power
+    figures do not reflect a cash breach, which is why this checks `cash`
+    directly rather than trusting a "looks fine" buying-power number)."""
+    account = client.get_account()
+    cash = float(account.cash)
+    nmbp = float(account.non_marginable_buying_power)
+    if cash >= 0 and nmbp >= 0:
+        return {'state': 'ok', 'cash': cash, 'non_marginable_buying_power': nmbp}
+    return {'state': 'breach', 'cash': cash, 'non_marginable_buying_power': nmbp}
+
+
 def run(dry_run: bool = False) -> int:
     """One shot. Returns process exit code (0 = no alerts fired, 1 = at
     least one alert fired or would have under --dry-run)."""
@@ -87,6 +103,39 @@ def run(dry_run: bool = False) -> int:
     alerted = False
 
     for account_label, client in clients.items():
+        # R1 WI-7: cash invariant, unconditional per account (unrelated to
+        # service state -- checked regardless of whether any unit is down).
+        paper = account_label == 'paper'
+        try:
+            cash_result = check_cash_invariant(client, account_label)
+        except Exception as e:
+            logging.error(f"{account_label}: could not check cash invariant — {e}")
+            cash_result = None
+
+        if cash_result is not None and cash_result['state'] == 'breach':
+            logging.critical(
+                f"{account_label}: CASH INVARIANT BREACHED — cash=${cash_result['cash']:,.2f} "
+                f"non_marginable_buying_power=${cash_result['non_marginable_buying_power']:,.2f}"
+            )
+            if dry_run:
+                logging.info(f"[DRY RUN] Would alert + write HALT_BUYS flag for {account_label}")
+            else:
+                _alerts.alert_with_backoff(
+                    f"cash_invariant_breach_{account_label}",
+                    lambda al=account_label, r=cash_result: _alerts.alert_cash_negative(
+                        al, r['cash'], r['non_marginable_buying_power'],
+                    ),
+                    min_interval_hours=_BACKOFF_HOURS,
+                )
+                _halt_buys.write_halt_flag(
+                    _halt_buys.flag_path(paper),
+                    reason=f"cash=${cash_result['cash']:,.2f} non_marginable_buying_power="
+                           f"${cash_result['non_marginable_buying_power']:,.2f}",
+                    data=cash_result,
+                )
+            alerted = True
+        # Healthy: do nothing -- no auto-clear anywhere, clearing is manual only.
+
         account_units = [u for u in TRADING_UNITS if u['paper'] == (account_label == 'paper')]
         # not_found units are skipped entirely (see trading_service_registry
         # docstring) — only truly 'inactive' (installed, not running) units

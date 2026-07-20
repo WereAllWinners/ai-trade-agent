@@ -89,6 +89,7 @@ def _make_stock_agent():
         'max_stocks_to_analyze': 5,
     }
     agent.trading_client     = MagicMock()
+    agent._paper             = True
     agent.daily_trades       = 0
     agent.last_reset_date    = datetime.now().date()
     agent.daily_start_equity = None

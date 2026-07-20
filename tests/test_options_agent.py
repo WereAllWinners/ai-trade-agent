@@ -837,3 +837,77 @@ class TestOptionsCallPutMapping:
             decision_neg, _, _ = agent.get_ai_options_decision(_make_analysis(momentum=-0.02))
         assert decision_pos['decision'] == 'hold'
         assert decision_neg['decision'] == 'buy_put'
+
+
+# ===========================================================================
+# R1 WI-7 — execute_options_trade() must refuse BUYs while HALT_BUYS is active
+# ===========================================================================
+
+class TestHaltBuysGate:
+
+    def _setup_trade(self, agent, halt_active, live_cash=10_000, option_price=1.00, quantity=2):
+        """Same minimal execute_options_trade() scaffolding as
+        test_cash_reserve.py::TestOptionsLiveCashCheck, isolating the
+        halt_buys check as the only thing that varies."""
+        mock_contract = MagicMock()
+        mock_contract.symbol          = 'SPY250328C00560000'
+        mock_contract.strike_price    = '560'
+        mock_contract.expiration_date = '2025-03-28'
+
+        mock_account = MagicMock()
+        mock_account.cash = str(live_cash)
+        mock_account.non_marginable_buying_power = str(live_cash)
+        agent.trading_client.get_account.return_value = mock_account
+
+        mock_order = MagicMock(); mock_order.id = 'order-1'
+        agent.trading_client.submit_order.return_value = mock_order
+
+        alloc_ctrl = MagicMock()
+        alloc_ctrl.get_position_size_pct.return_value = 0.03
+        agent.alloc_controller = alloc_ctrl
+        overseer = MagicMock()
+        overseer.is_buy_allowed.return_value = (True, '')
+        agent.overseer = overseer
+        fill_result = MagicMock()
+        fill_result.filled = True
+        fill_result.slippage_bps = 0.0
+        paper_sim = MagicMock()
+        paper_sim.simulate_options_fill.side_effect = lambda side, mid_price, contracts, **_kw: (
+            setattr(fill_result, 'fill_qty', contracts) or
+            setattr(fill_result, 'fill_price', mid_price) or
+            fill_result
+        )
+        agent.paper_sim = paper_sim
+
+        decision = {'decision': 'buy_call', 'confidence': 0.80,
+                    'reasoning': 'test', 'current_price': 560.0}
+        analysis = {'current_price': 560.0}
+
+        with patch.object(agent, 'find_optimal_option', return_value=mock_contract), \
+             patch.object(agent, 'get_option_price', return_value=option_price), \
+             patch.object(agent, 'calculate_position_size', return_value=quantity), \
+             patch('options_agent.halt_buys.is_halt_active', return_value=halt_active), \
+             patch('builtins.open', MagicMock()), \
+             patch('options_agent.alert_trade_executed'), \
+             patch('options_agent._db') as mock_db:
+            mock_db.cleanup_stale_reservations = MagicMock()
+            mock_db.get_total_reserved = MagicMock(return_value=0.0)
+            mock_db.reserve_cash = MagicMock(return_value=1)
+            mock_db.release_cash = MagicMock()
+            mock_db.insert_trade = MagicMock()
+            result = agent.execute_options_trade(
+                'SPY', decision, analysis, available_capital=5_000
+            )
+        return result
+
+    def test_buy_refused_when_flag_active(self):
+        agent = _make_agent()
+        result = self._setup_trade(agent, halt_active=True)
+        assert result is False
+        agent.trading_client.submit_order.assert_not_called()
+
+    def test_buy_proceeds_when_flag_clear(self):
+        agent = _make_agent()
+        result = self._setup_trade(agent, halt_active=False)
+        assert result is True
+        agent.trading_client.submit_order.assert_called()

@@ -27,6 +27,7 @@ from alerts import alert_circuit_breaker, alert_trade_executed, alert_trade_fail
 import news_fetcher
 import economic_calendar
 import db as _db
+import halt_buys
 from fee_simulator import FeeSimulator
 from paper_market_simulator import PaperMarketSimulator
 from alpaca.trading.requests import LimitOrderRequest
@@ -618,6 +619,25 @@ class AutonomousAgent:
                 avg_entry_price = float(position.avg_entry_price)
                 position_value = shares * current_price  # defined for the sanity check below
             else:
+                # R1 WI-7: HALT_BUYS flag — set by position_watchdog.py on a
+                # cash invariant breach (cash < 0 or non_marginable_buying_power
+                # < 0), the exact failure mode of the 2026-07 incident.
+                # Fail-closed: an unreadable flag state blocks buys too.
+                # Manual clear only — see docs/operations.md. Placed strictly
+                # inside the BUY branch, not at the outer session-level cash
+                # gate: that gate already returns from the entire session
+                # function (a separate, documented, not-fixed-here gap — see
+                # docs/operations.md) which would also block
+                # review_held_positions()'s defensive sells if this check
+                # were added there instead.
+                _halt_flag = halt_buys.flag_path(self._paper)
+                if halt_buys.is_halt_active(_halt_flag):
+                    logging.critical(
+                        f"🛑 HALT_BUYS flag active ({_halt_flag}) — refusing BUY {symbol}. "
+                        f"Manual clear required (see docs/operations.md)."
+                    )
+                    return False
+
                 # Proactive PDT check — count today's round trips before another buy
                 if not self.pdt_blocked:
                     todays_roundtrips = self._count_todays_roundtrips()
