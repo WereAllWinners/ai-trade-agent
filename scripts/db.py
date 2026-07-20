@@ -191,6 +191,33 @@ CREATE TABLE IF NOT EXISTS iv_history (
     iv_rank     REAL,
     UNIQUE(symbol, timestamp)
 );
+
+-- R1 WI-4: an exit order's lifecycle from submission to confirmed terminal
+-- status. Both agents write a row here at submit time instead of logging
+-- the exit as complete immediately (the 2026-07 incident's root defect —
+-- see findings/paper-negcash-addendum-a-2026-07-16.md). exit_reconciler.py
+-- resolves each row on a later pass by polling the broker's actual order
+-- status; nothing downstream (trade logs, alerts, the trades table) is
+-- written until that resolution, using real fill data instead of the
+-- pre-submission snapshot the old code used to assume was final.
+CREATE TABLE IF NOT EXISTS pending_exits (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id        TEXT    NOT NULL UNIQUE,
+    bot             TEXT    NOT NULL,                  -- 'stock' | 'options'
+    source          TEXT    NOT NULL DEFAULT 'paper',  -- 'paper' | 'live'
+    symbol          TEXT    NOT NULL,                  -- OCC contract or stock ticker
+    intended_qty    REAL    NOT NULL,
+    intended_reason TEXT,                               -- e.g. 'take_profit_50%', 'dte_exit_2d_remaining'
+    avg_entry_price REAL,                               -- captured at submit time — the position may
+                                                         -- no longer exist at the broker by resolve time
+    time_in_force   TEXT,
+    submitted_at    TEXT    NOT NULL,
+    status          TEXT    NOT NULL DEFAULT 'pending', -- pending | filled | exit_failed | abandoned
+    resolved_at     TEXT,
+    retry_count     INTEGER NOT NULL DEFAULT 0,
+    last_checked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pending_exits_lookup ON pending_exits(bot, source, status);
 """
 
 
@@ -244,6 +271,36 @@ def _migrate(conn) -> None:
     if 'regime' not in out_cols:
         conn.execute("ALTER TABLE outcomes ADD COLUMN regime TEXT")
         logging.info("db: migrated outcomes — added regime column")
+
+    # sprint02 D4.2: source column on unreconciled_orders — without it, paper
+    # and live rows for the same bot are indistinguishable, which matters
+    # once trade_log.jsonl (D4.3) is per-source and a diagnostic needs to
+    # know which account an unreconciled order actually belongs to.
+    unrec_cols = {row[1] for row in conn.execute("PRAGMA table_info(unreconciled_orders)")}
+    if 'source' not in unrec_cols:
+        conn.execute("ALTER TABLE unreconciled_orders ADD COLUMN source TEXT NOT NULL DEFAULT 'paper'")
+        logging.info("db: migrated unreconciled_orders — added source column")
+
+    # sprint03 E2.2: retry_count/last_attempt_at — a missing fill-price lookup
+    # no longer permanently drops the pair on first failure (see
+    # outcome_tracker.py's peek-don't-pop restructure); it's retried across
+    # passes, tracked here, until UNRECONCILED_MAX_RETRIES is exceeded and the
+    # existing `status` column gets set to 'abandoned'.
+    if 'retry_count' not in unrec_cols:
+        conn.execute("ALTER TABLE unreconciled_orders ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
+        logging.info("db: migrated unreconciled_orders — added retry_count column")
+    if 'last_attempt_at' not in unrec_cols:
+        conn.execute("ALTER TABLE unreconciled_orders ADD COLUMN last_attempt_at TEXT")
+        logging.info("db: migrated unreconciled_orders — added last_attempt_at column")
+
+    # sprint03 E4: label_source on training_examples — distinguishes a
+    # realized-outcome label from an N-day-forward-price fallback label.
+    # NULL for all pre-migration rows (never backfilled/guessed — same
+    # "tag going forward only" philosophy as trade_log.jsonl's source field).
+    te_cols = {row[1] for row in conn.execute("PRAGMA table_info(training_examples)")}
+    if 'label_source' not in te_cols:
+        conn.execute("ALTER TABLE training_examples ADD COLUMN label_source TEXT")
+        logging.info("db: migrated training_examples — added label_source column")
 
 
 def init_db(db_path: Path = DB_PATH) -> None:
@@ -371,10 +428,10 @@ def insert_training_example(rec: dict, source: str = 'paper', db_path: Path = DB
     sql = """
         INSERT OR IGNORE INTO training_examples
             (bot, source, symbol, prompt, ideal_output, label, confidence, pnl_pct,
-             entry_date, session_id, prompt_hash, generated_at)
+             entry_date, session_id, prompt_hash, generated_at, label_source)
         VALUES
             (:bot, :source, :symbol, :prompt, :ideal_output, :label, :confidence, :pnl_pct,
-             :entry_date, :session_id, :prompt_hash, :generated_at)
+             :entry_date, :session_id, :prompt_hash, :generated_at, :label_source)
     """
     meta = rec.get('metadata', {})
     _label = rec.get('label') or None
@@ -397,6 +454,10 @@ def insert_training_example(rec: dict, source: str = 'paper', db_path: Path = DB
         'session_id':   meta.get('session_id'),
         'prompt_hash':  meta.get('prompt_hash'),
         'generated_at': meta.get('generated_at', datetime.now().isoformat()),
+        # sprint03 E4: distinguishes a realized-outcome label from an N-day
+        # forward-price fallback label — NULL for callers that don't set it
+        # (tag going forward only, never guessed retroactively).
+        'label_source': meta.get('label_source'),
     }
     with get_conn(db_path) as conn:
         cursor = conn.execute(sql, row)
@@ -681,14 +742,117 @@ def load_daily_start_equity(bot: str, source: str = 'paper',
 # Unreconciled order audit
 # ---------------------------------------------------------------------------
 
-def insert_unreconciled_order(rec: dict, bot: str, db_path: Path = DB_PATH) -> None:
-    """Record an order that could not be matched to a filled P&L pair."""
+def upsert_unreconciled_order(rec: dict, bot: str, source: str = 'paper',
+                               db_path: Path = DB_PATH) -> int:
+    """Record (or re-record) an order that could not be matched to a filled
+    P&L pair. On a repeat of the same (order_id, reason) — sprint03 E2.2 —
+    increments retry_count instead of being silently ignored, so a transient
+    lookup failure can be retried across passes rather than permanently
+    dropping the pair. Returns the row's retry_count after this call (0 on
+    first insert)."""
+    now = datetime.now().isoformat()
     with get_conn(db_path) as conn:
         conn.execute(
-            """INSERT OR IGNORE INTO unreconciled_orders
-               (recorded_at, bot, order_id, symbol, status, reason)
-               VALUES (:recorded_at, :bot, :order_id, :symbol, :status, :reason)""",
-            {**rec, 'bot': bot},
+            """INSERT INTO unreconciled_orders
+                   (recorded_at, bot, order_id, symbol, status, reason, source,
+                    retry_count, last_attempt_at)
+               VALUES (:recorded_at, :bot, :order_id, :symbol, :status, :reason,
+                       :source, 0, :last_attempt_at)
+               ON CONFLICT(order_id, reason) DO UPDATE SET
+                   retry_count = retry_count + 1,
+                   last_attempt_at = excluded.last_attempt_at,
+                   status = excluded.status""",
+            {**rec, 'bot': bot, 'source': source, 'last_attempt_at': now},
+        )
+        row = conn.execute(
+            "SELECT retry_count FROM unreconciled_orders WHERE order_id=? AND reason=?",
+            (rec.get('order_id', ''), rec.get('reason')),
+        ).fetchone()
+        return row['retry_count'] if row else 0
+
+
+def mark_unreconciled_order_abandoned(order_id: str, reason: str, bot: str,
+                                       source: str = 'paper', db_path: Path = DB_PATH) -> None:
+    """Escape valve: permanently give up on a pair after
+    UNRECONCILED_MAX_RETRIES — keeps the row for forensics, but the caller
+    should now pop it from its FIFO queue so the queue can't wedge behind one
+    poison pair."""
+    with get_conn(db_path) as conn:
+        conn.execute(
+            "UPDATE unreconciled_orders SET status='abandoned' "
+            "WHERE order_id=? AND reason=? AND bot=? AND source=?",
+            (order_id, reason, bot, source),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Pending-exit helpers (R1 WI-4/5 — fill-state verification)
+# ---------------------------------------------------------------------------
+
+def insert_pending_exit(rec: dict, bot: str, source: str = 'paper',
+                         db_path: Path = DB_PATH) -> None:
+    """Record a just-submitted exit order as pending, before its fill is
+    known. INSERT OR IGNORE — order_id is UNIQUE, so a duplicate insert
+    (e.g. a caller retrying after a transient error) is a no-op rather than
+    an error; this is an idempotency guard, not a retry-upsert like
+    upsert_unreconciled_order's ON CONFLICT counter."""
+    with get_conn(db_path) as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO pending_exits
+                   (order_id, bot, source, symbol, intended_qty, intended_reason,
+                    avg_entry_price, time_in_force, submitted_at)
+               VALUES (:order_id, :bot, :source, :symbol, :intended_qty, :intended_reason,
+                       :avg_entry_price, :time_in_force, :submitted_at)""",
+            {**rec, 'bot': bot, 'source': source},
+        )
+
+
+def get_pending_exits(bot: str, source: str = 'paper', status: str = 'pending',
+                       db_path: Path = DB_PATH) -> list[dict]:
+    """Return pending_exits rows for (bot, source, status), oldest first."""
+    with get_conn(db_path) as conn:
+        rows = conn.execute(
+            """SELECT * FROM pending_exits WHERE bot=? AND source=? AND status=?
+               ORDER BY submitted_at ASC""",
+            (bot, source, status),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def resolve_pending_exit(order_id: str, status: str, db_path: Path = DB_PATH) -> None:
+    """Mark a pending_exits row resolved — status is 'filled' (including
+    partial fills, see exit_reconciler.py's partial-fill convention) or
+    'exit_failed' (expired/canceled/rejected, nothing filled)."""
+    with get_conn(db_path) as conn:
+        conn.execute(
+            "UPDATE pending_exits SET status=?, resolved_at=?, last_checked_at=? WHERE order_id=?",
+            (status, datetime.now().isoformat(), datetime.now().isoformat(), order_id),
+        )
+
+
+def bump_pending_exit_retry(order_id: str, db_path: Path = DB_PATH) -> int:
+    """A reconcile pass checked this order and it's still not in a terminal
+    state (or the status check itself errored) — bump the retry counter and
+    return its new value, so callers can escalate to abandoned after too
+    many passes."""
+    with get_conn(db_path) as conn:
+        conn.execute(
+            "UPDATE pending_exits SET retry_count = retry_count + 1, last_checked_at=? WHERE order_id=?",
+            (datetime.now().isoformat(), order_id),
+        )
+        row = conn.execute(
+            "SELECT retry_count FROM pending_exits WHERE order_id=?", (order_id,)
+        ).fetchone()
+    return row['retry_count'] if row else 0
+
+
+def mark_pending_exit_abandoned(order_id: str, db_path: Path = DB_PATH) -> None:
+    """Escape valve after too many failed status-check passes — keeps the
+    row for forensics rather than deleting it."""
+    with get_conn(db_path) as conn:
+        conn.execute(
+            "UPDATE pending_exits SET status='abandoned', resolved_at=? WHERE order_id=?",
+            (datetime.now().isoformat(), order_id),
         )
 
 

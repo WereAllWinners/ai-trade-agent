@@ -22,6 +22,9 @@ import pytest
 from alpaca.trading.requests import LimitOrderRequest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts' / 'agents'))
+
+import decision_parser
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +65,12 @@ def _make_agent():
     agent._decision_log       = Path('/tmp/test_options_decisions.jsonl')
     agent._params_file        = Path('/tmp/non_existent_params.json')
     agent._prev_equity        = None
+    # R1 WI-4: placeholder only -- every test that exercises
+    # manage_existing_positions() must mock options_agent._db.insert_pending_exit
+    # itself (matching the existing patch('builtins.open', MagicMock())
+    # pattern for the JSONL write); this attribute existing is just so
+    # `self._db_path` doesn't raise AttributeError before that mock is hit.
+    agent._db_path            = Path('/tmp/test_options_pending_exits.db')
     return agent
 
 
@@ -322,7 +331,7 @@ class TestManageExistingPositionsDTE:
         assert isinstance(submitted, LimitOrderRequest)
 
     def test_pl_exit_takes_priority_over_dte(self):
-        """When both P&L and DTE thresholds are met, P&L reason is logged (fires first)."""
+        """When both P&L and DTE thresholds are met, P&L reason wins (fires first)."""
         agent = _make_agent()
         # -55% (stop loss) AND DTE=1 (DTE exit)
         pos = _make_position('SPY250328P00560000', unrealized_plpc='-0.55')
@@ -331,25 +340,17 @@ class TestManageExistingPositionsDTE:
         mock_order = MagicMock(); mock_order.id = 'dual-1'
         agent.trading_client.submit_order.return_value = mock_order
 
-        logged_reasons = []
-        original_dumps = __import__('json').dumps
-
-        def capture_log(data, **kw):
-            if isinstance(data, dict) and 'reason' in data:
-                logged_reasons.append(data['reason'])
-            return original_dumps(data, **kw)
-
         with patch.object(agent, 'parse_dte_from_symbol', return_value=1), \
              patch.object(agent, '_fill_timeout_retry', return_value=mock_order), \
-             patch('options_agent.alert_trade_executed'), \
-             patch('json.dumps', side_effect=capture_log), \
-             patch('builtins.open', MagicMock()):
+             patch('options_agent._db.insert_pending_exit') as mock_pending:
             agent.manage_existing_positions()
 
         # Only one order submitted (not two)
         agent.trading_client.submit_order.assert_called_once()
-        assert any('stop_loss' in r for r in logged_reasons)
-        assert not any('dte_exit' in r for r in logged_reasons)
+        mock_pending.assert_called_once()
+        pending_rec = mock_pending.call_args[0][0]
+        assert 'stop_loss' in pending_rec['intended_reason']
+        assert 'dte_exit' not in pending_rec['intended_reason']
 
     def test_stock_symbols_skipped(self):
         """Short symbols (stocks) must be ignored even if len > 10 guard fails."""
@@ -468,9 +469,14 @@ class TestCircuitBreakerOrdering:
 # ===========================================================================
 
 class TestAlertOnExit:
+    """R1 WI-4: manage_existing_positions() must NOT alert (or write a
+    trade_log row) at submit time anymore -- that's exactly the defect that
+    fabricated the NVDA/AAPL false "closed at a profit" records. It now
+    records a pending_exits row instead; exit_reconciler.py fires the real
+    alert later, only once the broker confirms an actual fill."""
 
-    def test_alert_fired_on_dte_exit(self):
-        """alert_trade_executed must be called when a DTE exit order is submitted."""
+    def test_dte_exit_records_pending_not_alert(self):
+        """A DTE exit submits an order and records it pending -- no immediate alert."""
         agent = _make_agent()
         pos = _make_position('SPY250328P00560000', unrealized_plpc='-0.10')
         agent.trading_client.get_all_positions.return_value = [pos]
@@ -480,17 +486,18 @@ class TestAlertOnExit:
 
         with patch.object(agent, 'parse_dte_from_symbol', return_value=2), \
              patch('options_agent.alert_trade_executed') as mock_alert, \
-             patch('builtins.open', MagicMock()):
+             patch('options_agent._db.insert_pending_exit') as mock_pending:
             agent.manage_existing_positions()
 
-        mock_alert.assert_called_once()
-        args = mock_alert.call_args[0]
-        # Must include the contract symbol and 'sell'
-        assert 'SPY250328P00560000' in args
-        assert 'sell' in args
+        mock_alert.assert_not_called()
+        mock_pending.assert_called_once()
+        pending_rec = mock_pending.call_args[0][0]
+        assert pending_rec['symbol'] == 'SPY250328P00560000'
+        assert pending_rec['order_id'] == 'dte-alert-test'
+        assert 'dte_exit' in pending_rec['intended_reason']
 
-    def test_alert_fired_on_stop_loss_exit(self):
-        """alert_trade_executed must fire on stop-loss exits (not just DTE)."""
+    def test_stop_loss_exit_records_pending_not_alert(self):
+        """A stop-loss exit submits an order and records it pending -- no immediate alert."""
         agent = _make_agent()
         pos = _make_position('SPY250425P00560000', unrealized_plpc='-0.55')
         agent.trading_client.get_all_positions.return_value = [pos]
@@ -501,10 +508,13 @@ class TestAlertOnExit:
         with patch.object(agent, 'parse_dte_from_symbol', return_value=30), \
              patch.object(agent, '_fill_timeout_retry', return_value=mock_order), \
              patch('options_agent.alert_trade_executed') as mock_alert, \
-             patch('builtins.open', MagicMock()):
+             patch('options_agent._db.insert_pending_exit') as mock_pending:
             agent.manage_existing_positions()
 
-        mock_alert.assert_called_once()
+        mock_alert.assert_not_called()
+        mock_pending.assert_called_once()
+        pending_rec = mock_pending.call_args[0][0]
+        assert 'stop_loss' in pending_rec['intended_reason']
 
     def test_no_alert_when_no_exit(self):
         """alert_trade_executed must NOT be called when no exit triggers."""
@@ -745,3 +755,85 @@ class TestFillTimeoutRetry:
         agent.trading_client.cancel_order_by_id.assert_not_called()
         agent.trading_client.submit_order.assert_not_called()
         assert result is original_order
+
+
+# ===========================================================================
+# 10. Sprint01 C1.2 — options call/put substring-mapping bug fix
+# ===========================================================================
+
+def _make_analysis(momentum=0.0):
+    return {
+        'symbol':        'AAPL',
+        'current_price': 150.0,
+        'rsi':           55.0,
+        'volatility':    0.25,
+        'momentum':      momentum,
+    }
+
+
+class TestOptionsCallPutMapping:
+    """get_ai_options_decision must trust parse_decision's structured result,
+    never re-scan the raw response text for 'call'/'put' substrings — a HOLD
+    whose Reasoning happens to contain those words must stay HOLD.
+
+    Other test modules in this suite (test_options_session.py, test_option_price.py)
+    register their own `sys.modules['model_inference_lora']` stub at import time,
+    which — because `options_agent.py` does `from model_inference_lora import
+    parse_decision` — decides what `options_agent.parse_decision` resolves to for
+    the rest of the pytest session, regardless of collection order. These tests
+    pin `options_agent.parse_decision` to the real decision_parser implementation
+    explicitly so they exercise the actual sprint01 C1 parsing/mapping logic
+    rather than whatever stub happened to win the cross-file import race.
+    """
+
+    def test_hold_reasoning_mentioning_call_is_not_promoted(self):
+        agent = _make_agent()
+        response = "Decision: HOLD\nConfidence: 0.60\nReasoning: the technicals call for caution here"
+        with patch('options_agent.get_trading_decision', return_value=response), \
+             patch('options_agent.parse_decision', new=decision_parser.parse_decision):
+            decision, _, _ = agent.get_ai_options_decision(_make_analysis(momentum=0.05))
+        assert decision['decision'] == 'hold'
+
+    def test_hold_reasoning_mentioning_put_is_not_promoted(self):
+        agent = _make_agent()
+        response = "Decision: HOLD\nConfidence: 0.60\nReasoning: put simply, wait for confirmation"
+        with patch('options_agent.get_trading_decision', return_value=response), \
+             patch('options_agent.parse_decision', new=decision_parser.parse_decision):
+            decision, _, _ = agent.get_ai_options_decision(_make_analysis(momentum=-0.05))
+        assert decision['decision'] == 'hold'
+
+    def test_buy_call_structured_line_respected(self):
+        agent = _make_agent()
+        response = "Decision: BUY_CALL\nConfidence: 0.80\nReasoning: strong bullish breakout"
+        with patch('options_agent.get_trading_decision', return_value=response), \
+             patch('options_agent.parse_decision', new=decision_parser.parse_decision):
+            decision, _, _ = agent.get_ai_options_decision(_make_analysis(momentum=0.0))
+        assert decision['decision'] == 'buy_call'
+
+    def test_buy_put_structured_line_respected(self):
+        agent = _make_agent()
+        response = "Decision: BUY_PUT\nConfidence: 0.80\nReasoning: strong bearish breakdown"
+        with patch('options_agent.get_trading_decision', return_value=response), \
+             patch('options_agent.parse_decision', new=decision_parser.parse_decision):
+            decision, _, _ = agent.get_ai_options_decision(_make_analysis(momentum=0.0))
+        assert decision['decision'] == 'buy_put'
+
+    def test_bare_buy_maps_to_call_only_with_positive_momentum(self):
+        agent = _make_agent()
+        response = "Decision: BUY\nConfidence: 0.80\nReasoning: momentum building"
+        with patch('options_agent.get_trading_decision', return_value=response), \
+             patch('options_agent.parse_decision', new=decision_parser.parse_decision):
+            decision_neg, _, _ = agent.get_ai_options_decision(_make_analysis(momentum=-0.02))
+            decision_pos, _, _ = agent.get_ai_options_decision(_make_analysis(momentum=0.02))
+        assert decision_neg['decision'] == 'hold'
+        assert decision_pos['decision'] == 'buy_call'
+
+    def test_bare_sell_maps_to_put_only_with_negative_momentum(self):
+        agent = _make_agent()
+        response = "Decision: SELL\nConfidence: 0.80\nReasoning: weakening momentum"
+        with patch('options_agent.get_trading_decision', return_value=response), \
+             patch('options_agent.parse_decision', new=decision_parser.parse_decision):
+            decision_pos, _, _ = agent.get_ai_options_decision(_make_analysis(momentum=0.02))
+            decision_neg, _, _ = agent.get_ai_options_decision(_make_analysis(momentum=-0.02))
+        assert decision_pos['decision'] == 'hold'
+        assert decision_neg['decision'] == 'buy_put'

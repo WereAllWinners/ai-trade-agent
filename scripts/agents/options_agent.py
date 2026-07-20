@@ -37,6 +37,7 @@ from portfolio_overseer import PortfolioOverseer
 from allocation_controller import AllocationController
 from paper_market_simulator import PaperMarketSimulator
 import account_config as _acfg
+from service_suffix import service_suffix
 
 _DEBATE_CONFIDENCE_THRESHOLD = 0.85   # Options trades require higher bar for debate
 _debate_unavailable_count: int = 0    # E2: tracks base-model debate failures
@@ -321,6 +322,7 @@ class OptionsAgent:
 
         self.paper_sim = PaperMarketSimulator(paper=_paper)
         self._paper    = _paper
+        self._db_path  = _db.DB_PATH  # R1 WI-4: explicit injection point for tests
         set_alert_source('paper' if _paper else 'live')
 
         # Portfolio-level guards (sector cap + correlation limit)
@@ -610,12 +612,19 @@ Reasoning: <one sentence explaining the key signal>"""
         response = get_trading_decision(prompt, max_new_tokens=150)
         decision = parse_decision(response)
 
-        # Map to options-specific decisions
-        # Explicit model keywords take priority; fallback uses both AI action AND momentum
-        if 'call' in response.lower() or (decision['decision'] == 'buy' and analysis['momentum'] > 0):
-            decision['decision'] = 'buy_call'
-        elif 'put' in response.lower() or (decision['decision'] == 'sell' and analysis['momentum'] < 0):
-            decision['decision'] = 'buy_put'
+        # Map to options-specific decisions. Trust parse_decision's structured
+        # result only — do NOT re-scan the raw response text for "call"/"put"
+        # substrings, since the Reasoning field routinely contains those words
+        # as ordinary English (e.g. "the technicals call for caution") and a
+        # substring scan there can silently promote a HOLD to a directional
+        # trade (sprint01 C1.2).
+        _d = decision['decision']
+        if _d in ('buy_call', 'buy_put'):
+            pass  # already correctly mapped via JSON or the Decision: line
+        elif _d == 'buy':
+            decision['decision'] = 'buy_call' if analysis['momentum'] > 0 else 'hold'
+        elif _d == 'sell':
+            decision['decision'] = 'buy_put' if analysis['momentum'] < 0 else 'hold'
         else:
             decision['decision'] = 'hold'
 
@@ -928,6 +937,9 @@ Reasoning: <one sentence explaining the key signal>"""
                 submitted_order = self.trading_client.submit_order(order)
             
             # Log trade
+            # sprint02 D4.3: same paper/live commingling fix as the stock
+            # agent's trade_log.jsonl (see autonomous_agent.execute_trade).
+            _source = 'paper' if getattr(self, '_paper', True) else 'live'
             trade_log = {
                 'timestamp': datetime.now().isoformat(),
                 'underlying': symbol,
@@ -940,13 +952,14 @@ Reasoning: <one sentence explaining the key signal>"""
                 'entry_price': option_price,
                 'confidence': decision['confidence'],
                 'reasoning': decision['reasoning'],
-                'order_id': str(submitted_order.id)
+                'order_id': str(submitted_order.id),
+                'source': _source,
             }
-            
+
             with open('logs/options_trade_log.jsonl', 'a') as f:
                 f.write(json.dumps(trade_log, default=_json_default) + '\n')
             try:
-                _db.insert_trade(trade_log, bot='options', source='paper' if getattr(self, '_paper', True) else 'live')
+                _db.insert_trade(trade_log, bot='options', source=_source)
             except Exception as e:
                 logging.warning(f"⚠️  Could not write options trade to DB: {e}")
             
@@ -1217,29 +1230,32 @@ Reasoning: <one sentence explaining the key signal>"""
                         submitted_order, position, int(qty), limit_price
                     )
 
-                trade_log = {
-                    'timestamp': datetime.now().isoformat(),
-                    'contract': position.symbol,
-                    'action': 'sell',
-                    'quantity': int(qty),
-                    'reason': exit_reason,
-                    'exit_pl_pct': unrealized_plpc,
-                    'order_id': str(submitted_order.id)
+                # R1 WI-4: do NOT log this exit as complete yet — submitting an
+                # order is not the same as it filling (this is exactly the
+                # defect that fabricated the NVDA/AAPL "closed at a profit"
+                # records when those orders actually expired unfilled; see
+                # findings/paper-negcash-addendum-a-2026-07-16.md). Record it
+                # as pending; exit_reconciler.reconcile_pending_exits() writes
+                # the real trade_log/alert entry once the broker confirms a
+                # terminal status, using actual fill data instead of this
+                # pre-submission position snapshot.
+                pending = {
+                    'order_id': str(submitted_order.id),
+                    'symbol': position.symbol,
+                    'intended_qty': int(qty),
+                    'intended_reason': exit_reason,
+                    'avg_entry_price': float(position.avg_entry_price),
+                    'time_in_force': time_in_force.value,
+                    'submitted_at': datetime.now().isoformat(),
                 }
-
-                with open('logs/options_trade_log.jsonl', 'a') as f:
-                    f.write(json.dumps(trade_log, default=_json_default) + '\n')
-
-                logging.info(f"✅ Closed option position: {exit_reason} ({unrealized_plpc:+.1%})")
-
-                unrealized_pl  = float(position.unrealized_pl)
-                avg_entry      = float(position.avg_entry_price)
-                exit_price     = float(position.current_price)
-                alert_trade_executed(
-                    'OptionsAgent', position.symbol, 'sell',
-                    int(qty), exit_price, str(submitted_order.id),
-                    pnl=unrealized_pl, pnl_pct=unrealized_plpc,
-                    avg_entry_price=avg_entry,
+                _db.insert_pending_exit(
+                    pending, bot='options',
+                    source='paper' if getattr(self, '_paper', True) else 'live',
+                    db_path=self._db_path,
+                )
+                logging.info(
+                    f"⏳ Exit submitted (pending confirmation): {exit_reason} "
+                    f"order_id={submitted_order.id}"
                 )
 
         except Exception as e:
@@ -1301,6 +1317,26 @@ Reasoning: <one sentence explaining the key signal>"""
             'exit_dte_threshold', self.params['exit_dte_threshold']
         )
 
+        # R1 WI-4/5: reconcile any exits left pending from a prior session
+        # BEFORE this session's own manage_existing_positions() sweep. Each
+        # session is a brand-new process (options_daemon.py subprocess-
+        # launches this script fresh every cycle — nothing persists in
+        # memory between sessions), so this is the only place pending-exit
+        # state can ever be resolved. Anything resolved FILLED here is
+        # already gone from get_all_positions() by the time the sweep below
+        # runs; anything resolved exit_failed is still an open position, so
+        # the sweep naturally re-evaluates and retries it fresh — no extra
+        # bookkeeping needed for that self-heal.
+        try:
+            from exit_reconciler import reconcile_pending_exits, reconcile_broker_fills
+            _recon_source = 'paper' if getattr(self, '_paper', True) else 'live'
+            reconcile_pending_exits(self.trading_client, bot='options',
+                                     source=_recon_source, db_path=self._db_path)
+            reconcile_broker_fills(self.trading_client, source=_recon_source,
+                                    db_path=self._db_path)
+        except Exception as _rex:
+            logging.warning(f"⚠️  Exit reconciliation skipped: {_rex}")
+
         # Step 1: Manage existing positions — runs BEFORE the circuit breaker so
         # DTE exits still fire on bad P&L days (defensive, not speculative).
         self.manage_existing_positions()
@@ -1309,9 +1345,15 @@ Reasoning: <one sentence explaining the key signal>"""
         # and morning_model_check have an up-to-date unprotected-positions count.
         try:
             from risk_reconciler import write_reconcile_status
+            # sprint02 D4.1: suffix so paper/live options services don't race
+            # with each other. NOTE: this still collides with the stock bot's
+            # write to the same base filename (paper-stock vs paper-options,
+            # live-stock vs live-options) — that's a separate stock-vs-options
+            # collision outside this stage's approved paper/live-only scope;
+            # flagged, not fixed here.
             write_reconcile_status(
                 self.trading_client,
-                Path('logs/reconcile_status.json'),
+                Path(f'logs/reconcile_status{service_suffix()}.json'),
             )
         except Exception as _re:
             logging.debug("Could not write reconcile_status: %s", _re)
@@ -1341,6 +1383,7 @@ Reasoning: <one sentence explaining the key signal>"""
             logging.error(f"❌ Failed to check circuit breaker: {e}")
 
         # ── Macro guard (Fix B/C) ──────────────────────────────────────────────
+        economic_calendar.check_calendar_staleness()
         macro_events = economic_calendar.get_todays_high_impact_events()
         halt, halt_reason = economic_calendar.should_halt_trading(macro_events)
         if halt:

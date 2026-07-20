@@ -83,6 +83,7 @@ def _make_agent(cash: float = 50_500.0, position_qty: float = _POSITION_QTY,
     agent.discovery = MagicMock()
     agent._paper = True
     agent._last_order_id = None
+    agent._db_path = None  # R1 WI-4: _run()'s patch('autonomous_agent._db') mocks all DB calls anyway
 
     alloc_ctrl = MagicMock()
     alloc_ctrl.get_position_size_pct.return_value = alloc_pct

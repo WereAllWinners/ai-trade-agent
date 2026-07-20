@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 import pandas as pd
 import numpy as np
+from alpaca.trading.enums import OrderSide
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts' / 'agents'))
@@ -47,6 +48,7 @@ class TestAutonomousAgentRisk:
             agent.daily_start_equity = None
             agent.cooldowns = {}
             agent.pdt_blocked = False
+            agent._paper = True  # sprint02 D4.3: execute_trade's trade_log now reads this
             from datetime import datetime
             agent.last_reset_date = datetime.now().date()
             # Mock trading client
@@ -344,6 +346,7 @@ class TestRotationCashGuard:
         agent.daily_start_equity = None
         agent.cooldowns = {}
         agent.pdt_blocked = False
+        agent._paper = True  # sprint02 D4.3: execute_trade's trade_log now reads this
         agent._last_order_id = None
         from datetime import datetime
         agent.last_reset_date = datetime.now().date()
@@ -482,6 +485,626 @@ class TestRotationCashGuard:
         assert result is True
         assert mock_et.call_count == 2  # sell + buy
 
+    # -----------------------------------------------------------------
+    # Sprint01 C3 — session-loop cash accounting (deduction + trigger)
+    # -----------------------------------------------------------------
+
+    def _make_full_session_agent(self, alloc_pct=0.05):
+        """AutonomousAgent wired for run_trading_session-level cash tests."""
+        with patch('autonomous_agent.TradingClient'), \
+             patch('autonomous_agent.StockHistoricalDataClient'), \
+             patch('autonomous_agent.StockDiscovery'), \
+             patch('autonomous_agent.load_dotenv'), \
+             patch('autonomous_agent.load_model_once'), \
+             patch('autonomous_agent.PortfolioOverseer'), \
+             patch('autonomous_agent.AllocationController'):
+            from autonomous_agent import AutonomousAgent
+            agent = AutonomousAgent.__new__(AutonomousAgent)
+        agent.params = {
+            'max_position_size': 0.05,
+            'stop_loss': -0.07,
+            'take_profit': 0.15,
+            'max_daily_loss_pct': 0.05,
+            'max_daily_trades': 10,
+            'cooldown_minutes': 15,
+            'min_confidence': 0.60,
+            'max_stocks_to_analyze': 25,
+        }
+        agent.daily_trades = 0
+        agent.daily_start_equity = 100_000.0
+        agent.cooldowns = {}
+        agent.pdt_blocked = False
+        agent._paper = True  # sprint02 D4.3: execute_trade's trade_log now reads this
+        agent._last_order_id = None
+        agent._last_position_value = None
+        from datetime import datetime
+        agent.last_reset_date = datetime.now().date()
+        agent.trading_client = MagicMock()
+        alloc_ctrl = MagicMock()
+        alloc_ctrl.get_position_size_pct.return_value = alloc_pct
+        agent.alloc_controller = alloc_ctrl
+        overseer = MagicMock()
+        overseer.is_buy_allowed.return_value = (True, '')
+        agent.overseer = overseer
+        fill_result = MagicMock()
+        fill_result.filled = True
+        fill_result.slippage_bps = 0.0
+        paper_sim = MagicMock()
+        paper_sim.simulate_stock_fill.side_effect = lambda side, price, qty, **_kw: (
+            setattr(fill_result, 'fill_qty', qty) or
+            setattr(fill_result, 'fill_price', price) or
+            fill_result
+        )
+        agent.paper_sim = paper_sim
+        return agent
+
+    def _run_session_capturing_cash(self, agent, non_marginable_cash, opportunities,
+                                     execute_side_effect):
+        """Drive run_trading_session with N mocked opportunities, capturing the
+        `available_cash` passed to execute_trade on each call."""
+        mock_account = MagicMock()
+        mock_account.equity = '100000'
+        # .cash guards the early session-level circuit breaker (line ~1098);
+        # .non_marginable_buying_power drives `settled`/remaining_cash — these
+        # are genuinely different Alpaca account fields, both must be set
+        # explicitly or MagicMock's default __float__ (1.0) trips the guard.
+        mock_account.cash = '100000'
+        mock_account.non_marginable_buying_power = str(non_marginable_cash)
+        agent.trading_client.get_account.return_value = mock_account
+
+        discovery = MagicMock()
+        discovery.discover_opportunities.return_value = opportunities
+        discovery.opportunities = {o['symbol']: [] for o in opportunities}
+        agent.discovery = discovery
+
+        indicators = {
+            'current_price': 100.0, 'rsi': 50.0, 'macd': 0.1,
+            'volume_ratio': 1.2, 'price_change_pct': 1.0,
+        }
+
+        import autonomous_agent as aa
+        with patch.object(agent, 'check_cooldown', return_value=False), \
+             patch.object(agent, 'get_market_data', return_value=MagicMock()), \
+             patch.object(agent, 'calculate_indicators', return_value=indicators), \
+             patch.object(agent, 'execute_trade', side_effect=execute_side_effect), \
+             patch.object(agent, '_attempt_rotation', return_value=False), \
+             patch.object(agent, '_log_decision', return_value=None), \
+             patch.object(aa, 'get_trading_decision', return_value=''), \
+             patch.object(aa, 'parse_decision', return_value={
+                 'decision': 'buy', 'confidence': 0.80,
+                 'reasoning': 'test', 'current_price': 100.0,
+             }), \
+             patch.object(aa, 'news_fetcher'), \
+             patch.object(aa, '_db') as mock_db:
+            mock_db.load_daily_start_equity.return_value = 100_000.0
+            from autonomous_agent import AutonomousAgent
+            AutonomousAgent.run_trading_session(agent)
+
+    def test_tier1_buy_deducts_actual_cost_not_5pct_ceiling(self):
+        """Tier 1 (1%) buy on $100k must deduct ~1% of spendable cash, not the
+        5% max_position_size ceiling constant."""
+        from autonomous_agent import _MIN_CASH_RESERVE
+        agent = self._make_full_session_agent(alloc_pct=0.01)
+
+        captured_cash = []
+
+        def fake_execute(symbol, decision, equity, available_cash):
+            captured_cash.append(available_cash)
+            agent._last_position_value = 995.0  # ≈1% of ~$99,500 spendable
+            return True
+
+        self._run_session_capturing_cash(
+            agent, 100_000, [{'symbol': 'AAA', 'signals': []}, {'symbol': 'BBB', 'signals': []}],
+            fake_execute,
+        )
+
+        initial_remaining = 100_000.0 - _MIN_CASH_RESERVE
+        assert len(captured_cash) == 2
+        assert captured_cash[0] == initial_remaining
+        # Second call must reflect a ~$995 deduction, NOT remaining*5% (~$4,975).
+        assert captured_cash[1] == initial_remaining - 995.0
+
+    def test_two_sequential_buys_cumulative_deduction_equals_actual_costs(self):
+        agent = self._make_full_session_agent(alloc_pct=0.03)
+        from autonomous_agent import _MIN_CASH_RESERVE
+
+        costs = [500.0, 300.0]
+        captured_cash = []
+
+        def fake_execute(symbol, decision, equity, available_cash):
+            captured_cash.append(available_cash)
+            agent._last_position_value = costs[len(captured_cash) - 1]
+            return True
+
+        self._run_session_capturing_cash(
+            agent, 50_000,
+            [{'symbol': 'AAA', 'signals': []}, {'symbol': 'BBB', 'signals': []}],
+            fake_execute,
+        )
+
+        initial_remaining = 50_000.0 - _MIN_CASH_RESERVE
+        assert captured_cash[0] == initial_remaining
+        assert captured_cash[1] == initial_remaining - costs[0]
+        # Cumulative deduction after both buys equals the sum of actual costs —
+        # verified indirectly via the second call's starting point above, plus
+        # the fact that the deduction used costs[0] exactly, not a formula.
+
+    def test_rotation_trigger_does_not_fire_with_ample_spendable_cash(self):
+        """remaining_cash below one expensive share's price, but still well
+        above zero (net of reserve), must NOT trigger rotation — fractional
+        shares make the old one-share heuristic meaningless."""
+        agent = self._make_full_session_agent(alloc_pct=0.05)
+
+        rotation_called = []
+
+        def fake_execute(symbol, decision, equity, available_cash):
+            return False  # doesn't matter — we're only checking rotation wasn't attempted
+
+        mock_account = MagicMock()
+        mock_account.equity = '100000'
+        mock_account.cash = '100000'
+        # settled cash yields remaining_cash = 1000 - 500 = 500 (well above 0),
+        # but decision['current_price'] will be $800 — below the OLD one-share
+        # heuristic's threshold, which would have wrongly triggered rotation.
+        mock_account.non_marginable_buying_power = '1000'
+        agent.trading_client.get_account.return_value = mock_account
+
+        discovery = MagicMock()
+        discovery.discover_opportunities.return_value = [{'symbol': 'EXP', 'signals': []}]
+        discovery.opportunities = {'EXP': []}
+        agent.discovery = discovery
+
+        indicators = {
+            'current_price': 800.0, 'rsi': 50.0, 'macd': 0.1,
+            'volume_ratio': 1.2, 'price_change_pct': 1.0,
+        }
+
+        import autonomous_agent as aa
+        with patch.object(agent, 'check_cooldown', return_value=False), \
+             patch.object(agent, 'get_market_data', return_value=MagicMock()), \
+             patch.object(agent, 'calculate_indicators', return_value=indicators), \
+             patch.object(agent, 'execute_trade', side_effect=fake_execute), \
+             patch.object(agent, '_attempt_rotation',
+                           side_effect=lambda *a, **kw: rotation_called.append(1) or False) as mock_rot, \
+             patch.object(agent, '_log_decision', return_value=None), \
+             patch.object(aa, 'get_trading_decision', return_value=''), \
+             patch.object(aa, 'parse_decision', return_value={
+                 'decision': 'buy', 'confidence': 0.80,
+                 'reasoning': 'test', 'current_price': 800.0,
+             }), \
+             patch.object(aa, 'news_fetcher'), \
+             patch.object(aa, '_db') as mock_db:
+            mock_db.load_daily_start_equity.return_value = 100_000.0
+            from autonomous_agent import AutonomousAgent
+            AutonomousAgent.run_trading_session(agent)
+
+        mock_rot.assert_not_called()
+        assert rotation_called == []
+
+    def test_rotation_trigger_fires_when_spendable_cash_exhausted(self):
+        """remaining_cash <= 0 (net of reserve) must trigger rotation."""
+        agent = self._make_full_session_agent(alloc_pct=0.05)
+
+        mock_account = MagicMock()
+        mock_account.equity = '100000'
+        mock_account.cash = '100000'
+        # settled cash = 500 → remaining_cash = 500 - 500 = 0 → exhausted
+        mock_account.non_marginable_buying_power = '500'
+        agent.trading_client.get_account.return_value = mock_account
+
+        discovery = MagicMock()
+        discovery.discover_opportunities.return_value = [{'symbol': 'EXP', 'signals': []}]
+        discovery.opportunities = {'EXP': []}
+        agent.discovery = discovery
+
+        indicators = {
+            'current_price': 10.0, 'rsi': 50.0, 'macd': 0.1,
+            'volume_ratio': 1.2, 'price_change_pct': 1.0,
+        }
+
+        import autonomous_agent as aa
+        with patch.object(agent, 'check_cooldown', return_value=False), \
+             patch.object(agent, 'get_market_data', return_value=MagicMock()), \
+             patch.object(agent, 'calculate_indicators', return_value=indicators), \
+             patch.object(agent, 'execute_trade') as mock_execute, \
+             patch.object(agent, '_attempt_rotation', return_value=False) as mock_rot, \
+             patch.object(agent, '_log_decision', return_value=None), \
+             patch.object(aa, 'get_trading_decision', return_value=''), \
+             patch.object(aa, 'parse_decision', return_value={
+                 'decision': 'buy', 'confidence': 0.80,
+                 'reasoning': 'test', 'current_price': 10.0,
+             }), \
+             patch.object(aa, 'news_fetcher'), \
+             patch.object(aa, '_db') as mock_db:
+            mock_db.load_daily_start_equity.return_value = 100_000.0
+            from autonomous_agent import AutonomousAgent
+            AutonomousAgent.run_trading_session(agent)
+
+        mock_rot.assert_called_once()
+        mock_execute.assert_not_called()
+
+    def test_rotation_deduction_uses_actual_buy_entry_cost_not_equity_pct(self):
+        """After a successful rotation, the session loop must correctly pass
+        remaining_cash into _attempt_rotation and floor the post-deduction
+        value at 0 (never negative)."""
+        agent = self._make_full_session_agent(alloc_pct=0.05)
+
+        mock_account = MagicMock()
+        mock_account.equity = '100000'
+        mock_account.cash = '100000'
+        mock_account.non_marginable_buying_power = '500'  # forces rotation trigger
+        agent.trading_client.get_account.return_value = mock_account
+
+        discovery = MagicMock()
+        discovery.discover_opportunities.return_value = [{'symbol': 'EXP', 'signals': []}]
+        discovery.opportunities = {'EXP': []}
+        agent.discovery = discovery
+
+        indicators = {
+            'current_price': 10.0, 'rsi': 50.0, 'macd': 0.1,
+            'volume_ratio': 1.2, 'price_change_pct': 1.0,
+        }
+
+        captured_cash = []
+
+        def fake_rotation(symbol, decision, remaining_cash, equity):
+            captured_cash.append(remaining_cash)
+            agent._last_position_value = 321.0  # actual rotation BUY cost, unrelated to equity*5%=5000
+            return True
+
+        import autonomous_agent as aa
+        with patch.object(agent, 'check_cooldown', return_value=False), \
+             patch.object(agent, 'get_market_data', return_value=MagicMock()), \
+             patch.object(agent, 'calculate_indicators', return_value=indicators), \
+             patch.object(agent, 'execute_trade') as mock_execute, \
+             patch.object(agent, '_attempt_rotation', side_effect=fake_rotation), \
+             patch.object(agent, '_log_decision', return_value=None), \
+             patch.object(aa, 'get_trading_decision', return_value=''), \
+             patch.object(aa, 'parse_decision', return_value={
+                 'decision': 'buy', 'confidence': 0.80,
+                 'reasoning': 'test', 'current_price': 10.0,
+             }), \
+             patch.object(aa, 'news_fetcher'), \
+             patch.object(aa, '_db') as mock_db:
+            mock_db.load_daily_start_equity.return_value = 100_000.0
+            from autonomous_agent import AutonomousAgent
+            AutonomousAgent.run_trading_session(agent)
+
+        # remaining_cash = 0 (500 settled - 500 reserve) is what rotation is
+        # invoked with, and the post-deduction value floors at 0 (never goes
+        # negative) regardless of the $321 deducted.
+        assert captured_cash[0] == 0.0
+        mock_execute.assert_not_called()
+
+    def test_rotation_deduction_formula_uses_last_position_value_not_equity_pct(self):
+        """Source-level regression check: once remaining_cash is at/below zero
+        at the rotation trigger, any positive deduction floors to the same
+        value (0) regardless of amount — the black-box session-loop behavior
+        above can't distinguish the fixed formula from the old bug. Assert
+        directly against the source that the rotation-deduction line uses
+        self._last_position_value, not equity * max_position_size, so a
+        future regression back to the old formula is still caught."""
+        import inspect
+        import autonomous_agent as aa
+        src = inspect.getsource(aa.AutonomousAgent.run_trading_session)
+        # Isolate the rotation branch (between "needs_rotation" and the
+        # following "else:" that starts the non-rotation execute_trade path).
+        start = src.index('if needs_rotation:')
+        end = src.index('else:', start)
+        rotation_branch = src[start:end]
+        assert '_last_position_value' in rotation_branch
+        assert "equity * self.params['max_position_size']" not in rotation_branch
+
+
+# ---------------------------------------------------------------------------
+# Sprint01 C3.1 — _last_position_value stashing on execute_trade
+# ---------------------------------------------------------------------------
+
+class TestPositionValueStashing:
+    def _make_agent(self):
+        with patch('autonomous_agent.TradingClient'), \
+             patch('autonomous_agent.StockHistoricalDataClient'), \
+             patch('autonomous_agent.StockDiscovery'), \
+             patch('autonomous_agent.load_dotenv'), \
+             patch('autonomous_agent.load_model_once'), \
+             patch('autonomous_agent.PortfolioOverseer'), \
+             patch('autonomous_agent.AllocationController'):
+            from autonomous_agent import AutonomousAgent
+            agent = AutonomousAgent.__new__(AutonomousAgent)
+        agent.params = {
+            'max_position_size': 0.05,
+            'stop_loss': -0.07,
+            'take_profit': 0.15,
+            'max_daily_loss_pct': 0.05,
+            'max_daily_trades': 10,
+            'cooldown_minutes': 15,
+            'min_confidence': 0.60,
+            'max_stocks_to_analyze': 25,
+        }
+        agent.daily_trades = 0
+        agent.daily_start_equity = None
+        agent.cooldowns = {}
+        agent.pdt_blocked = False
+        agent._paper = True  # sprint02 D4.3: execute_trade's trade_log now reads this
+        agent._last_order_id = None
+        agent._last_position_value = None
+        agent._db_path = None  # R1 WI-4: each test patches autonomous_agent._db itself
+        from datetime import datetime
+        agent.last_reset_date = datetime.now().date()
+        agent.trading_client = MagicMock()
+        alloc_ctrl = MagicMock()
+        alloc_ctrl.get_position_size_pct.return_value = 0.05
+        agent.alloc_controller = alloc_ctrl
+        overseer = MagicMock()
+        overseer.is_buy_allowed.return_value = (True, '')
+        agent.overseer = overseer
+        fill_result = MagicMock()
+        fill_result.filled = True
+        fill_result.slippage_bps = 0.0
+        paper_sim = MagicMock()
+        paper_sim.simulate_stock_fill.side_effect = lambda side, price, qty, **_kw: (
+            setattr(fill_result, 'fill_qty', qty) or
+            setattr(fill_result, 'fill_price', price) or
+            fill_result
+        )
+        agent.paper_sim = paper_sim
+        return agent
+
+    def test_last_position_value_set_on_successful_buy(self):
+        agent = self._make_agent()
+        mock_order = MagicMock()
+        mock_order.id = 'order-123'
+        agent.trading_client.submit_order.return_value = mock_order
+
+        mock_account = MagicMock()
+        mock_account.cash = '10500'
+        agent.trading_client.get_account.return_value = mock_account
+
+        decision = {'decision': 'buy', 'confidence': 0.80, 'reasoning': 'test', 'current_price': 100.0}
+
+        with patch('builtins.open', MagicMock()), \
+             patch('autonomous_agent.alert_trade_executed'), \
+             patch('autonomous_agent._db') as mock_db:
+            mock_db.cleanup_stale_reservations = MagicMock()
+            mock_db.get_total_reserved = MagicMock(return_value=0.0)
+            mock_db.reserve_cash = MagicMock(return_value=1)
+            mock_db.release_cash = MagicMock()
+            mock_db.insert_trade = MagicMock()
+            result = agent.execute_trade('AAPL', decision, 100_000.0, 9_500.0)
+
+        assert result is True
+        assert agent._last_position_value is not None
+        # spendable=$10,000; 5% of $10,000=$500; 500 shares at $100 fill price.
+        assert agent._last_position_value == pytest.approx(500.0, rel=0.01)
+
+    def test_last_position_value_none_after_sell(self):
+        agent = self._make_agent()
+        agent._last_position_value = 999.0  # simulate a stale value from a prior buy
+
+        mock_position = MagicMock()
+        mock_position.qty = '10'
+        mock_position.avg_entry_price = '90.0'
+        agent.get_position = MagicMock(return_value=mock_position)
+
+        mock_order = MagicMock()
+        mock_order.id = 'sell-order-1'
+        agent.trading_client.submit_order.return_value = mock_order
+
+        decision = {'decision': 'sell', 'confidence': 0.80, 'reasoning': 'test', 'current_price': 100.0}
+
+        with patch('builtins.open', MagicMock()), \
+             patch('autonomous_agent.alert_trade_executed'), \
+             patch('autonomous_agent._db') as mock_db:
+            mock_db.insert_trade = MagicMock()
+            result = agent.execute_trade('AAPL', decision, 100_000.0, 0)
+
+        assert result is True
+        assert agent._last_position_value is None
+
+    def test_last_position_value_has_no_coupling_with_cash_reservation_table(self):
+        """self._last_position_value is a purely local/session-scoped attribute
+        with no interaction with the cross-bot cash-reservation DB table —
+        _db.reserve_cash/release_cash must be called/released exactly as before,
+        unaffected by C3's stashing addition."""
+        agent = self._make_agent()
+        mock_order = MagicMock()
+        mock_order.id = 'order-456'
+        agent.trading_client.submit_order.return_value = mock_order
+
+        mock_account = MagicMock()
+        mock_account.cash = '10500'
+        agent.trading_client.get_account.return_value = mock_account
+
+        decision = {'decision': 'buy', 'confidence': 0.80, 'reasoning': 'test', 'current_price': 100.0}
+
+        with patch('builtins.open', MagicMock()), \
+             patch('autonomous_agent.alert_trade_executed'), \
+             patch('autonomous_agent._db') as mock_db:
+            mock_db.cleanup_stale_reservations = MagicMock()
+            mock_db.get_total_reserved = MagicMock(return_value=0.0)
+            mock_db.reserve_cash = MagicMock(return_value=42)
+            mock_db.release_cash = MagicMock()
+            mock_db.insert_trade = MagicMock()
+            agent.execute_trade('AAPL', decision, 100_000.0, 9_500.0)
+
+            mock_db.reserve_cash.assert_called_once()
+            mock_db.release_cash.assert_called_once_with(42)
+        # The reservation amount is independent of _last_position_value — it's
+        # computed from pre-fill-sim position_value, not the post-fill actual cost.
+        assert agent._last_position_value is not None
+
+
+# ---------------------------------------------------------------------------
+# Sprint02 D3 — review_held_positions() unconditional stop-loss/take-profit
+# ---------------------------------------------------------------------------
+
+def _make_held_position(symbol, unrealized_plpc, current_price=100.0, qty='10'):
+    p = MagicMock()
+    p.symbol = symbol
+    p.unrealized_plpc = str(unrealized_plpc)
+    p.current_price = str(current_price)
+    p.qty = qty
+    return p
+
+
+class TestHeldPositionReview:
+    def _make_agent(self):
+        with patch('autonomous_agent.TradingClient'), \
+             patch('autonomous_agent.StockHistoricalDataClient'), \
+             patch('autonomous_agent.StockDiscovery'), \
+             patch('autonomous_agent.load_dotenv'), \
+             patch('autonomous_agent.load_model_once'), \
+             patch('autonomous_agent.PortfolioOverseer'), \
+             patch('autonomous_agent.AllocationController'):
+            from autonomous_agent import AutonomousAgent
+            agent = AutonomousAgent.__new__(AutonomousAgent)
+        agent.params = {
+            'max_position_size': 0.05,
+            'stop_loss': -0.07,
+            'take_profit': 0.15,
+            'max_daily_loss_pct': 0.05,
+            'max_daily_trades': 10,
+            'cooldown_minutes': 15,
+            'min_confidence': 0.60,
+            'max_stocks_to_analyze': 25,
+        }
+        agent.daily_trades = 0
+        agent.daily_start_equity = None
+        agent.cooldowns = {}
+        agent.pdt_blocked = False
+        agent._paper = True  # sprint02 D4.3: execute_trade's trade_log now reads this
+        agent._last_order_id = None
+        agent._last_position_value = None
+        agent.trading_client = MagicMock()
+        agent.trading_client.get_orders.return_value = []  # no open exit orders by default
+        return agent
+
+    def test_stop_loss_triggers_sell(self):
+        agent = self._make_agent()
+        pos = _make_held_position('AAA', -0.08, current_price=92.0)  # opened prior day
+        agent.trading_client.get_all_positions.return_value = [pos]
+        with patch.object(agent, '_bought_today', return_value=False), \
+             patch.object(agent, 'execute_trade', return_value=True) as mock_execute:
+            agent.review_held_positions(equity=100_000.0)
+        mock_execute.assert_called_once()
+        call_symbol, call_decision = mock_execute.call_args[0][0], mock_execute.call_args[0][1]
+        assert call_symbol == 'AAA'
+        assert call_decision['decision'] == 'sell'
+
+    def test_take_profit_triggers_sell(self):
+        agent = self._make_agent()
+        pos = _make_held_position('BBB', 0.16, current_price=116.0)
+        agent.trading_client.get_all_positions.return_value = [pos]
+        with patch.object(agent, '_bought_today', return_value=False), \
+             patch.object(agent, 'execute_trade', return_value=True) as mock_execute:
+            agent.review_held_positions(equity=100_000.0)
+        mock_execute.assert_called_once()
+        assert mock_execute.call_args[0][0] == 'BBB'
+
+    def test_within_band_no_sell(self):
+        agent = self._make_agent()
+        pos = _make_held_position('CCC', -0.02, current_price=98.0)  # inside -7%/+15% band
+        agent.trading_client.get_all_positions.return_value = [pos]
+        with patch.object(agent, '_bought_today', return_value=False), \
+             patch.object(agent, 'execute_trade') as mock_execute:
+            agent.review_held_positions(equity=100_000.0)
+        mock_execute.assert_not_called()
+
+    def test_duplicate_exit_guard_skips_second_sell(self):
+        agent = self._make_agent()
+        pos = _make_held_position('DDD', -0.10, current_price=90.0)
+        agent.trading_client.get_all_positions.return_value = [pos]
+        open_sell = MagicMock()
+        open_sell.symbol = 'DDD'
+        open_sell.side = OrderSide.SELL
+        agent.trading_client.get_orders.return_value = [open_sell]
+        with patch.object(agent, '_bought_today', return_value=False), \
+             patch.object(agent, 'execute_trade') as mock_execute:
+            agent.review_held_positions(equity=100_000.0)
+        mock_execute.assert_not_called()
+
+    def test_pdt_deferral_same_day_position(self):
+        """A stop/take-profit trigger on a position opened today must be
+        deferred, not submitted as a same-day close, when no_same_day_close
+        is active."""
+        agent = self._make_agent()
+        agent.params['no_same_day_close'] = True
+        pos = _make_held_position('EEE', -0.08, current_price=92.0)
+        agent.trading_client.get_all_positions.return_value = [pos]
+        with patch.object(agent, '_bought_today', return_value=True), \
+             patch.object(agent, 'execute_trade') as mock_execute, \
+             patch('autonomous_agent.logging') as mock_log:
+            agent.review_held_positions(equity=100_000.0)
+        mock_execute.assert_not_called()
+        assert any('deferred' in str(c) for c in mock_log.info.call_args_list)
+
+    def test_pdt_deferral_does_not_apply_to_prior_day_position(self):
+        """The same trigger on a position opened a prior day must sell
+        normally — deferral only applies to same-day opens."""
+        agent = self._make_agent()
+        agent.params['no_same_day_close'] = True
+        pos = _make_held_position('FFF', -0.08, current_price=92.0)
+        agent.trading_client.get_all_positions.return_value = [pos]
+        with patch.object(agent, '_bought_today', return_value=False), \
+             patch.object(agent, 'execute_trade', return_value=True) as mock_execute:
+            agent.review_held_positions(equity=100_000.0)
+        mock_execute.assert_called_once()
+
+    def test_no_positions_no_crash(self):
+        agent = self._make_agent()
+        agent.trading_client.get_all_positions.return_value = []
+        with patch.object(agent, 'execute_trade') as mock_execute:
+            agent.review_held_positions(equity=100_000.0)
+        mock_execute.assert_not_called()
+
+    def test_options_positions_excluded(self):
+        """Long OCC option symbols (len > 10) must not be reviewed here —
+        those belong to the options bot."""
+        agent = self._make_agent()
+        opt_pos = _make_held_position('SPY250328P00560000', -0.60, current_price=1.0)
+        agent.trading_client.get_all_positions.return_value = [opt_pos]
+        with patch.object(agent, '_bought_today', return_value=False), \
+             patch.object(agent, 'execute_trade') as mock_execute:
+            agent.review_held_positions(equity=100_000.0)
+        mock_execute.assert_not_called()
+
+    def test_runs_even_with_empty_opportunities(self):
+        """End-to-end: review_held_positions still executes a sell when
+        discovery returns zero opportunities — the core sprint02 D3 fix."""
+        from datetime import datetime as _dt
+        agent = self._make_agent()
+        agent.daily_start_equity = 100_000.0
+        agent.last_reset_date = _dt.now().date()
+        alloc_ctrl = MagicMock()
+        alloc_ctrl.get_position_size_pct.return_value = 0.05
+        agent.alloc_controller = alloc_ctrl
+        overseer = MagicMock()
+        overseer.is_buy_allowed.return_value = (True, '')
+        agent.overseer = overseer
+        pos = _make_held_position('GGG', -0.09, current_price=91.0)
+        agent.trading_client.get_all_positions.return_value = [pos]
+
+        mock_account = MagicMock()
+        mock_account.equity = '100000'
+        mock_account.cash = '100000'
+        mock_account.non_marginable_buying_power = '100000'
+        agent.trading_client.get_account.return_value = mock_account
+
+        discovery = MagicMock()
+        discovery.discover_opportunities.return_value = []
+        agent.discovery = discovery
+
+        import autonomous_agent as aa
+        with patch.object(agent, '_bought_today', return_value=False), \
+             patch.object(agent, 'execute_trade', return_value=True) as mock_execute, \
+             patch.object(aa, '_db') as mock_db:
+            mock_db.load_daily_start_equity.return_value = 100_000.0
+            from autonomous_agent import AutonomousAgent
+            AutonomousAgent.run_trading_session(agent)
+
+        mock_execute.assert_called_once()
+        assert mock_execute.call_args[0][0] == 'GGG'
+
 
 # ---------------------------------------------------------------------------
 # Fix 8: TestSettledCash — remaining_cash must come from non_marginable_buying_power
@@ -514,6 +1137,7 @@ class TestSettledCash:
         agent.daily_start_equity = 50_000.0
         agent.cooldowns = {}
         agent.pdt_blocked = False
+        agent._paper = True  # sprint02 D4.3: execute_trade's trade_log now reads this
         from datetime import datetime
         agent.last_reset_date = datetime.now().date()
         agent.trading_client = MagicMock()
@@ -629,6 +1253,7 @@ class TestDynamicAssumedReturn:
         agent.daily_start_equity = None
         agent.cooldowns = {}
         agent.pdt_blocked = False
+        agent._paper = True  # sprint02 D4.3: execute_trade's trade_log now reads this
         agent._last_order_id = None
         from datetime import datetime
         agent.last_reset_date = datetime.now().date()

@@ -503,6 +503,24 @@ def alert_service_down_with_positions(unit_name: str, account_label: str, bot: s
     )
 
 
+def alert_broker_fill_unaccounted(symbol: str, order_id: str, filled_qty: float,
+                                  avg_price: float) -> None:
+    """R1 WI-5: a broker-side fill was found with zero corresponding app
+    record — the exact gap that made the MSFT protective-stop fill (2026-07
+    incident) invisible until this reconciliation sweep existed. CRITICAL,
+    separate from the informational trade_executed alert also fired for the
+    same event — this one is about the *fact that it was ever invisible*,
+    not just that a trade happened."""
+    send_alert(
+        AlertLevel.CRITICAL,
+        'broker_fill_unaccounted',
+        f"Broker fill with NO app record found: SELL {filled_qty} {symbol} "
+        f"@ ${avg_price:.2f} (order {order_id}). Reconciled after the fact — "
+        f"investigate why this order was never captured by the submitting code path.",
+        data={'symbol': symbol, 'order_id': order_id, 'filled_qty': filled_qty, 'avg_price': avg_price},
+    )
+
+
 def alert_cash_negative(account_label: str, cash: float, non_marginable_buying_power: float) -> None:
     """R1 WI-7: the account's cash invariant (cash >= 0 and
     non_marginable_buying_power >= 0) has been breached — the exact failure

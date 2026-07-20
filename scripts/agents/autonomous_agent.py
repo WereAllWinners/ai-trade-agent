@@ -33,6 +33,7 @@ from alpaca.trading.requests import LimitOrderRequest
 from portfolio_overseer import PortfolioOverseer
 from allocation_controller import AllocationController
 import account_config as _acfg
+from service_suffix import service_suffix
 from utils.indicators import get_daily_bars_for_ma, calculate_ma_atr, is_daily_df
 
 _DEBATE_CONFIDENCE_THRESHOLD = 0.90   # Only debate very high-conviction trades
@@ -202,7 +203,9 @@ def _write_rotation_log(sell_sym, buy_sym, sell_oid, buy_oid, outcome):
     }
     try:
         os.makedirs('logs', exist_ok=True)
-        with open('logs/rotation_log.jsonl', 'a') as f:
+        # sprint02 D4.1: paper/live stock services share a WorkingDirectory —
+        # suffix so they don't race on the same rotation log.
+        with open(f'logs/rotation_log{service_suffix()}.jsonl', 'a') as f:
             f.write(json.dumps(record) + '\n')
     except Exception as e:
         logging.warning(f"⚠️  Could not write rotation log: {e}")
@@ -328,8 +331,15 @@ class AutonomousAgent:
         self.fee_simulator      = FeeSimulator(paper=_paper)
         self.paper_sim          = PaperMarketSimulator(paper=_paper)
         self._last_order_id: str | None = None
+        # sprint01 C3.1: actual dollar cost of the last successful BUY (post
+        # fill-simulation, so it reflects partial fills correctly) — the
+        # session loop uses this instead of re-deriving a deduction amount
+        # from a different formula, which is what caused the cash-accounting
+        # drift this stage fixes.
+        self._last_position_value: float | None = None
         self._session_regime: str | None = None
         self._paper             = _paper
+        self._db_path           = _db.DB_PATH  # R1 WI-4: explicit injection point for tests
         set_alert_source('paper' if _paper else 'live')
 
         # Decision logging — unique ID per process run for replay correlation
@@ -741,38 +751,73 @@ class AutonomousAgent:
                 submitted_order = self.trading_client.submit_order(order)
 
             self._last_order_id = str(submitted_order.id)
+            # sprint01 C3.1: actual spend, using the post-fill-simulation values
+            # (shares/fill_price), not the pre-fill `position_value` computed
+            # above — this correctly reflects partial fills. None on sells so
+            # the session loop can tell "no BUY just happened" apart from "BUY
+            # happened but cost $0".
+            self._last_position_value = shares * fill_price if side == OrderSide.BUY else None
 
-            # Log trade
-            trade_log = {
-                'timestamp': datetime.now().isoformat(),
-                'symbol': symbol,
-                'action': decision['decision'],
-                'shares': shares,
-                'confidence': decision['confidence'],
-                'reasoning': decision['reasoning'],
-                'order_id': str(submitted_order.id),
-                'bracket_stop': stop_price,
-                'bracket_take_profit': target_price,
-            }
-
-            with open('logs/trade_log.jsonl', 'a') as f:
-                f.write(json.dumps(trade_log) + '\n')
-            try:
-                _db.insert_trade(trade_log, bot='stock', source='paper' if self._paper else 'live')
-            except Exception as e:
-                logging.warning(f"⚠️  Could not write trade to DB: {e}")
-
-            logging.info(f"✅ Executed {decision['decision'].upper()} {shares} shares of {symbol}")
-            if side == OrderSide.SELL and avg_entry_price is not None:
-                realized_pnl = (fill_price - avg_entry_price) * shares
-                realized_pnl_pct = (fill_price - avg_entry_price) / avg_entry_price
-                alert_trade_executed(
-                    'StockAgent', symbol, decision['decision'],
-                    shares, fill_price, str(submitted_order.id),
-                    pnl=realized_pnl, pnl_pct=realized_pnl_pct,
-                    avg_entry_price=avg_entry_price,
+            if side == OrderSide.SELL:
+                # R1 WI-4: same fill-confirmation fix as the options agent's
+                # manage_existing_positions() — do NOT log this exit as
+                # complete at submit time (that's exactly the defect that
+                # fabricated the 2026-07 incident's false "closed at a
+                # profit" records; see
+                # findings/paper-negcash-addendum-a-2026-07-16.md). Record
+                # it pending instead; exit_reconciler.reconcile_pending_exits()
+                # writes the real trade_log/DB/alert entry once the broker
+                # confirms a terminal status, using actual fill data instead
+                # of `fill_price` (the simulator's pre-submission estimate,
+                # not a confirmed fill).
+                pending = {
+                    'order_id': str(submitted_order.id),
+                    'symbol': symbol,
+                    'intended_qty': shares,
+                    'intended_reason': decision['reasoning'],
+                    'avg_entry_price': avg_entry_price,
+                    'time_in_force': order.time_in_force.value,
+                    'submitted_at': datetime.now().isoformat(),
+                }
+                _db.insert_pending_exit(
+                    pending, bot='stock',
+                    source='paper' if self._paper else 'live',
+                    db_path=self._db_path,
+                )
+                logging.info(
+                    f"⏳ Exit submitted (pending confirmation): {symbol} "
+                    f"order_id={submitted_order.id}"
                 )
             else:
+                # Log trade
+                # sprint02 D4.3: paper and live stock services share this same
+                # trade_log.jsonl file — without a source field, outcome_tracker's
+                # FIFO matching (grouped purely by symbol) can pair a paper BUY
+                # with a live SELL or vice versa, producing wrong realized P&L.
+                # Confirmed empirically: 2/15 sampled order_ids in the shared file
+                # actually belonged to the live account. `self._paper` mirrors the
+                # value already computed for the DB insert two lines below.
+                trade_log = {
+                    'timestamp': datetime.now().isoformat(),
+                    'symbol': symbol,
+                    'action': decision['decision'],
+                    'shares': shares,
+                    'confidence': decision['confidence'],
+                    'reasoning': decision['reasoning'],
+                    'order_id': str(submitted_order.id),
+                    'bracket_stop': stop_price,
+                    'bracket_take_profit': target_price,
+                    'source': 'paper' if self._paper else 'live',
+                }
+
+                with open('logs/trade_log.jsonl', 'a') as f:
+                    f.write(json.dumps(trade_log) + '\n')
+                try:
+                    _db.insert_trade(trade_log, bot='stock', source='paper' if self._paper else 'live')
+                except Exception as e:
+                    logging.warning(f"⚠️  Could not write trade to DB: {e}")
+
+                logging.info(f"✅ Executed {decision['decision'].upper()} {shares} shares of {symbol}")
                 alert_trade_executed(
                     'StockAgent', symbol, decision['decision'],
                     shares, fill_price, str(submitted_order.id),
@@ -914,6 +959,102 @@ class AutonomousAgent:
             logging.debug("Could not compute recent avg win pct: %s", e)
         return _FALLBACK
 
+    def _has_open_exit_order(self, symbol: str) -> bool:
+        """Return True if a live SELL order already exists for this stock symbol.
+
+        Prevents duplicate exit submissions when a broker-side OCO/bracket stop
+        is still pending. Defaults to False on API error so a real exit is never
+        silently blocked. Ported from options_agent.py's equivalent guard
+        (sprint02 D3).
+        """
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            open_orders = self.trading_client.get_orders(GetOrdersRequest(status='open'))
+            return any(
+                order.symbol == symbol and order.side == OrderSide.SELL
+                for order in open_orders
+            )
+        except Exception as e:
+            logging.warning(f"Could not check open orders for {symbol}: {e}")
+            return False
+
+    def review_held_positions(self, equity: float = 0) -> None:
+        """Broker-independent numeric stop-loss/take-profit safety net (sprint02 D3).
+
+        Runs unconditionally at session start, before discovery — so a discovery
+        failure (or any future data-source outage) never strips the account of
+        its only exit mechanism. This is a hard numeric floor, not an AI opinion:
+        any position that has crossed self.params['stop_loss']/['take_profit'] is
+        sold immediately, mirroring options_agent.manage_existing_positions()'s
+        proven pattern. An AI-scored soft-sell layer is deferred to a follow-up
+        sprint (see plan) — this stage only closes the "naked fractional position"
+        gap, since many stock positions currently carry no broker-side OCO/bracket
+        protection at all (Alpaca does not support GTC stops on fractional qty).
+
+        Sells built here don't get decision['indicators'] attached — same shape
+        as the sprint01 A5 rotation gap (accepted, see TODO(sprint02) comment at
+        _attempt_rotation's sell_decision construction site). Paper-mode fill
+        simulation for these sells runs on the 1M-share default ADV; live mode is
+        unaffected (pure passthrough regardless of ADV).
+        """
+        try:
+            positions = self.trading_client.get_all_positions()
+        except Exception as e:
+            logging.warning(f"⚠️  review_held_positions: could not fetch positions: {e}")
+            return
+
+        stock_positions = [p for p in positions if len(p.symbol) <= 10]
+        logging.info(f"📋 Phase 1: reviewing {len(stock_positions)} held positions")
+
+        stop_loss_pct   = self.params['stop_loss']
+        take_profit_pct = self.params['take_profit']
+
+        for position in stock_positions:
+            symbol = position.symbol
+            try:
+                unrealized_plpc = float(position.unrealized_plpc)
+            except (TypeError, ValueError, AttributeError):
+                continue
+
+            triggered = unrealized_plpc <= stop_loss_pct or unrealized_plpc >= take_profit_pct
+            if not triggered:
+                continue
+
+            if self._has_open_exit_order(symbol):
+                logging.debug(f"review_held_positions: {symbol} already has an open exit order — skipping")
+                continue
+
+            # PDT guard: execute_trade's own SELL branch already enforces
+            # no_same_day_close via _bought_today(), but we check proactively
+            # here too so the deferral gets its own explicit, loud log line
+            # rather than relying only on execute_trade's more generic
+            # "Skipping SELL" message.
+            if self.params.get('no_same_day_close') and self._bought_today(symbol):
+                logging.info(
+                    f"⏸️  Stop triggered for {symbol} but deferred (PDT same-day-close guard)"
+                )
+                continue
+
+            try:
+                current_price = float(position.current_price)
+            except (TypeError, ValueError, AttributeError):
+                continue
+
+            reason = 'stop_loss' if unrealized_plpc <= stop_loss_pct else 'take_profit'
+            sell_decision = {
+                'decision':      'sell',
+                'confidence':    1.0,
+                'reasoning':     f'held-position review — {reason} triggered ({unrealized_plpc:+.2%})',
+                'current_price': current_price,
+            }
+            logging.info(
+                f"🛑 {reason.replace('_', ' ').title()} triggered for {symbol} "
+                f"({unrealized_plpc:+.2%}) — selling"
+            )
+            # NOTE(B2): resting DAY stops will reserve qty — cancel-before-exit
+            # must cover this sell path when B1/B2 lands.
+            self.execute_trade(symbol, sell_decision, equity, 0)
+
     def _attempt_rotation(
         self,
         new_symbol:   str,
@@ -1010,6 +1151,10 @@ class AutonomousAgent:
             f"🔄 Rotating: SELL {weakest['symbol']} → BUY {new_symbol} "
             f"(est. fees ${fee_breakdown['total_cost']:.2f})"
         )
+        # TODO(sprint02): no 'indicators' key here, so execute_trade's fill sim
+        # still uses the 1M-share default ADV for this leg (see V0-B in
+        # docs/sprint01-v0-findings.md — accepted gap for sprint01, sell-side
+        # slippage on liquid rotation exits is expected to be small).
         sell_decision = {
             'decision':      'sell',
             'confidence':    weakest['confidence'],
@@ -1086,6 +1231,25 @@ class AutonomousAgent:
             f"Settled: ${settled:,.2f} (T+1 pending: ${cash - settled:,.2f})"
         )
 
+        # R1 WI-4/5: reconcile any exits left pending from a prior session
+        # BEFORE the cash hard-gate below — that gate `return`s from this
+        # entire function when cash is low, which (documented, pre-existing
+        # gap, not fixed here — see docs/operations.md) already means
+        # review_held_positions() never runs once cash goes negative.
+        # Placing reconciliation ahead of the gate means it can never be
+        # silently skipped by that same condition too. Each session is a
+        # brand-new process (trading_daemon.py subprocess-launches this
+        # script fresh every cycle), so this is the only place pending-exit
+        # state can ever be resolved.
+        try:
+            from exit_reconciler import reconcile_pending_exits
+            reconcile_pending_exits(
+                self.trading_client, bot='stock',
+                source='paper' if self._paper else 'live', db_path=self._db_path,
+            )
+        except Exception as _rex:
+            logging.warning(f"⚠️  Exit reconciliation skipped: {_rex}")
+
         # Apply account-tier params and fire upgrade alert when equity crosses thresholds.
         stock_overrides = _acfg.get_stock_params(equity)
         if stock_overrides:
@@ -1125,6 +1289,7 @@ class AutonomousAgent:
             return
 
         # ── Macro guard (Fix B/C) ──────────────────────────────────────────────
+        economic_calendar.check_calendar_staleness()
         macro_events = economic_calendar.get_todays_high_impact_events()
         halt, halt_reason = economic_calendar.should_halt_trading(macro_events)
         if halt:
@@ -1141,6 +1306,13 @@ class AutonomousAgent:
             macro_events,
             economic_calendar.get_earnings_today([]),  # symbols added below after discovery
         )
+
+        # ── Phase 1: unconditional held-position review (sprint02 D3) ────────
+        # Runs before discovery and independent of its outcome — a discovery
+        # failure must never strip the account of its only exit mechanism.
+        # Respects the circuit-breaker/macro-guard early returns above (those
+        # are deliberate full-session halts, unlike a discovery outage).
+        self.review_held_positions(equity)
 
         # Discover opportunities — force a fresh scan on the first session of each trading day.
         # A file-based stamp survives daemon restarts and subprocess boundaries.
@@ -1306,6 +1478,7 @@ class AutonomousAgent:
             response = get_trading_decision(prompt)
             decision = parse_decision(response)
             decision['current_price'] = indicators['current_price']
+            decision['indicators'] = indicators
 
             logging.info(f"📊 {symbol}: {decision['decision'].upper()} (confidence: {decision['confidence']:.2f})")
 
@@ -1341,18 +1514,36 @@ class AutonomousAgent:
                 will_execute = False
             elif will_execute:
                 is_buy = decision['decision'] == 'buy'
-                needs_rotation = is_buy and remaining_cash < decision.get('current_price', 0)
+                # sprint01 C3.2: previously compared remaining_cash against one
+                # share's price — meaningless with fractional-share support (it
+                # fired whenever cash couldn't cover one expensive share, which
+                # happens often, triggering rotation far too readily). Defer
+                # entirely to execute_trade's own affordability checks as the
+                # single source of truth: only rotate when session cash is
+                # essentially exhausted. `remaining_cash` is already initialized
+                # net of _MIN_CASH_RESERVE (see `remaining_cash = settled -
+                # _MIN_CASH_RESERVE` above) — it's the spendable-beyond-reserve
+                # figure, the same quantity execute_trade calls `spendable`
+                # internally. So "exhausted" here is remaining_cash <= 0, not
+                # <= _MIN_CASH_RESERVE (that would double-count the reserve and
+                # trigger rotation far too early).
+                needs_rotation = is_buy and remaining_cash <= 0
 
                 if needs_rotation:
                     logging.info(
-                        f"💡 Cash ${remaining_cash:,.2f} insufficient for {symbol} "
-                        f"@ ${decision.get('current_price', 0):.2f} — attempting rotation..."
+                        f"💡 Cash ${remaining_cash:,.2f} spendable (net of reserve) "
+                        f"exhausted — attempting rotation for {symbol}..."
                     )
                     executed = self._attempt_rotation(symbol, decision, remaining_cash, equity)
                     if executed:
                         trades_executed += 1
+                        # sprint01 C3.2: deduct the rotation's actual BUY entry cost
+                        # (stashed by execute_trade — _attempt_rotation calls it twice,
+                        # SELL then BUY, so this holds the BUY's value on return), not
+                        # equity * max_position_size (a ceiling constant unrelated to
+                        # what was actually spent).
                         remaining_cash = max(
-                            remaining_cash - equity * self.params['max_position_size'], 0
+                            remaining_cash - (getattr(self, '_last_position_value', None) or 0), 0
                         )
                         logging.info(f"💵 Remaining cash this session: ${remaining_cash:,.2f}")
                 else:
@@ -1360,7 +1551,19 @@ class AutonomousAgent:
                     if executed:
                         trades_executed += 1
                         if is_buy:
-                            cost = remaining_cash * self.params['max_position_size']
+                            # sprint01 C3.2: deduct what was actually spent
+                            # (self._last_position_value, stashed by execute_trade),
+                            # not remaining_cash * max_position_size — that used the
+                            # 5% ceiling constant regardless of the actual allocation
+                            # tier (1%/3%/5%), over-deducting by up to ~5x in Tier 1.
+                            _lpv = getattr(self, '_last_position_value', None)
+                            cost = (
+                                _lpv
+                                if _lpv is not None
+                                # Defensive fallback — should be unreachable when
+                                # executed=True on the buy path.
+                                else remaining_cash * self.alloc_controller.get_position_size_pct()
+                            )
                             remaining_cash = max(remaining_cash - cost, 0)
                             logging.info(f"💵 Remaining cash this session: ${remaining_cash:,.2f}")
             elif not will_execute and decision['decision'] in ['buy', 'sell']:
@@ -1422,7 +1625,10 @@ class AutonomousAgent:
         try:
             from risk_reconciler import write_reconcile_status as _write_rec
             from pathlib import Path as _Path
-            _write_rec(self.trading_client, _Path('logs/reconcile_status.json'))
+            # sprint02 D4.1: suffix so paper/live stock services (and the
+            # options bot, also a writer of this same historically-shared
+            # path) don't overwrite each other's status.
+            _write_rec(self.trading_client, _Path(f'logs/reconcile_status{service_suffix()}.json'))
         except Exception as _re:
             logging.debug("Could not write reconcile_status: %s", _re)
 
