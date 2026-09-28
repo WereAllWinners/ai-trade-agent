@@ -10,11 +10,15 @@ trl>=0.7.0
 datasets>=2.14.0
 
 # Trading APIs
-alpaca-py>=0.8.0
-yfinance>=0.2.0
+# sprint02 D6b: pin upper bounds to what's actually installed/tested — an
+# untested major/minor bump silently broke pandas.read_html for months
+# (see D1) with nobody noticing until a live-account investigation surfaced
+# it. Bump these deliberately, not implicitly via `pip install -U`.
+alpaca-py>=0.8.0,<0.44.0
+yfinance>=0.2.0,<1.2.0
 
 # Data processing
-pandas>=2.0.0
+pandas>=2.0.0,<3.1.0
 numpy>=1.24.0
 lxml==6.0.2
 tenacity==9.1.4
