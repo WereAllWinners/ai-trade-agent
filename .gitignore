@@ -3,6 +3,9 @@
 *.env
 .env.live
 *.env.live
+# Timestamped .env backups hold real credentials and match none of the
+# patterns above (*.env only matches names *ending* in .env).
+.env.bak*
 
 # Python
 __pycache__/
@@ -18,6 +21,10 @@ logs/
 
 # Keep curated knowledge base files (committed to repo)
 !knowledge/*.jsonl
+!data/macro_event_calendar.json
+
+# Local symlink farm pointing into the HuggingFace cache — not repo content
+unsloth/
 
 # Model files — ignore checkpoint dirs/symlinks, not training scripts
 finetune/finance_qwen_32b*
