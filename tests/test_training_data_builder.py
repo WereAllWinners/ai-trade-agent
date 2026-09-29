@@ -1566,3 +1566,98 @@ class TestRegenerateSyncedOutcomes:
 
         assert stats == {'matched': 0, 'unmatched': 0, 'deleted': 0, 'inserted': 0,
                           'coverage_pct': 100.0, 'details': []}
+
+
+class TestRegenerateHistoricalPrefersDecisionsReasoning:
+    """regenerate_historical must rebuild from the ORIGINAL reasoning when available.
+
+    _extract_reasoning_clean can only salvage text that survived inside the
+    contaminated ideal_output — which may be truncated, since the contamination
+    consumed part of the 200-char budget. decisions.reasoning, once backfilled
+    from raw_response, is the real thing. Joined on prompt_hash because
+    training_examples.prompt is a verbatim copy of decisions.prompt.
+    """
+
+    def _seed(self, db_path, stored_reasoning, ideal_output):
+        import db as _db
+        import training_data_builder as tdb
+        prompt = 'Analyze AAPL for a potential trade.'
+        _db.insert_decision({
+            'timestamp': '2026-09-01T10:00:00', 'session_id': 's', 'bot': 'stock',
+            'model': 'm', 'symbol': 'AAPL', 'prompt': prompt, 'raw_response': 'x',
+            'decision': 'buy', 'confidence': 0.8, 'reasoning': stored_reasoning,
+            'executed': True, 'indicators': {},
+        }, db_path=db_path)
+        # insert_training_example reads these from `metadata`, not top level.
+        _db.insert_training_example({
+            'input': prompt, 'output': ideal_output, 'label': 'winner',
+            'metadata': {
+                'bot': 'stock', 'symbol': 'AAPL', 'confidence': 0.8,
+                'pnl_pct': 0.05, 'entry_date': '2026-09-01', 'session_id': '',
+                'prompt_hash': tdb._prompt_hash(prompt),
+            },
+        }, db_path=db_path)
+        return prompt
+
+    def test_rebuild_uses_the_backfilled_decisions_reasoning(self, tmp_path):
+        import db as _db
+        import training_data_builder as tdb
+        db_path = tmp_path / 'r.db'
+        _db.init_db(db_path)
+        # ideal_output holds a truncated copy; decisions holds the full text.
+        self._seed(
+            db_path,
+            stored_reasoning='Strong momentum confirmed across several indicators.',
+            ideal_output=('Decision: BUY\nConfidence: 0.80\n'
+                          'Reasoning: Decision: BUY Confidence: 0.85 Reasoning: Strong mom'),
+        )
+        tdb.regenerate_historical(db_path, dry_run=False)
+
+        with _db.get_conn(db_path) as conn:
+            rebuilt = conn.execute('SELECT ideal_output FROM training_examples').fetchone()[0]
+        assert tdb._is_clean_ideal_output(rebuilt), 'rebuilt row must pass the filter'
+        assert 'Strong momentum confirmed across several indicators.' in rebuilt, \
+            'should use the full decisions.reasoning, not the truncated in-string copy'
+
+    def test_falls_back_when_no_decision_row_matches(self, tmp_path):
+        import db as _db
+        import training_data_builder as tdb
+        db_path = tmp_path / 'r2.db'
+        _db.init_db(db_path)
+        prompt = 'Orphan prompt with no decision row.'
+        _db.insert_training_example({
+            'input': prompt,
+            'output': ('Decision: BUY\nConfidence: 0.80\n'
+                       'Reasoning: Decision: BUY Confidence: 0.85 Reasoning: Salvaged text.'),
+            'label': 'winner',
+            'metadata': {
+                'bot': 'stock', 'symbol': 'MSFT', 'confidence': 0.8, 'pnl_pct': 0.05,
+                'entry_date': '2026-09-01', 'session_id': '',
+                'prompt_hash': tdb._prompt_hash(prompt),
+            },
+        }, db_path=db_path)
+
+        tdb.regenerate_historical(db_path, dry_run=False)
+        with _db.get_conn(db_path) as conn:
+            rebuilt = conn.execute('SELECT ideal_output FROM training_examples').fetchone()[0]
+        assert tdb._is_clean_ideal_output(rebuilt)
+        assert 'Salvaged text.' in rebuilt, 'must fall back to in-string extraction'
+
+    def test_contaminated_decision_rows_are_not_used_as_a_source(self, tmp_path):
+        """A decision row the backfill could not repair is no better than the string."""
+        import db as _db
+        import training_data_builder as tdb
+        db_path = tmp_path / 'r3.db'
+        _db.init_db(db_path)
+        self._seed(
+            db_path,
+            stored_reasoning='Decision: BUY Confidence: 0.85 Reasoning: still contaminated',
+            ideal_output=('Decision: BUY\nConfidence: 0.80\n'
+                          'Reasoning: Decision: BUY Confidence: 0.85 Reasoning: Salvageable text.'),
+        )
+        tdb.regenerate_historical(db_path, dry_run=False)
+        with _db.get_conn(db_path) as conn:
+            rebuilt = conn.execute('SELECT ideal_output FROM training_examples').fetchone()[0]
+        assert tdb._is_clean_ideal_output(rebuilt)
+        assert 'Salvageable text.' in rebuilt
+        assert 'still contaminated' not in rebuilt

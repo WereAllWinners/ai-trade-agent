@@ -341,6 +341,43 @@ def _extract_decision(ideal_output: str) -> str:
     return 'hold'
 
 
+def _load_decision_reasoning_map(db_path) -> dict:
+    """Map md5(prompt) → decisions.reasoning, for rebuilding contaminated rows.
+
+    Only clean, non-empty reasoning is included: a decision row that is itself
+    still contaminated (e.g. one the backfill skipped because raw_response held
+    nothing recoverable) is no better than what the ideal_output already
+    contains, so callers should fall back to in-string extraction for those.
+    """
+    mapping: dict[str, str] = {}
+    try:
+        with _db.get_conn(db_path) as conn:
+            rows = conn.execute(
+                "SELECT prompt, reasoning FROM decisions "
+                "WHERE prompt IS NOT NULL AND reasoning IS NOT NULL "
+                "  AND TRIM(reasoning) <> ''"
+            ).fetchall()
+    except Exception as e:
+        logging.warning("could not load decisions as a reasoning source: %s", e)
+        return mapping
+
+    for row in rows:
+        text = (row['reasoning'] or '').strip()
+        lowered = text.lower()
+        if 'decision:' in lowered or 'outcome:' in lowered or 'reward signal' in lowered:
+            continue
+        mapping.setdefault(_prompt_hash(row['prompt']), text)
+    return mapping
+
+
+def _reasoning_for_row(row: dict, ideal: str, decisions_reasoning: dict) -> str:
+    """Best available reasoning for a training row being rebuilt."""
+    original = decisions_reasoning.get(row.get('prompt_hash') or '')
+    if original:
+        return original
+    return _extract_reasoning_clean(ideal)
+
+
 def _extract_reasoning_clean(ideal_output: str) -> str:
     """Extract clean reasoning text from a contaminated ideal_output.
 
@@ -1270,6 +1307,16 @@ def regenerate_historical(db_path: 'Path | str', dry_run: bool = False) -> dict:
     all_rows = _db.get_training_examples(db_path=db_path)
     logging.info("regenerate_historical: %d total rows in %s", len(all_rows), db_path)
 
+    # Prefer the ORIGINAL reasoning over what can be salvaged from the
+    # contaminated string. _extract_reasoning_clean can only recover text that
+    # survived inside ideal_output; decisions.reasoning (once backfilled from
+    # raw_response by scripts/backfill_decision_reasoning.py) is the real thing,
+    # untruncated. Joined on prompt_hash because training_examples.prompt is a
+    # verbatim copy of decisions.prompt and _prompt_hash is md5(prompt) alone.
+    decisions_reasoning = _load_decision_reasoning_map(db_path)
+    logging.info("regenerate_historical: %d decisions available as a reasoning source",
+                 len(decisions_reasoning))
+
     updates: list[tuple[int, str, str]] = []   # (id, new_label, new_ideal_output)
     skipped_ids:  list[int] = []
     skip_reasons: Counter   = Counter()
@@ -1311,7 +1358,7 @@ def regenerate_historical(db_path: 'Path | str', dry_run: bool = False) -> dict:
 
         # ── Genuine HOLD ─────────────────────────────────────────────────────────
         if decision == 'hold':
-            reasoning = _extract_reasoning_clean(ideal)
+            reasoning = _reasoning_for_row(row, ideal, decisions_reasoning)
             new_ideal = _build_ideal_output(decision, confidence, reasoning, old_label)
             if not _is_clean_ideal_output(new_ideal):
                 skipped_ids.append(row_id)
@@ -1329,7 +1376,7 @@ def regenerate_historical(db_path: 'Path | str', dry_run: bool = False) -> dict:
             continue
 
         new_label, _ = _tiered_label_from_pnl(float(pnl_pct), decision)
-        reasoning     = _extract_reasoning_clean(ideal)
+        reasoning     = _reasoning_for_row(row, ideal, decisions_reasoning)
         new_ideal     = _build_ideal_output(decision, confidence, reasoning, new_label)
         if not _is_clean_ideal_output(new_ideal):
             skipped_ids.append(row_id)
