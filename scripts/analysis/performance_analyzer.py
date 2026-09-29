@@ -84,6 +84,13 @@ class PerformanceAnalyzer:
                 os.getenv('ALPACA_SECRET_KEY'),
                 paper=self._paper,
             )
+            # sprint03 E2.1: same read-only-lookup retry gap as outcome_tracker.py.
+            from utils.alpaca_retry import retry_on_rate_limit
+            for _m in ('submit_order', 'get_account', 'get_all_positions', 'get_orders', 'get_order_by_id'):
+                if hasattr(self._trading_client, _m):
+                    method = getattr(self._trading_client, _m)
+                    if not hasattr(method, '_mock_name'):
+                        setattr(self._trading_client, _m, retry_on_rate_limit(method))
         return self._trading_client
 
     def get_equity_curve(self, days_back=30):
@@ -397,13 +404,17 @@ class PerformanceAnalyzer:
             import sys as _sys
             _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
             import db as _db
+            # sprint02 D4.2: filter by this analyzer's own account (self._paper,
+            # already correctly tracked) so a live-account report doesn't count
+            # paper's unreconciled rows and vice versa.
+            _source = 'paper' if self._paper else 'live'
             with _db.get_conn() as conn:
                 unreconciled = conn.execute(
-                    "SELECT COUNT(*) FROM unreconciled_orders WHERE recorded_at > ?",
-                    [(datetime.now() - timedelta(days=30)).isoformat()]
+                    "SELECT COUNT(*) FROM unreconciled_orders WHERE recorded_at > ? AND source = ?",
+                    [(datetime.now() - timedelta(days=30)).isoformat(), _source]
                 ).fetchone()[0]
             if unreconciled:
-                print(f"\n⚠️  Unreconciled orders (last 30d): {unreconciled} "
+                print(f"\n⚠️  Unreconciled orders (last 30d, {_source}): {unreconciled} "
                       f"— review unreconciled_orders table for manual action")
         except Exception:
             pass

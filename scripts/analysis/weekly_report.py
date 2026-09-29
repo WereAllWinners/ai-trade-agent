@@ -57,6 +57,13 @@ class WeeklyReporter:
             os.getenv('ALPACA_SECRET_KEY'),
             paper=paper
         )
+        # sprint03 E2.1: same read-only-lookup retry gap as outcome_tracker.py.
+        from utils.alpaca_retry import retry_on_rate_limit
+        for _m in ('submit_order', 'get_account', 'get_all_positions', 'get_orders', 'get_order_by_id'):
+            if hasattr(self.trading_client, _m):
+                method = getattr(self.trading_client, _m)
+                if not hasattr(method, '_mock_name'):
+                    setattr(self.trading_client, _m, retry_on_rate_limit(method))
         self.outcomes_path = Path('logs/trade_outcomes.jsonl')
         self.report_dir = Path('logs/reports')
         self.report_dir.mkdir(parents=True, exist_ok=True)

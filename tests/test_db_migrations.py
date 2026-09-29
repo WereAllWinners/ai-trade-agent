@@ -47,6 +47,34 @@ class TestMigrations:
             cols = {row[1] for row in conn.execute("PRAGMA table_info(outcomes)")}
         assert 'excess_return_pct' in cols
 
+    def test_unreconciled_orders_has_source_column(self, db_path):
+        """sprint02 D4.2."""
+        import db as _db
+        with _db.get_conn(db_path) as conn:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(unreconciled_orders)")}
+        assert 'source' in cols
+
+    def test_unreconciled_orders_has_retry_count_column(self, db_path):
+        """sprint03 E2.2."""
+        import db as _db
+        with _db.get_conn(db_path) as conn:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(unreconciled_orders)")}
+        assert 'retry_count' in cols
+
+    def test_unreconciled_orders_has_last_attempt_at_column(self, db_path):
+        """sprint03 E2.2."""
+        import db as _db
+        with _db.get_conn(db_path) as conn:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(unreconciled_orders)")}
+        assert 'last_attempt_at' in cols
+
+    def test_training_examples_has_label_source_column(self, db_path):
+        """sprint03 E4."""
+        import db as _db
+        with _db.get_conn(db_path) as conn:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(training_examples)")}
+        assert 'label_source' in cols
+
     def test_outcomes_has_regime_column(self, db_path):
         import db as _db
         with _db.get_conn(db_path) as conn:
@@ -57,6 +85,114 @@ class TestMigrations:
         """Running init_db twice must not raise (idempotent ALTER TABLE guards)."""
         import db as _db
         _db.init_db(db_path)   # second call — must not error
+
+
+class TestInsertUnreconciledOrderSource:
+    """sprint02 D4.2."""
+
+    def test_source_defaults_to_paper(self, db_path):
+        import db as _db
+        _db.upsert_unreconciled_order({
+            'recorded_at': '2026-07-02T00:00:00',
+            'order_id':    'oid-1',
+            'symbol':      'AAPL',
+            'status':      'unknown',
+            'reason':      'missing_entry_fill',
+        }, bot='stock', db_path=db_path)
+        with _db.get_conn(db_path) as conn:
+            row = conn.execute(
+                "SELECT source FROM unreconciled_orders WHERE order_id='oid-1'"
+            ).fetchone()
+        assert row['source'] == 'paper'
+
+    def test_source_explicit_live(self, db_path):
+        import db as _db
+        _db.upsert_unreconciled_order({
+            'recorded_at': '2026-07-02T00:00:00',
+            'order_id':    'oid-2',
+            'symbol':      'MSFT',
+            'status':      'unknown',
+            'reason':      'missing_exit_fill',
+        }, bot='stock', source='live', db_path=db_path)
+        with _db.get_conn(db_path) as conn:
+            row = conn.execute(
+                "SELECT source FROM unreconciled_orders WHERE order_id='oid-2'"
+            ).fetchone()
+        assert row['source'] == 'live'
+
+    def test_paper_and_live_rows_are_distinguishable_for_same_symbol(self, db_path):
+        """The core D4.2 fix: two unreconciled rows for the same symbol but
+        different accounts must be independently countable by source."""
+        import db as _db
+        _db.upsert_unreconciled_order({
+            'recorded_at': '2026-07-02T00:00:00', 'order_id': 'oid-p',
+            'symbol': 'TSLA', 'status': 'unknown', 'reason': 'missing_entry_fill',
+        }, bot='stock', source='paper', db_path=db_path)
+        _db.upsert_unreconciled_order({
+            'recorded_at': '2026-07-02T00:00:00', 'order_id': 'oid-l',
+            'symbol': 'TSLA', 'status': 'unknown', 'reason': 'missing_entry_fill',
+        }, bot='stock', source='live', db_path=db_path)
+        with _db.get_conn(db_path) as conn:
+            paper_count = conn.execute(
+                "SELECT COUNT(*) FROM unreconciled_orders WHERE symbol='TSLA' AND source='paper'"
+            ).fetchone()[0]
+            live_count = conn.execute(
+                "SELECT COUNT(*) FROM unreconciled_orders WHERE symbol='TSLA' AND source='live'"
+            ).fetchone()[0]
+        assert paper_count == 1
+        assert live_count == 1
+
+
+class TestUpsertUnreconciledOrder:
+    """sprint03 E2.2 — retry tracking via upsert instead of INSERT OR IGNORE."""
+
+    def _row(self, order_id='oid-1', reason='missing_entry_fill', symbol='AAPL'):
+        return {
+            'recorded_at': '2026-07-02T00:00:00',
+            'order_id':    order_id,
+            'symbol':      symbol,
+            'status':      'unknown',
+            'reason':      reason,
+        }
+
+    def test_first_insert_has_retry_count_zero(self, db_path):
+        import db as _db
+        retry_count = _db.upsert_unreconciled_order(self._row(), bot='stock', db_path=db_path)
+        assert retry_count == 0
+
+    def test_second_upsert_same_order_id_reason_increments_retry_count(self, db_path):
+        import db as _db
+        first = _db.upsert_unreconciled_order(self._row(), bot='stock', db_path=db_path)
+        second = _db.upsert_unreconciled_order(self._row(), bot='stock', db_path=db_path)
+        assert first == 0
+        assert second == 1
+        with _db.get_conn(db_path) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM unreconciled_orders WHERE order_id='oid-1' AND reason='missing_entry_fill'"
+            ).fetchone()[0]
+        assert count == 1, "must not create a duplicate row on repeat upsert"
+
+    def test_different_reason_same_order_id_is_independent_row(self, db_path):
+        import db as _db
+        _db.upsert_unreconciled_order(self._row(reason='missing_entry_fill'), bot='stock', db_path=db_path)
+        retry_count = _db.upsert_unreconciled_order(self._row(reason='missing_exit_fill'), bot='stock', db_path=db_path)
+        assert retry_count == 0
+        with _db.get_conn(db_path) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM unreconciled_orders WHERE order_id='oid-1'"
+            ).fetchone()[0]
+        assert count == 2
+
+    def test_mark_unreconciled_order_abandoned_sets_status(self, db_path):
+        import db as _db
+        _db.upsert_unreconciled_order(self._row(), bot='stock', source='paper', db_path=db_path)
+        _db.mark_unreconciled_order_abandoned('oid-1', 'missing_entry_fill', bot='stock',
+                                               source='paper', db_path=db_path)
+        with _db.get_conn(db_path) as conn:
+            row = conn.execute(
+                "SELECT status FROM unreconciled_orders WHERE order_id='oid-1' AND reason='missing_entry_fill'"
+            ).fetchone()
+        assert row['status'] == 'abandoned'
 
 
 class TestGetOutcomeByOrderId:

@@ -46,11 +46,20 @@ class OptionsOutcomeTracker:
     def __init__(self, paper=None):
         if paper is None:
             paper = os.getenv('PAPER_TRADING', 'true').lower() != 'false'
+        self.paper = paper
         self.trading_client = TradingClient(
             os.getenv('ALPACA_API_KEY'),
             os.getenv('ALPACA_SECRET_KEY'),
             paper=paper
         )
+        # sprint03 E2.1: mirror outcome_tracker.py's retry wrapper — same
+        # unretried-lookup bug shape, same fix.
+        from utils.alpaca_retry import retry_on_rate_limit
+        for _m in ('submit_order', 'get_account', 'get_all_positions', 'get_orders', 'get_order_by_id'):
+            if hasattr(self.trading_client, _m):
+                method = getattr(self.trading_client, _m)
+                if not hasattr(method, '_mock_name'):
+                    setattr(self.trading_client, _m, retry_on_rate_limit(method))
         self.trade_log_path = Path('logs/options_trade_log.jsonl')
         self.outcomes_path = Path('logs/options_trade_outcomes.jsonl')
         Path('logs').mkdir(exist_ok=True)
@@ -136,16 +145,19 @@ class OptionsOutcomeTracker:
 
         Returns a list of closed-trade outcome dicts.
         """
-        # Group by contract symbol, sorted by time
+        # sprint02 D4.3: group by (contract, source), not contract alone — same
+        # paper/live commingling fix as outcome_tracker.py (see its comment
+        # for full rationale). Legacy rows without a source tag bucket under
+        # source=None, preserving FIFO matching among historical pairs.
         by_contract = defaultdict(list)
         for t in trades:
             contract = t.get('contract')
             if contract:
-                by_contract[contract].append(t)
+                by_contract[(contract, t.get('source'))].append(t)
 
         outcomes = []
 
-        for contract, contract_trades in by_contract.items():
+        for (contract, _bucket_source), contract_trades in by_contract.items():
             contract_trades.sort(key=lambda x: x['timestamp'])
             open_buys = []  # FIFO queue of enriched buy records
 
@@ -157,7 +169,9 @@ class OptionsOutcomeTracker:
                     open_buys.append({**trade, 'fill_price': fill_price})
 
                 elif action == 'sell' and open_buys:
-                    entry = open_buys.pop(0)
+                    # sprint03 E2.2: PEEK, don't pop yet — mirror
+                    # outcome_tracker.py's fix (see its comment for rationale).
+                    entry = open_buys[0]
                     exit_fill = self.get_fill_price(trade.get('order_id'))
 
                     entry_price = entry.get('fill_price')
@@ -167,22 +181,42 @@ class OptionsOutcomeTracker:
                         missing_side = 'missing_entry_fill' if not entry_price else 'missing_exit_fill'
                         missing_oid = entry.get('order_id') if not entry_price else trade.get('order_id')
                         oid_status = self.get_order_status(missing_oid)
-                        logging.warning(
-                            "⚠️  Unreconciled order %s for %s — status=%s reason=%s",
-                            missing_oid, contract, oid_status['status'], missing_side
-                        )
                         try:
-                            _db.insert_unreconciled_order({
+                            retry_count = _db.upsert_unreconciled_order({
                                 'recorded_at': datetime.now().isoformat(),
                                 'order_id':    missing_oid or '',
                                 'symbol':      contract,
                                 'status':      oid_status['status'],
                                 'reason':      missing_side,
-                            }, bot=self._bot_name)
+                            }, bot=self._bot_name, source='paper' if self.paper else 'live')
                         except Exception as db_err:
                             logging.debug("Could not write unreconciled order: %s", db_err)
+                            retry_count = 0
+
+                        _max_retries = int(os.getenv('UNRECONCILED_MAX_RETRIES', '10'))
+                        if retry_count >= _max_retries:
+                            logging.warning(
+                                "⚠️  Unreconciled order %s for %s exceeded %d retries — "
+                                "abandoning (status=%s reason=%s)",
+                                missing_oid, contract, _max_retries, oid_status['status'], missing_side,
+                            )
+                            try:
+                                _db.mark_unreconciled_order_abandoned(
+                                    missing_oid or '', missing_side, bot=self._bot_name,
+                                    source='paper' if self.paper else 'live')
+                            except Exception as db_err:
+                                logging.debug("Could not mark unreconciled order abandoned: %s", db_err)
+                            open_buys.pop(0)  # only NOW does the buy leave the FIFO queue
+                        else:
+                            logging.warning(
+                                "⚠️  Unreconciled order %s for %s — status=%s reason=%s "
+                                "(retry %d/%d, will retry next pass)",
+                                missing_oid, contract, oid_status['status'], missing_side,
+                                retry_count, _max_retries,
+                            )
                         continue
 
+                    open_buys.pop(0)  # normal successful match — pop now
                     contracts = min(
                         entry.get('quantity', 0),
                         trade.get('quantity', 0)

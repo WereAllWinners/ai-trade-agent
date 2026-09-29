@@ -121,6 +121,7 @@ def _make_stock_agent():
     agent.daily_start_equity = None
     agent.cooldowns          = {}
     agent.pdt_blocked        = False
+    agent._paper              = True  # sprint02 D4.3: execute_trade's trade_log now reads this
     agent.discovery          = MagicMock()
     agent.fee_simulator      = MagicMock()
     # Mock new round-2 components
