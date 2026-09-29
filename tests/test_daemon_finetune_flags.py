@@ -160,3 +160,50 @@ class TestStrategyEvolverEnabledFlag:
         with patch('trading_daemon.subprocess.run', return_value=mock_result) as mock_subprocess:
             d.run_weekend_strategist()
         mock_subprocess.assert_called_once()
+
+
+class TestOnlineTrainingEnabledFlag:
+    """ONLINE_TRAINING_ENABLED gates the threshold-triggered LoRA update.
+
+    Added after run_online_training fired unprompted: it had no switch at all,
+    so when the outcome-tracker fix landed a 3-month backlog of 337 outcomes at
+    once, the 15-outcome threshold tripped with no way to hold it short of
+    stopping the daemon.
+    """
+
+    def test_flag_false_skips_online_training(self, monkeypatch, caplog):
+        monkeypatch.setenv('ONLINE_TRAINING_ENABLED', 'false')
+        d = _make_trading_daemon()
+        with patch('trading_daemon.subprocess.run') as mock_subprocess, \
+             caplog.at_level(logging.INFO):
+            d.run_online_training()
+        mock_subprocess.assert_not_called()
+        assert any('ONLINE_TRAINING_ENABLED=false' in r.getMessage() for r in caplog.records)
+
+    def test_flag_true_runs_unchanged(self, monkeypatch):
+        monkeypatch.setenv('ONLINE_TRAINING_ENABLED', 'true')
+        d = _make_trading_daemon()
+        with patch('trading_daemon.subprocess.run') as mock_subprocess:
+            mock_subprocess.return_value = MagicMock(returncode=0)
+            d.run_online_training()
+        mock_subprocess.assert_called_once()
+
+    def test_flag_absent_defaults_to_enabled(self, monkeypatch):
+        monkeypatch.delenv('ONLINE_TRAINING_ENABLED', raising=False)
+        d = _make_trading_daemon()
+        with patch('trading_daemon.subprocess.run') as mock_subprocess:
+            mock_subprocess.return_value = MagicMock(returncode=0)
+            d.run_online_training()
+        mock_subprocess.assert_called_once()
+
+    def test_is_independent_of_finetune_enabled(self, monkeypatch):
+        """The two switches must not be coupled: online training is the
+        mechanism that replaces the nightly fine-tune when that is off."""
+        monkeypatch.setenv('FINETUNE_ENABLED', 'false')
+        monkeypatch.delenv('ONLINE_TRAINING_ENABLED', raising=False)
+        d = _make_trading_daemon()
+        with patch('trading_daemon.subprocess.run') as mock_subprocess:
+            mock_subprocess.return_value = MagicMock(returncode=0)
+            d.run_online_training()
+        mock_subprocess.assert_called_once(), \
+            'FINETUNE_ENABLED=false must not silently gate online training'

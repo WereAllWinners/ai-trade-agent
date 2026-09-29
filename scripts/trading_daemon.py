@@ -376,6 +376,17 @@ class TradingDaemon:
 
     def run_online_training(self) -> None:
         """Trigger lightweight LoRA update if enough new outcomes have closed."""
+        # Deliberately its OWN switch rather than reusing FINETUNE_ENABLED.
+        # Threshold-triggered online training is the mechanism that *replaced*
+        # the nightly fine-tune when FINETUNE_ENABLED was set false, so folding
+        # it under that flag would conflate "nightly off" with "all training
+        # off". It previously had no switch at all, which meant a GPU-heavy job
+        # could fire on its own with no way to hold it short of stopping the
+        # daemon — and it did exactly that the moment a 3-month outcome backlog
+        # landed at once.
+        if os.getenv('ONLINE_TRAINING_ENABLED', 'true').lower() == 'false':
+            logging.info("⏭️  ONLINE_TRAINING_ENABLED=false — skipping online training check")
+            return
         try:
             logging.info("🔬 Checking online training threshold...")
             result = subprocess.run(
