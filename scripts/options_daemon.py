@@ -9,12 +9,20 @@ import sys
 import time
 import logging
 import subprocess
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import pytz
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
-_HEARTBEAT_FILE = _SCRIPTS_DIR.parent / 'logs' / 'heartbeat_options.json'
+sys.path.append(str(_SCRIPTS_DIR))
+from service_suffix import suffixed_path  # noqa: E402
+
+# Service-suffixed (sprint02 D4.1): the paper and live stock daemons share a
+# WorkingDirectory, so an unsuffixed path meant both wrote logs/heartbeat_options.json
+# last-writer-wins — a healthy paper bot would mask a dead live one, and
+# health_server had no way to tell them apart.
+_HEARTBEAT_FILE = suffixed_path(_SCRIPTS_DIR.parent / 'logs' / 'heartbeat_options.json')
 
 # See trading_daemon.py — same uncached-lookup stall, same budget.
 _OUTCOME_TRACKER_TIMEOUT = int(os.getenv('OUTCOME_TRACKER_TIMEOUT', '900'))
@@ -33,7 +41,12 @@ def _write_heartbeat(status: str, market_open: bool) -> None:
     """Update heartbeat file so health_server.py can report daemon liveness."""
     try:
         _HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _HEARTBEAT_FILE.write_text(json.dumps({
+        # Written atomically: the background heartbeat thread and the main loop
+        # can both write this file, and health_server reads it concurrently — a
+        # plain write_text truncates first, so a reader can catch an empty or
+        # half-written file and report a spurious parse error.
+        _tmp = _HEARTBEAT_FILE.with_suffix(_HEARTBEAT_FILE.suffix + '.tmp')
+        _tmp.write_text(json.dumps({
             'daemon': 'options',
             'status': status,
             'market_open': market_open,
@@ -44,6 +57,7 @@ def _write_heartbeat(status: str, market_open: bool) -> None:
             # traded normally and /health reported "down".
             'ts': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
         }))
+        os.replace(_tmp, _HEARTBEAT_FILE)   # atomic on POSIX
     except Exception as e:
         # Never fatal — a heartbeat write must not take the daemon down — but do
         # not swallow it silently either: that is exactly how the six-month
@@ -51,31 +65,45 @@ def _write_heartbeat(status: str, market_open: bool) -> None:
         logging.warning(f"⚠️  heartbeat write failed: {type(e).__name__}: {e}")
 
 
-# Heartbeat cadence. The daemon's idle sleeps run to 30 minutes (between trading
-# sessions) or many hours (overnight), but health_server treats a heartbeat older
-# than HEALTH_MAX_AGE_SECONDS (default 300s) as unhealthy. Sleeping straight
-# through therefore reported the daemon "down" for ~25 of every 30 minutes even
-# while it was perfectly healthy. Sleep in short chunks and re-stamp the
-# heartbeat on each one instead, so the staleness threshold stays a real
-# liveness signal rather than a guaranteed false alarm.
+# Heartbeat cadence. health_server treats a heartbeat older than
+# HEALTH_MAX_AGE_SECONDS (default 300s) as unhealthy, but the main loop goes
+# quiet for far longer than that in two different ways: it sleeps 30 minutes
+# between sessions, and — the case that actually bit us — it spends many minutes
+# *working* inside run_trading_session(), where a single symbol's LLM inference
+# takes ~2 minutes and a session walks dozens of symbols.
+#
+# Chunking the sleeps was tried first and was not enough: the daemon reported
+# down at 443s while healthily analysing CCL. Liveness therefore cannot be tied
+# to what the main loop happens to be doing. A daemon thread stamps the
+# heartbeat on a fixed interval regardless, which covers sleeping, working, and
+# blocking on a subprocess alike.
 _HEARTBEAT_INTERVAL_SECONDS = int(os.getenv('HEARTBEAT_INTERVAL_SECONDS', '60'))
 
+_heartbeat_stop = threading.Event()
+# Last known market state, refreshed by the main loop. The thread reuses it
+# rather than calling is_market_open() itself: that is an Alpaca clock API call,
+# and polling it every 60s overnight would add hundreds of needless requests
+# against the same rate limit that already starved the outcome tracker.
+_heartbeat_market_open = False
 
-def _sleep_with_heartbeat(total_seconds: float, market_open: bool) -> None:
-    """Sleep for *total_seconds*, re-stamping the heartbeat every chunk.
 
-    `market_open` is captured once by the caller rather than re-checked per
-    chunk: is_market_open() calls the Alpaca clock API, and polling it every
-    60 s through an overnight sleep would add hundreds of needless calls
-    against the same rate limit the outcome tracker already contends with.
-    The field is informational, and the daemon is not trading while it sleeps.
-    """
-    remaining = max(0.0, float(total_seconds))
-    while remaining > 0:
-        chunk = min(_HEARTBEAT_INTERVAL_SECONDS, remaining)
-        time.sleep(chunk)
-        remaining -= chunk
-        _write_heartbeat('running', market_open)
+def _set_heartbeat_market_open(is_open: bool) -> None:
+    """Record the market state for the heartbeat thread to report."""
+    global _heartbeat_market_open
+    _heartbeat_market_open = bool(is_open)
+
+
+def _heartbeat_loop() -> None:
+    while not _heartbeat_stop.wait(_HEARTBEAT_INTERVAL_SECONDS):
+        _write_heartbeat('running', _heartbeat_market_open)
+
+
+def start_heartbeat_thread() -> threading.Thread:
+    """Start the background heartbeat. Daemon thread so it never blocks exit."""
+    thread = threading.Thread(target=_heartbeat_loop, name='heartbeat', daemon=True)
+    thread.start()
+    return thread
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -392,10 +420,6 @@ class OptionsDaemon:
     def sleep_until_next_event(self):
         """Sleep until next scheduled event."""
         now = datetime.now(self.est)
-        # Resolved once and reused for every heartbeat chunk below — see
-        # _sleep_with_heartbeat: is_market_open() is an Alpaca clock API call,
-        # and this wait can run for hours.
-        _market_open = self.is_market_open()
         
         # Check for scheduled events today
         events = []
@@ -432,19 +456,20 @@ class OptionsDaemon:
                 hours = sleep_seconds / 3600
                 minutes = (sleep_seconds % 3600) / 60
                 logging.info(f"💤 Next event: {event_name} in {hours:.1f} hours" if hours >= 1 else f"💤 Next event: {event_name} in {minutes:.1f} minutes")
-                # Always at least 60s to avoid a tight spin; chunked so the
-                # heartbeat stays fresh through a multi-hour wait.
-                _sleep_with_heartbeat(max(sleep_seconds, 60), market_open=_market_open)
+                time.sleep(max(sleep_seconds, 60))  # Always sleep at least 60s to avoid a tight spin
         else:
             # Sleep until tomorrow
             tomorrow = now + timedelta(days=1)
             tomorrow = tomorrow.replace(hour=0, minute=0, second=0, microsecond=0)
             sleep_seconds = (tomorrow - now).total_seconds()
             logging.info(f"💤 Sleeping until tomorrow ({sleep_seconds/3600:.1f} hours)")
-            _sleep_with_heartbeat(sleep_seconds, market_open=_market_open)
+            time.sleep(sleep_seconds)
     
     def run(self):
         """Main daemon loop."""
+        # Liveness is reported by a background thread, not by this loop:
+        # a trading session can occupy the loop for many minutes at a time.
+        start_heartbeat_thread()
         logging.info("🚀 Starting Options Daemon - Running 24/7")
         logging.info("💰 Options Trading: 9:30 AM - 4:00 PM EST")
         logging.info("📊 Analysis: 5:30 PM EST (daily)")
@@ -505,7 +530,9 @@ class OptionsDaemon:
                     weekend_strategist_done_this_week = False
 
                 logging.info(f"📅 Current time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-                _write_heartbeat('running', self.is_market_open())
+                _market_open = self.is_market_open()
+                _set_heartbeat_market_open(_market_open)
+                _write_heartbeat('running', _market_open)
                 
                 # Weekend deep analysis on Saturday at 10:00 AM (paper bot only)
                 if (not _LIVE_ONLY
@@ -549,7 +576,7 @@ class OptionsDaemon:
                         self.run_options_trading()
                         last_trade_time = now
                         logging.info(f"⏰ Next session in {self.trading_interval} minutes")
-                        _sleep_with_heartbeat(self.trading_interval * 60, market_open=True)
+                        time.sleep(self.trading_interval * 60)
                     else:
                         time.sleep(60)
                 else:

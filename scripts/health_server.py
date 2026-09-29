@@ -46,9 +46,29 @@ _LOGS_DIR    = _SCRIPTS_DIR.parent / 'logs'
 
 sys.path.insert(0, str(_SCRIPTS_DIR))
 
+# Paths are spelled out per account rather than derived from service_suffix():
+# that helper reads PAPER_TRADING from the CALLING process's environment, which
+# is right for a single-account daemon but wrong here — health_server is one
+# process reporting on both accounts at once. Same reasoning as
+# halt_buys.flag_path taking an explicit bool (sprint02 D4.1).
 HEARTBEAT_FILES = {
-    'stock':   _LOGS_DIR / 'heartbeat_stock.json',
-    'options': _LOGS_DIR / 'heartbeat_options.json',
+    'stock':        _LOGS_DIR / 'heartbeat_stock.json',
+    'options':      _LOGS_DIR / 'heartbeat_options.json',
+    'stock_live':   _LOGS_DIR / 'heartbeat_stock_live.json',
+    'options_live': _LOGS_DIR / 'heartbeat_options_live.json',
+}
+
+# Daemons that must be healthy for the overall verdict. The live daemons are
+# deliberately absent by default: live is held off, its heartbeat file does not
+# exist, and counting a service that was never started as a failure would make
+# /health permanently degraded — the same false-alarm noise that made the
+# endpoint unusable before. A daemon outside this set is still reported in full;
+# it only joins the verdict once it has actually written a heartbeat, so a live
+# bot that IS running and then dies is caught, while one that is switched off
+# stays quiet. Add names here (comma-separated) to require them unconditionally.
+REQUIRED_DAEMONS = {
+    d.strip() for d in os.getenv('HEALTH_REQUIRED_DAEMONS', 'stock,options').split(',')
+    if d.strip()
 }
 
 MAX_AGE_SECONDS = int(os.getenv('HEALTH_MAX_AGE_SECONDS', '300'))
@@ -100,8 +120,16 @@ def build_health_payload() -> tuple[dict, int]:
         except Exception:
             pass
 
-    all_healthy = all(d['healthy'] for d in daemons.values())
-    any_healthy = any(d['healthy'] for d in daemons.values())
+    # Judge only the daemons we actually expect to be running: those explicitly
+    # required, plus any that have written a heartbeat at some point (status
+    # 'missing' means the file has never appeared, i.e. the service is not in
+    # service on this host).
+    judged = {
+        name: d for name, d in daemons.items()
+        if name in REQUIRED_DAEMONS or d.get('status') != 'missing'
+    }
+    all_healthy = all(d['healthy'] for d in judged.values()) if judged else False
+    any_healthy = any(d['healthy'] for d in judged.values())
 
     if all_healthy:
         overall, http_code = 'ok', 200
