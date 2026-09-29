@@ -10,7 +10,7 @@ import time
 import logging
 import subprocess
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import pytz
 
@@ -35,10 +35,18 @@ def _write_heartbeat(status: str, market_open: bool) -> None:
             'daemon': 'stock',
             'status': status,
             'market_open': market_open,
-            'ts': datetime.now(datetime.UTC).isoformat(),
+            # `datetime.UTC` is an attribute of the datetime *module*, not the
+            # datetime *class* imported here — `datetime.now(datetime.UTC)` raises
+            # AttributeError. Combined with the except below, that silently froze
+            # every heartbeat from 2026-03-22 until 2026-09-28 while the daemon
+            # traded normally and /health reported "down".
+            'ts': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
         }))
-    except Exception:
-        pass
+    except Exception as e:
+        # Never fatal — a heartbeat write must not take the daemon down — but do
+        # not swallow it silently either: that is exactly how the six-month
+        # outage above went unnoticed.
+        logging.warning(f"⚠️  heartbeat write failed: {type(e).__name__}: {e}")
 
 logging.basicConfig(
     level=logging.INFO,
