@@ -89,7 +89,12 @@ def _resolve_filled(row: dict, bot: str, source: str, filled_qty: float,
         'timestamp': datetime.now().isoformat(),
         ('contract' if bot == 'options' else 'symbol'): row['symbol'],
         'action': 'sell',
-        'quantity': filled_qty,
+        # Size key differs per log, exactly like the symbol/contract key above:
+        # the options log uses 'quantity', the stock log uses 'shares'. Writing
+        # 'quantity' into the stock log made outcome_tracker read 0 for the size
+        # on every broker-side exit — 342 of 534 sell rows — which zeroed
+        # realized_pnl and so recorded 181 profitable trades as losses.
+        ('quantity' if bot == 'options' else 'shares'): filled_qty,
         'reason': row['intended_reason'],
         'exit_pl_pct': pnl_pct,
         'order_id': row['order_id'],
