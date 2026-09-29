@@ -55,6 +55,33 @@ def _write_heartbeat(status: str, market_open: bool) -> None:
         # outage above went unnoticed.
         logging.warning(f"⚠️  heartbeat write failed: {type(e).__name__}: {e}")
 
+
+# Heartbeat cadence. The daemon's idle sleeps run to 30 minutes (between trading
+# sessions) or many hours (overnight), but health_server treats a heartbeat older
+# than HEALTH_MAX_AGE_SECONDS (default 300s) as unhealthy. Sleeping straight
+# through therefore reported the daemon "down" for ~25 of every 30 minutes even
+# while it was perfectly healthy. Sleep in short chunks and re-stamp the
+# heartbeat on each one instead, so the staleness threshold stays a real
+# liveness signal rather than a guaranteed false alarm.
+_HEARTBEAT_INTERVAL_SECONDS = int(os.getenv('HEARTBEAT_INTERVAL_SECONDS', '60'))
+
+
+def _sleep_with_heartbeat(total_seconds: float, market_open: bool) -> None:
+    """Sleep for *total_seconds*, re-stamping the heartbeat every chunk.
+
+    `market_open` is captured once by the caller rather than re-checked per
+    chunk: is_market_open() calls the Alpaca clock API, and polling it every
+    60 s through an overnight sleep would add hundreds of needless calls
+    against the same rate limit the outcome tracker already contends with.
+    The field is informational, and the daemon is not trading while it sleeps.
+    """
+    remaining = max(0.0, float(total_seconds))
+    while remaining > 0:
+        chunk = min(_HEARTBEAT_INTERVAL_SECONDS, remaining)
+        time.sleep(chunk)
+        remaining -= chunk
+        _write_heartbeat('running', market_open)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -463,6 +490,10 @@ class TradingDaemon:
     def sleep_until_next_event(self):
         """Sleep until next scheduled event."""
         now = datetime.now(self.est)
+        # Resolved once and reused for every heartbeat chunk below — see
+        # _sleep_with_heartbeat: is_market_open() is an Alpaca clock API call,
+        # and this wait can run for hours.
+        _market_open = self.is_market_open()
         
         # Check for scheduled events today
         events = []
@@ -492,14 +523,16 @@ class TradingDaemon:
                 hours = sleep_seconds / 3600
                 minutes = (sleep_seconds % 3600) / 60
                 logging.info(f"💤 Next event: {event_name} in {hours:.1f} hours" if hours >= 1 else f"💤 Next event: {event_name} in {minutes:.1f} minutes")
-                time.sleep(max(sleep_seconds, 60))  # Always sleep at least 60s to avoid tight spin
+                # Always at least 60s to avoid a tight spin; chunked so the
+                # heartbeat stays fresh through a multi-hour wait.
+                _sleep_with_heartbeat(max(sleep_seconds, 60), market_open=_market_open)
         else:
             # Sleep until tomorrow
             tomorrow = now + timedelta(days=1)
             tomorrow = tomorrow.replace(hour=0, minute=0, second=0, microsecond=0)
             sleep_seconds = (tomorrow - now).total_seconds()
             logging.info(f"💤 Sleeping until tomorrow ({sleep_seconds/3600:.1f} hours)")
-            time.sleep(sleep_seconds)
+            _sleep_with_heartbeat(sleep_seconds, market_open=_market_open)
     
     def run(self):
         """Main daemon loop."""
@@ -627,7 +660,7 @@ class TradingDaemon:
                         self.run_trading_session()
                         last_trade_time = now
                         logging.info(f"⏰ Next session in {self.trading_interval} minutes")
-                        time.sleep(self.trading_interval * 60)
+                        _sleep_with_heartbeat(self.trading_interval * 60, market_open=True)
                     else:
                         time.sleep(60)
                 else:
