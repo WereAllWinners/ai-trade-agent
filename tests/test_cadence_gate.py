@@ -266,3 +266,44 @@ class TestCadenceGateReadsCorrectFile:
         result = _cadence_gate(sft_path, 'stock')
         assert result is False, \
             "Gate must read the SFT file (10 take-trade → FIRE), not the archive (250 winners)"
+
+
+# ---------------------------------------------------------------------------
+# sprint03 E4 — data-quality gate wiring inside finetune_model()
+# ---------------------------------------------------------------------------
+
+class TestFinetuneModelDataQualityGating:
+    """finetune_model() calls _cadence_gate() then, if it passes, calls
+    analysis.data_quality_check.run_data_quality_checks() — a fail result
+    must block the fine_tune_llm.py subprocess launch just like a cadence
+    gate fire does."""
+
+    def _passing_sft_rows(self):
+        # take_trade=150 (>=40), hold=50, total=200 (>=200), hold_share=0.25 (<=0.65)
+        # — satisfies all three _cadence_gate conditions.
+        return (
+            [_sft_row('winner', i) for i in range(150)]
+            + [_sft_row('correct_hold', i + 1000) for i in range(50)]
+        )
+
+    def test_dq_gate_fail_blocks_subprocess_and_alerts(self, tmp_path):
+        import analysis.data_quality_check as adq
+
+        sft_path = tmp_path / 'training_data_sft.json'
+        _write_sft_file(sft_path, self._passing_sft_rows())
+
+        fail_result = {
+            'passed': False,
+            'checks': [{'name': 'hold_share', 'status': 'fail', 'detail': 'too much hold', 'metric': 0.9}],
+            'summary': 'FAILED: hold_share',
+        }
+        with patch('finetune_model._gpu_temp', return_value=None), \
+             patch('finetune_model.subprocess') as mock_sub, \
+             patch.object(adq, 'run_data_quality_checks', return_value=fail_result), \
+             patch('alerts.alert_once_per_day') as mock_alert:
+            from finetune_model import finetune_model as fm
+            fm(sft_path)
+
+        mock_sub.run.assert_not_called()
+        called_keys = [c.args[0] for c in mock_alert.call_args_list]
+        assert 'data_quality_fail_stock_hold_share' in called_keys

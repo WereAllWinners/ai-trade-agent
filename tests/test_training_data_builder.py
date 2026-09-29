@@ -696,6 +696,7 @@ class TestConstraintBlockCap:
              patch.object(_db, 'get_existing_prompt_hashes', return_value=set()), \
              patch.object(_db, 'get_calibration_map', return_value={}), \
              patch.object(_db, 'get_executed_decisions', return_value=[]), \
+             patch.object(tdb, '_example_weight', return_value=1.0), \
              patch.object(_db, 'init_db'):
             tdb.build_and_store('stock')
 
@@ -1091,9 +1092,10 @@ class TestHoldShareTripwire:
             i=i,
         )
 
-    def _run_and_capture(self, tmp_path, name, examples, caplog):
+    def _run_and_capture(self, tmp_path, name, examples, caplog, force_full_weight=False):
         import logging
         from unittest.mock import patch
+        from contextlib import ExitStack
         import db as _db
         import training_data_builder as tdb
         import importlib; importlib.reload(tdb)
@@ -1104,14 +1106,22 @@ class TestHoldShareTripwire:
         data_dir.mkdir()
 
         with caplog.at_level(logging.WARNING):
-            with patch.object(tdb, '_db', _db), \
-                 patch.object(tdb, '_DATA_DIR', data_dir), \
-                 patch.object(_db, 'DB_PATH', db_path), \
-                 patch.object(_db, 'get_training_examples', return_value=examples), \
-                 patch.object(_db, 'get_existing_prompt_hashes', return_value=set()), \
-                 patch.object(_db, 'get_calibration_map', return_value={}), \
-                 patch.object(_db, 'get_executed_decisions', return_value=[]), \
-                 patch.object(_db, 'init_db'):
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(tdb, '_db', _db))
+                stack.enter_context(patch.object(tdb, '_DATA_DIR', data_dir))
+                stack.enter_context(patch.object(_db, 'DB_PATH', db_path))
+                stack.enter_context(patch.object(_db, 'get_training_examples', return_value=examples))
+                stack.enter_context(patch.object(_db, 'get_existing_prompt_hashes', return_value=set()))
+                stack.enter_context(patch.object(_db, 'get_calibration_map', return_value={}))
+                stack.enter_context(patch.object(_db, 'get_executed_decisions', return_value=[]))
+                stack.enter_context(patch.object(_db, 'init_db'))
+                if force_full_weight:
+                    # sprint03 E5: this fixture set is sensitive to the exact
+                    # calendar-day recency weight (boundary-condition test) —
+                    # force deterministic full inclusion rather than let a
+                    # 1-2 row random exclusion flip the outcome as wall-clock
+                    # time passes since the fixture's hardcoded entry_date.
+                    stack.enter_context(patch.object(tdb, '_example_weight', return_value=1.0))
                 tdb.build_and_store('stock')
 
     def test_warning_logged_when_hold_share_above_threshold(self, tmp_path, caplog):
@@ -1140,7 +1150,12 @@ class TestHoldShareTripwire:
             [self._make_correct_hold(i) for i in range(13)]
             + [self._make_winner(i) for i in range(7)]
         )
-        self._run_and_capture(tmp_path, 'boundary', examples, caplog)
+        # sprint03 E5: force_full_weight=True — this is an exact-boundary
+        # test (13/20 = 0.65000...), so even one row randomly excluded by the
+        # recency-weighted export filter flips the ratio across the
+        # threshold. Force deterministic full inclusion so the test verifies
+        # the `>` vs `>=` boundary semantics, not today's calendar date.
+        self._run_and_capture(tmp_path, 'boundary', examples, caplog, force_full_weight=True)
         # 13/20 = 0.65 exactly; `> _SFT_MAX_HOLD_SHARE` is False at equality
         assert not any('TRIPWIRE' in r.getMessage() for r in caplog.records), \
             "TRIPWIRE must NOT fire at exact threshold (check is > not >=)"
@@ -1378,3 +1393,162 @@ class TestSFTFileSplit:
         imported_names = {alias.name for imp in imports for alias in imp.names}
         assert '_SFT_TRAIN_LABELS' in imported_names, \
             "fine_tune_llm.py must import _SFT_TRAIN_LABELS from training_data_builder"
+
+
+# ---------------------------------------------------------------------------
+# Sprint01 C2.4 — regenerate_synced_outcomes (relabel after broker-fill sync)
+# ---------------------------------------------------------------------------
+
+class TestRegenerateSyncedOutcomes:
+    """Join path is explicit (sprint01 A4): trade_log synthesized sell ->
+    outcomes.sell_order_id -> outcomes.buy_order_id -> decisions.order_id ->
+    decisions.prompt -> _prompt_hash(prompt) -> training_examples.prompt_hash.
+    No fuzzy symbol/date fallback — unmatched rows are counted, not guessed.
+    """
+
+    def _write_trade_log(self, tmp_path, rows):
+        import json
+        path = tmp_path / 'trade_log.jsonl'
+        with open(path, 'w') as f:
+            for row in rows:
+                f.write(json.dumps(row) + '\n')
+        return path
+
+    def _insert_decision(self, db_path, order_id, prompt, decision='buy', symbol='PFE'):
+        import db as _db
+        _db.insert_decision({
+            'timestamp': '2026-06-01T09:30:00', 'session_id': 's1', 'bot': 'stock',
+            'source': 'paper', 'model': 'test', 'symbol': symbol, 'prompt': prompt,
+            'raw_response': f'Decision: {decision.upper()}', 'decision': decision,
+            'confidence': 0.8, 'reasoning': 'bullish', 'executed': 1, 'order_id': order_id,
+        }, db_path=db_path)
+
+    def _insert_outcome(self, db_path, buy_order_id, sell_order_id, pnl_pct, symbol='PFE'):
+        import db as _db
+        _db.insert_outcome({
+            'symbol': symbol, 'buy_order_id': buy_order_id, 'sell_order_id': sell_order_id,
+            'entry_timestamp': '2026-06-01T09:30:00', 'exit_timestamp': '2026-06-02T10:00:00',
+            'entry_price': 20.0, 'exit_price': 20.0 * (1 + pnl_pct), 'shares': 35.0,
+            'realized_pnl': 20.0 * pnl_pct * 35.0, 'pnl_pct': pnl_pct, 'hold_hours': 24.0,
+            'entry_confidence': 0.8, 'entry_reasoning': 'bullish', 'won': pnl_pct > 0,
+        }, bot='stock', source='paper', db_path=db_path)
+
+    def _insert_training_example(self, db_path, prompt, label, ideal_output):
+        import db as _db
+        import training_data_builder as tdb
+        ph = tdb._prompt_hash(prompt)
+        _db.insert_training_example({
+            'input': prompt, 'output': ideal_output, 'label': label,
+            'metadata': {
+                'bot': 'stock', 'source': 'paper', 'symbol': 'PFE', 'confidence': 0.8,
+                'pnl_pct': None, 'entry_date': '2026-06-01', 'session_id': 's1',
+                'prompt_hash': ph, 'generated_at': '2026-06-05T00:00:00',
+            },
+        }, db_path=db_path)
+        return ph
+
+    def test_stale_forward_price_label_relabeled_with_realized_pnl(self, db_path, tmp_path):
+        """A row previously fallback-labeled must be deleted and reinserted with
+        the realized-P&L label once its broker exit is synced."""
+        import training_data_builder as tdb
+
+        prompt = 'Analyze PFE for a stock trade.'
+        # Stale row: originally built via N-day forward-price fallback as a weak win.
+        old_ph = self._insert_training_example(
+            db_path, prompt, 'weak_winner',
+            'Decision: BUY\nConfidence: 0.80\nReasoning: bullish'
+        )
+        self._insert_decision(db_path, 'buy-order-1', prompt, decision='buy')
+        # Realized outcome is actually a strong loser (stop-loss hit).
+        self._insert_outcome(db_path, 'buy-order-1', 'sell-order-1', pnl_pct=-0.32)
+
+        trade_log_path = self._write_trade_log(tmp_path, [
+            {'timestamp': '2026-06-02T10:00:00', 'symbol': 'PFE', 'action': 'sell',
+             'shares': 35.0, 'order_id': 'sell-order-1', 'synthesized_by': 'broker_fill_sync'},
+        ])
+
+        stats = tdb.regenerate_synced_outcomes(
+            'both', db_path=db_path, trade_log_path=trade_log_path, dry_run=False
+        )
+
+        assert stats['matched'] == 1
+        assert stats['unmatched'] == 0
+        assert stats['deleted'] == 1
+        assert stats['inserted'] == 1
+        assert stats['coverage_pct'] == 100.0
+
+        import db as _db
+        with _db.get_conn(db_path) as conn:
+            row = conn.execute(
+                "SELECT label FROM training_examples WHERE prompt_hash = ?", [old_ph]
+            ).fetchone()
+        assert row['label'] == 'strong_loser'
+
+    def test_dry_run_reports_without_writing(self, db_path, tmp_path):
+        import training_data_builder as tdb
+
+        prompt = 'Analyze AVGO for a stock trade.'
+        old_ph = self._insert_training_example(
+            db_path, prompt, 'weak_winner',
+            'Decision: BUY\nConfidence: 0.80\nReasoning: bullish'
+        )
+        self._insert_decision(db_path, 'buy-order-2', prompt, decision='buy', symbol='AVGO')
+        self._insert_outcome(db_path, 'buy-order-2', 'sell-order-2', pnl_pct=-0.32, symbol='AVGO')
+
+        trade_log_path = self._write_trade_log(tmp_path, [
+            {'timestamp': '2026-06-02T10:00:00', 'symbol': 'AVGO', 'action': 'sell',
+             'shares': 2.0, 'order_id': 'sell-order-2', 'synthesized_by': 'broker_fill_sync'},
+        ])
+
+        stats = tdb.regenerate_synced_outcomes(
+            'both', db_path=db_path, trade_log_path=trade_log_path, dry_run=True
+        )
+
+        assert stats['matched'] == 1
+        assert stats['deleted'] == 0
+        assert stats['inserted'] == 0
+        assert stats['details'][0]['new_label'] == 'strong_loser'
+
+        import db as _db
+        with _db.get_conn(db_path) as conn:
+            row = conn.execute(
+                "SELECT label FROM training_examples WHERE prompt_hash = ?", [old_ph]
+            ).fetchone()
+        assert row['label'] == 'weak_winner'  # unchanged — dry run
+
+    def test_outcome_with_no_matching_decision_row_is_unmatched_not_mislinked(self, db_path, tmp_path):
+        """An older decision row without order_id (or missing entirely) must be
+        counted as unmatched — never guessed via a fuzzy symbol/date fallback."""
+        import training_data_builder as tdb
+
+        # Outcome exists, but no decisions row carries this buy_order_id.
+        self._insert_outcome(db_path, 'orphan-buy-order', 'orphan-sell-order', pnl_pct=0.25)
+
+        trade_log_path = self._write_trade_log(tmp_path, [
+            {'timestamp': '2026-06-02T10:00:00', 'symbol': 'PFE', 'action': 'sell',
+             'shares': 35.0, 'order_id': 'orphan-sell-order', 'synthesized_by': 'broker_fill_sync'},
+        ])
+
+        stats = tdb.regenerate_synced_outcomes(
+            'both', db_path=db_path, trade_log_path=trade_log_path, dry_run=False
+        )
+
+        assert stats['matched'] == 0
+        assert stats['unmatched'] == 1
+        assert stats['coverage_pct'] == 0.0
+        assert 'no matching decisions row' in stats['details'][0]['reason']
+
+    def test_no_synced_rows_in_trade_log_is_a_no_op(self, db_path, tmp_path):
+        import training_data_builder as tdb
+
+        trade_log_path = self._write_trade_log(tmp_path, [
+            {'timestamp': '2026-06-02T10:00:00', 'symbol': 'PFE', 'action': 'sell',
+             'shares': 35.0, 'order_id': 'agent-sell-1'},  # no synthesized_by marker
+        ])
+
+        stats = tdb.regenerate_synced_outcomes(
+            'both', db_path=db_path, trade_log_path=trade_log_path, dry_run=False
+        )
+
+        assert stats == {'matched': 0, 'unmatched': 0, 'deleted': 0, 'inserted': 0,
+                          'coverage_pct': 100.0, 'details': []}

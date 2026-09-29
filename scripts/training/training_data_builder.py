@@ -24,6 +24,7 @@ import _pathfix  # noqa: F401
 
 import yfinance as yf
 import db as _db
+from training_constants import _SFT_MAX_HOLD_SHARE, _HOLD_TEACHING_LABELS
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -80,17 +81,9 @@ _CONSTRAINT_BLOCK_SFT_CAP:      int = int(os.getenv('TDB_CONSTRAINT_BLOCK_SFT_CA
 # Without this cap the Session-4 SFT set was 86% HOLD-teaching (599/695).
 _COUNTERFACTUAL_SFT_CAP: int = int(os.getenv('TDB_COUNTERFACTUAL_SFT_CAP', '30'))
 
-# SFT HOLD-teaching share tripwire.
-# (counterfactual + correct_hold + constraint_block) / total_sft > threshold → WARNING.
-# The threshold is intentionally below 70% so the Session-4 state (94%) would have
-# failed immediately and Session 3 would have run before any fine-tune.
-_SFT_MAX_HOLD_SHARE: float = float(os.getenv('TDB_SFT_MAX_HOLD_SHARE', '0.65'))
-
-# All labels that teach "decline / hold" rather than "take the trade".
-# Used by the tripwire and by Session 5's cadence gate.
-_HOLD_TEACHING_LABELS: frozenset[str] = frozenset({
-    'counterfactual', 'correct_hold', 'constraint_block',
-})
+# sprint03 E4: _SFT_MAX_HOLD_SHARE and _HOLD_TEACHING_LABELS moved to
+# training_constants.py (imported above) — single source of truth shared with
+# finetune_model.py's cadence gate and data_quality_check.py's gate.
 
 # Single source of truth for the SFT training label set.
 # Imported by fine_tune_llm.py (filter at load time) and used by the tripwire
@@ -545,6 +538,10 @@ def build_and_store(bot: str) -> tuple[int, int]:
         pnl_pct = None
         reward = None
         position_size = 0.03  # default fallback
+        # sprint03 E4: distinguishes a realized-outcome label from an N-day
+        # forward-price fallback label, for data_quality_check.py's
+        # fallback_label_rate check — tagged per-branch below, never guessed.
+        label_source = None
 
         # 1. Primary: look up by order_id when available (A6), fall back to (symbol, date)
         order_id = rec.get('order_id')
@@ -559,6 +556,7 @@ def build_and_store(bot: str) -> tuple[int, int]:
         if outcome:
             pnl_pct = outcome.get('pnl_pct', 0)
             label, reward = _tiered_label_from_pnl(pnl_pct, decision, position_size)
+            label_source = 'realized'
 
         # 2. Fallback forward price (non-hold executed trades)
         elif rec.get('executed') and decision != 'hold':
@@ -567,6 +565,7 @@ def build_and_store(bot: str) -> tuple[int, int]:
                 pnl_pct = _forward_price_change(symbol, entry_dt, HOLD_DAYS_FALLBACK)
                 if pnl_pct is not None:
                     label, reward = _tiered_label_from_pnl(pnl_pct, decision, position_size)
+                    label_source = 'fallback_forward_price'
 
         # 3. HOLD validation — A1: use SPY-excess-return threshold, not absolute price change
         elif decision == 'hold':
@@ -574,6 +573,7 @@ def build_and_store(bot: str) -> tuple[int, int]:
             if days_elapsed >= HOLD_DAYS_FALLBACK:
                 pnl_pct, excess = _forward_excess_return(symbol, entry_dt, HOLD_DAYS_FALLBACK)
                 if excess is not None:
+                    label_source = 'fallback_forward_price'
                     if excess >= _MISSED_OPP_EXCESS:
                         label = 'missed_opportunity'
                         reward = -0.02
@@ -612,6 +612,7 @@ def build_and_store(bot: str) -> tuple[int, int]:
                 'prompt_hash': ph,
                 'generated_at': datetime.now().isoformat(),
                 'example_type': 'imitation',
+                'label_source': label_source,
             },
         }
 
@@ -1070,6 +1071,165 @@ def regenerate_counterfactuals(bot: str = 'both',
     return deleted, inserted
 
 
+def regenerate_synced_outcomes(bot: str = 'both', db_path: 'Path | str | None' = None,
+                               trade_log_path: 'Path | str | None' = None,
+                               dry_run: bool = False) -> dict:
+    """Relabel training examples whose real outcome only became available after
+    sprint01 C2's broker-fill-sync backfill.
+
+    Rows previously built via the N-day forward-price fallback (because the
+    broker-side bracket/OCO exit was missing from the trade log at build time)
+    are now wrong-by-construction — training_data_builder's normal run() will
+    NOT revisit them on its own, since their prompt_hash is already present in
+    training_examples and gets skipped as a duplicate.
+
+    Join path is explicit — NOT prompt_hash-direct (sprint01 A4):
+      trade_log sell row (synthesized_by == 'broker_fill_sync') → order_id
+      → outcomes.sell_order_id → outcomes.buy_order_id
+      → decisions.order_id → decisions.prompt → _prompt_hash(prompt)
+      → training_examples.prompt_hash
+
+    Older decision rows may lack `order_id` (added in a later revision of the
+    session loop) or may have no matching training_examples row yet — those
+    are counted as `unmatched`, never guessed via a fuzzy symbol/date fallback.
+
+    dry_run=True computes the projected relabeling and coverage without
+    writing; always inspect 'coverage_pct' and 'details' before running with
+    dry_run=False.
+
+    Returns {'matched', 'unmatched', 'deleted', 'inserted', 'coverage_pct', 'details'}.
+    """
+    db_path = Path(db_path) if db_path else _db.DB_PATH
+    trade_log_path = Path(trade_log_path) if trade_log_path else (_PROJECT_ROOT / 'logs' / 'trade_log.jsonl')
+    _db.init_db(db_path)
+
+    # Step 1: collect sell order_ids created by sync_broker_exits.py.
+    synced_sell_ids: set = set()
+    if trade_log_path.exists():
+        with open(trade_log_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get('synthesized_by') == 'broker_fill_sync' and rec.get('order_id'):
+                    synced_sell_ids.add(rec['order_id'])
+
+    if not synced_sell_ids:
+        logging.info(
+            "regenerate_synced_outcomes: no broker_fill_sync rows found in %s — nothing to relabel",
+            trade_log_path,
+        )
+        return {'matched': 0, 'unmatched': 0, 'deleted': 0, 'inserted': 0,
+                'coverage_pct': 100.0, 'details': []}
+
+    # Step 2: outcomes whose sell leg is one of the synced sells.
+    with _db.get_conn(db_path) as conn:
+        placeholders = ','.join('?' * len(synced_sell_ids))
+        outcome_rows = conn.execute(
+            f"SELECT * FROM outcomes WHERE sell_order_id IN ({placeholders})",
+            list(synced_sell_ids),
+        ).fetchall()
+    outcomes = [dict(r) for r in outcome_rows]
+
+    matched = 0
+    unmatched = 0
+    deleted = 0
+    inserted = 0
+    details = []
+
+    for outcome in outcomes:
+        row_bot = outcome.get('bot', 'stock')
+        if bot not in ('both', row_bot):
+            continue
+
+        buy_order_id = outcome.get('buy_order_id')
+        if not buy_order_id:
+            unmatched += 1
+            details.append({'sell_order_id': outcome.get('sell_order_id'),
+                             'reason': 'no buy_order_id on outcome'})
+            continue
+
+        with _db.get_conn(db_path) as conn:
+            drow = conn.execute(
+                "SELECT prompt, decision FROM decisions WHERE order_id = ?",
+                [buy_order_id],
+            ).fetchone()
+        if not drow or not drow['prompt']:
+            unmatched += 1
+            details.append({'buy_order_id': buy_order_id,
+                             'reason': 'no matching decisions row / prompt (older order_id-less row?)'})
+            continue
+
+        prompt = drow['prompt']
+        decision = drow['decision'] or 'buy'
+        ph = _prompt_hash(prompt)
+
+        with _db.get_conn(db_path) as conn:
+            existing = conn.execute(
+                "SELECT id, label FROM training_examples WHERE prompt_hash = ?",
+                [ph],
+            ).fetchone()
+        if not existing:
+            unmatched += 1
+            details.append({'buy_order_id': buy_order_id, 'prompt_hash': ph,
+                             'reason': 'no existing training_examples row to relabel'})
+            continue
+
+        matched += 1
+        pnl_pct = outcome.get('pnl_pct') or 0.0
+        new_label, reward = _tiered_label_from_pnl(pnl_pct, decision, 0.03)
+
+        if dry_run:
+            details.append({
+                'buy_order_id': buy_order_id, 'prompt_hash': ph,
+                'old_label': existing['label'], 'new_label': new_label, 'pnl_pct': pnl_pct,
+            })
+            continue
+
+        confidence = outcome.get('entry_confidence') or 0.5
+        reasoning = outcome.get('entry_reasoning', '') or ''
+        new_example = {
+            'input': prompt,
+            'output': _build_ideal_output(decision, confidence, reasoning, new_label),
+            'label': new_label,
+            'metadata': {
+                'bot':          row_bot,
+                'source':       outcome.get('source', 'paper'),
+                'symbol':       outcome.get('symbol', ''),
+                'decision':     decision,
+                'confidence':   round(confidence, 4),
+                'pnl_pct':      round(pnl_pct, 6),
+                'reward':       round(reward, 6) if reward is not None else None,
+                'entry_date':   (outcome.get('entry_timestamp') or '')[:10],
+                'session_id':   '',
+                'prompt_hash':  ph,
+                'generated_at': datetime.now().isoformat(),
+                'example_type': 'imitation',
+            },
+        }
+        with _db.get_conn(db_path) as conn:
+            conn.execute("DELETE FROM training_examples WHERE prompt_hash = ?", [ph])
+        deleted += 1
+        if _db.insert_training_example(new_example, db_path=db_path):
+            inserted += 1
+
+    total = matched + unmatched
+    coverage_pct = round(100.0 * matched / total, 1) if total else 100.0
+
+    logging.info(
+        "regenerate_synced_outcomes: matched=%d unmatched=%d deleted=%d inserted=%d coverage=%.1f%%%s",
+        matched, unmatched, deleted, inserted, coverage_pct, ' [DRY RUN]' if dry_run else '',
+    )
+    return {
+        'matched': matched, 'unmatched': unmatched, 'deleted': deleted, 'inserted': inserted,
+        'coverage_pct': coverage_pct, 'details': details,
+    }
+
+
 def regenerate_historical(db_path: 'Path | str', dry_run: bool = False) -> dict:
     """Regenerate contaminated historical rows using the current Session-2 taxonomy.
 
@@ -1247,6 +1407,17 @@ if __name__ == '__main__':
         help='Regenerate contaminated historical rows with current Session-2 taxonomy (use with --db)',
     )
     parser.add_argument(
+        '--relabel-synced', action='store_true',
+        help='Relabel training examples whose outcome only became available after sprint01 '
+             "C2's broker-fill-sync backfill (sync_broker_exits.py --execute). Defaults to a "
+             'dry-run preview reporting coverage — pass --execute to actually write.',
+    )
+    parser.add_argument(
+        '--execute', action='store_true',
+        help='With --relabel-synced: perform the writes. Without it, --relabel-synced always '
+             'runs as a dry-run preview — never invoke --execute from automation.',
+    )
+    parser.add_argument(
         '--db', default=None,
         help='DB path for --regenerate-historical (required; never defaults to live DB)',
     )
@@ -1260,6 +1431,13 @@ if __name__ == '__main__':
             parser.error('--regenerate-historical requires --db <path>')
         stats = regenerate_historical(args.db, dry_run=args.dry_run)
         logging.info("regenerate_historical complete: %s", stats)
+    elif args.relabel_synced:
+        stats = regenerate_synced_outcomes(args.bot, dry_run=not args.execute)
+        logging.info("regenerate_synced_outcomes complete: %s", stats)
+        print(f"\nCoverage: {stats['coverage_pct']}% ({stats['matched']} matched / "
+              f"{stats['unmatched']} unmatched)")
+        if not args.execute:
+            print("Dry run — no writes made. Re-run with --relabel-synced --execute to apply.")
     elif args.regenerate_counterfactuals:
         deleted, inserted = regenerate_counterfactuals(args.bot)
         logging.info("Regeneration complete: deleted=%d inserted=%d", deleted, inserted)

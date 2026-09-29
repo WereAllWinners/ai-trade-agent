@@ -15,10 +15,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # scripts/training/ for tdb imports
 from training import FINETUNE_PYTHON as _FINETUNE_PYTHON, FINETUNE_PTXAS as _FINETUNE_PTXAS
-from training_data_builder import (  # noqa: E402
+from training_data_builder import _SFT_TRAIN_LABELS  # noqa: E402
+# sprint03 E4: shared thresholds moved to training_constants.py — single
+# source of truth also used by data_quality_check.py's gate.
+from training_constants import (  # noqa: E402
     _HOLD_TEACHING_LABELS,
-    _SFT_TRAIN_LABELS,
     _SFT_MAX_HOLD_SHARE,
+    _MIN_TAKE_TRADE,
+    _MIN_TOTAL_SFT,
+    _TAKE_TRADE_LABELS,
 )
 
 _SCRIPTS_DIR  = Path(__file__).resolve().parent.parent
@@ -30,9 +35,6 @@ logging.basicConfig(
 )
 
 _GPU_TEMP_LIMIT   = 75   # °C — skip training above this to prevent thermal shutdown
-_MIN_TAKE_TRADE   = int(os.getenv('FINETUNE_MIN_TAKE_TRADE', '40'))
-_MIN_TOTAL_SFT    = int(os.getenv('FINETUNE_MIN_TOTAL_SFT',  '200'))
-_TAKE_TRADE_LABELS: frozenset[str] = frozenset({'winner', 'strong_winner'})
 
 
 def _cadence_gate(training_data_path: Path, bot: str = 'stock') -> bool:
@@ -169,6 +171,21 @@ def finetune_model(training_data_path: Path) -> None:
 
     if not _cadence_gate(training_data_path, bot):
         return   # gate fires — reason already logged; do not launch subprocess
+
+    from analysis.data_quality_check import run_data_quality_checks
+    dq_result = run_data_quality_checks(bot=bot)
+    failing = [c for c in dq_result['checks'] if c['status'] == 'fail']
+    warning = [c for c in dq_result['checks'] if c['status'] == 'warn']
+    from alerts import send_alert, AlertLevel, alert_once_per_day
+    for c in failing:
+        alert_once_per_day(f"data_quality_fail_{bot}_{c['name']}", lambda c=c: send_alert(
+            AlertLevel.WARNING, 'data_quality_gate_fail', f"{bot}: {c['name']} — {c['detail']}"))
+    for c in warning:
+        alert_once_per_day(f"data_quality_warn_{bot}_{c['name']}", lambda c=c: send_alert(
+            AlertLevel.WARNING, 'data_quality_gate_warn', f"{bot}: {c['name']} — {c['detail']}"))
+    if not dq_result['passed']:
+        logging.error("🚫 Data quality gate FAILED (%s) — skipping fine-tune: %s", bot, dq_result['summary'])
+        return
 
     with open(training_data_path) as f:
         training_data = json.load(f)
