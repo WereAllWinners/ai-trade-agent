@@ -222,6 +222,7 @@ def repair_naked_positions(results: CheckResult) -> None:
                         'Alpaca credentials not set — skipping repair sweep',
                         warn_only=True)
             return
+        from service_suffix import service_suffix
         paper  = os.getenv('PAPER_TRADING', 'true').lower() != 'false'
         client = TradingClient(api_key, secret, paper=paper)
         dry_run = os.getenv('DRY_RUN', 'false').lower() == 'true'
@@ -230,7 +231,12 @@ def repair_naked_positions(results: CheckResult) -> None:
             {'stop_loss': -0.07, 'take_profit': 0.15},
             dry_run=dry_run,
         )
-        write_reconcile_status(client, _PROJECT_ROOT / 'logs' / 'reconcile_status.json')
+        # sprint02 D4.1: this tool already derives `paper` from the running
+        # environment above — match the suffixed path the corresponding
+        # daemon actually writes, instead of the always-paper legacy path.
+        write_reconcile_status(
+            client, _PROJECT_ROOT / 'logs' / f'reconcile_status{service_suffix()}.json'
+        )
         results.add(
             'repair_sweep', True,
             f"Repair sweep: protected={summary['protected']} "
@@ -251,7 +257,10 @@ def check_reconcile_status(results: CheckResult) -> None:
     Warn-only: stocks_fractional > 0 (GTC stop unsupported for fractional — known limitation).
     Warn-only: any count == -1 (API unavailable at check time).
     """
-    status_path = _PROJECT_ROOT / 'logs' / 'reconcile_status.json'
+    from service_suffix import service_suffix
+    # sprint02 D4.1: read the same suffixed path repair_naked_positions()
+    # (above) just wrote, for the currently-running environment.
+    status_path = _PROJECT_ROOT / 'logs' / f'reconcile_status{service_suffix()}.json'
     if not status_path.exists():
         results.add(
             'reconcile_status', False,

@@ -147,6 +147,8 @@ def reprotect_positions(
       already_protected    — positions that already had a SELL order (skipped)
       skipped_fractional   — fractional positions (no GTC stop available)
       deferred_pdt         — positions skipped due to same-day PDT deferral
+      skipped_breached     — positions whose current price already crossed the
+                             stop/target (OCO would fill immediately; not submitted)
       errors               — positions where submit_order raised
       report               — list of per-position dicts (dry_run=True only)
     """
@@ -157,7 +159,7 @@ def reprotect_positions(
 
     summary: dict = {
         'protected': 0, 'already_protected': 0, 'skipped_fractional': 0,
-        'deferred_pdt': 0, 'errors': 0, 'report': [],
+        'deferred_pdt': 0, 'skipped_breached': 0, 'errors': 0, 'report': [],
     }
 
     try:
@@ -205,12 +207,15 @@ def reprotect_positions(
             summary['deferred_pdt'] += 1
             continue
 
+        # Current price + would-fill, computed once for both the dry-run report
+        # and the live breached-position guard below.
+        try:
+            current_price = float(pos.current_price)
+        except Exception:
+            current_price = avg_entry
+        would_fill = current_price <= stop_price or current_price >= target_price
+
         if dry_run:
-            try:
-                current_price = float(pos.current_price)
-            except Exception:
-                current_price = avg_entry
-            would_fill = current_price <= stop_price or current_price >= target_price
             summary['report'].append({
                 'symbol':               symbol,
                 'qty':                  int(qty),
@@ -227,14 +232,28 @@ def reprotect_positions(
             summary['protected'] += 1
             continue
 
+        # Live guard: never submit an OCO the current price has already crossed.
+        # A sell-stop above market (or take-profit below market) fills or rejects
+        # on submission; placing it on a stale entry-derived level is not
+        # protection. Surface for deliberate handling instead.
+        if would_fill:
+            logging.warning(
+                "⚠️  REPROTECT: %s breached (current=$%.2f stop=$%.2f target=$%.2f) — "
+                "OCO would fill immediately; skipping. Resolve via "
+                "handle_breached_positions.py or agent SELL decision.",
+                symbol, current_price, stop_price, target_price,
+            )
+            summary['skipped_breached'] += 1
+            continue
+
         try:
             order = LimitOrderRequest(
                 symbol=symbol,
                 qty=int(qty),
                 side=OrderSide.SELL,
-                limit_price=target_price,
                 time_in_force=TimeInForce.GTC,
                 order_class=OrderClass.OCO,
+                take_profit=TakeProfitRequest(limit_price=target_price),
                 stop_loss=StopLossRequest(stop_price=stop_price),
             )
             trading_client.submit_order(order)
@@ -294,8 +313,15 @@ def main():
               f"deferred_pdt={summary['deferred_pdt']}  "
               f"errors={summary['errors']}")
     else:
-        write_reconcile_status(client, _DEFAULT_STATUS_PATH)
-        data = json.loads(_DEFAULT_STATUS_PATH.read_text())
+        # sprint02 D4.1: paper/live share this default path — suffix by the
+        # `paper` value already derived above so this CLI matches whichever
+        # daemon's status the caller's environment actually corresponds to.
+        from service_suffix import service_suffix
+        _status_path = _DEFAULT_STATUS_PATH.with_name(
+            _DEFAULT_STATUS_PATH.stem + service_suffix() + _DEFAULT_STATUS_PATH.suffix
+        )
+        write_reconcile_status(client, _status_path)
+        data = json.loads(_status_path.read_text())
         print(json.dumps(data, indent=2))
 
 

@@ -251,7 +251,7 @@ class TestReprotectPositions:
         reprotect_positions(client, self._DEFAULT_PARAMS)
         order_arg = client.submit_order.call_args[0][0]
         # take_profit = 200 * 1.15 = 230.00
-        assert float(order_arg.limit_price) == pytest.approx(230.00, abs=0.01)
+        assert float(order_arg.take_profit.limit_price) == pytest.approx(230.00, abs=0.01)
 
     def test_position_with_existing_sell_is_skipped(self):
         """Position already has a SELL order → submit_order not called."""
@@ -379,7 +379,7 @@ class TestReprotectPositions:
         result = reprotect_positions(client, self._DEFAULT_PARAMS)
         assert result == {
             'protected': 0, 'already_protected': 0, 'skipped_fractional': 0,
-            'deferred_pdt': 0, 'errors': 0, 'report': [],
+            'deferred_pdt': 0, 'skipped_breached': 0, 'errors': 0, 'report': [],
         }
 
     def test_options_symbols_not_reprotected(self):
@@ -390,6 +390,39 @@ class TestReprotectPositions:
         assert result['protected']          == 0
         assert result['skipped_fractional'] == 0
         client.submit_order.assert_not_called()
+
+    def test_breached_target_position_skipped_in_live_mode(self):
+        """Current price above target → OCO would fill immediately → skipped, not submitted."""
+        client = _client(
+            positions=[_pos('AAPL', qty=10.0, avg_entry=100.0, current_price=120.0)],
+            orders=[],
+        )
+        result = reprotect_positions(client, self._DEFAULT_PARAMS)
+        assert result['skipped_breached'] == 1
+        assert result['protected']        == 0
+        client.submit_order.assert_not_called()
+
+    def test_breached_stop_position_skipped_in_live_mode(self):
+        """Current price below stop → OCO would fill immediately → skipped, not submitted."""
+        client = _client(
+            positions=[_pos('AAPL', qty=10.0, avg_entry=100.0, current_price=80.0)],
+            orders=[],
+        )
+        result = reprotect_positions(client, self._DEFAULT_PARAMS)
+        assert result['skipped_breached'] == 1
+        assert result['protected']        == 0
+        client.submit_order.assert_not_called()
+
+    def test_unbreached_position_still_protected_in_live_mode(self):
+        """Price between stop and target → normal OCO submitted (guard does not over-trigger)."""
+        client = _client(
+            positions=[_pos('AAPL', qty=10.0, avg_entry=100.0, current_price=105.0)],
+            orders=[],
+        )
+        result = reprotect_positions(client, self._DEFAULT_PARAMS)
+        assert result['skipped_breached'] == 0
+        assert result['protected']        == 1
+        client.submit_order.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
