@@ -20,6 +20,99 @@ import _pathfix  # noqa: F401
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 import db as _db
+from analysis.order_status_cache import OrderStatusCache
+
+
+def _row_qty(row: dict) -> float:
+    """Return a trade-log row's size, accepting either key name.
+
+    Two writers feed logs/trade_log.jsonl with different key names for the same
+    thing: the agents write 'shares', while exit_reconciler.py — which records
+    broker-side bracket/OCO exits — wrote 'quantity' (the options-log key) into
+    the stock log. This reader only ever looked at 'shares', so 342 of 534 sell
+    rows yielded 0.
+
+    Because size feeds `realized_pnl = (exit - entry) * shares`, a 0 collapsed
+    realized_pnl to 0 and therefore `won = realized_pnl > 0` to False — while
+    pnl_pct, computed straight from the prices, stayed correct. The result was
+    181 genuinely profitable trades recorded as losses, biased strictly in one
+    direction. Training on that teaches the model that profitable setups fail.
+
+    exit_reconciler.py now writes 'shares' for the stock log, but this fallback
+    stays: it is what repairs the rows already on disk, and it keeps the reader
+    tolerant of either spelling.
+    """
+    for key in ('shares', 'quantity'):
+        val = row.get(key)
+        if val is None:
+            continue
+        try:
+            qty = float(val)
+        except (TypeError, ValueError):
+            continue
+        if qty:
+            return qty
+    return 0.0
+
+
+_SPY_RETURN_CACHE: dict = {}   # (entry_date, exit_date) -> float | None
+_SPY_SERIES_CACHE: dict = {}   # single entry: {'series': <closes>} once fetched
+
+
+def _spy_closes(first_date, last_date):
+    """Return a SPY close series covering [first_date, last_date].
+
+    This used to be one yf.download per closed trade — up to ~534 network calls
+    in a single pass, several minutes on top of the Alpaca lookups, and a second
+    reason the nightly tracker blew its subprocess budget. SPY history is the
+    same series for every trade, so it is fetched once and sliced.
+
+    The cached series tracks the range it actually covers and refetches the union
+    if a later window falls outside it. Without that, the first pair's dates
+    would fix the range and every trade outside it would silently score None.
+    """
+    import datetime as _dt
+
+    if _SPY_SERIES_CACHE.get('failed'):
+        return None
+
+    want_start = first_date - _dt.timedelta(days=7)
+    want_end   = last_date + _dt.timedelta(days=7)
+
+    have_start = _SPY_SERIES_CACHE.get('start')
+    have_end   = _SPY_SERIES_CACHE.get('end')
+    if have_start is not None and have_start <= want_start and have_end >= want_end:
+        return _SPY_SERIES_CACHE['series']
+
+    # Expand to the union so we never shrink an already-fetched range.
+    if have_start is not None:
+        want_start = min(want_start, have_start)
+        want_end   = max(want_end, have_end)
+
+    # Every trade being scored is historical, so reach through today in one go.
+    # Without this each successive hold window extends the end by a day and
+    # refetches — one download per trade again, which is the cost this cache
+    # exists to remove.
+    want_end = max(want_end, _dt.date.today() + _dt.timedelta(days=7))
+
+    try:
+        import yfinance as yf
+        spy = yf.download(
+            'SPY', start=str(want_start), end=str(want_end),
+            auto_adjust=True, progress=False,
+        )['Close']
+        if hasattr(spy, 'columns'):       # newer yfinance returns a DataFrame
+            spy = spy.squeeze('columns')
+        if spy is None or len(spy) == 0:
+            _SPY_SERIES_CACHE['failed'] = True
+            return None
+        _SPY_SERIES_CACHE.update({'series': spy, 'start': want_start, 'end': want_end})
+        logging.info("SPY series cached: %d bars (%s → %s)", len(spy), want_start, want_end)
+        return spy
+    except Exception as e:
+        logging.debug("SPY series fetch failed (non-fatal): %s", e)
+        _SPY_SERIES_CACHE['failed'] = True
+        return None
 
 
 def _fetch_spy_return(entry_ts: str, exit_ts: str) -> float | None:
@@ -29,18 +122,24 @@ def _fetch_spy_return(entry_ts: str, exit_ts: str) -> float | None:
     Returns None silently on any fetch failure.
     """
     try:
-        import yfinance as yf
         entry_dt = datetime.fromisoformat(entry_ts).date()
         exit_dt  = datetime.fromisoformat(exit_ts).date()
         if entry_dt >= exit_dt:
             return None
-        spy = yf.download(
-            'SPY', start=str(entry_dt), end=str(exit_dt + __import__('datetime').timedelta(days=1)),
-            auto_adjust=True, progress=False
-        )['Close']
-        if spy.empty or len(spy) < 2:
+
+        key = (entry_dt, exit_dt)
+        if key in _SPY_RETURN_CACHE:
+            return _SPY_RETURN_CACHE[key]
+
+        spy = _spy_closes(entry_dt, exit_dt)
+        if spy is None:
             return None
-        return float((spy.iloc[-1] - spy.iloc[0]) / spy.iloc[0])
+        window = spy.loc[str(entry_dt):str(exit_dt)]
+        result = None
+        if len(window) >= 2:
+            result = float((window.iloc[-1] - window.iloc[0]) / window.iloc[0])
+        _SPY_RETURN_CACHE[key] = result
+        return result
     except Exception as e:
         logging.debug("_fetch_spy_return failed (non-fatal): %s", e)
         return None
@@ -79,6 +178,15 @@ class OutcomeTracker:
         self.trade_log_path = Path('logs/trade_log.jsonl')
         self.outcomes_path = Path('logs/trade_outcomes.jsonl')
         Path('logs').mkdir(exist_ok=True)
+        # Persistent order-status cache. Without it this tracker re-issued one
+        # Alpaca lookup per trade-log row on every run — 3,390 sequential calls
+        # (~4 min) against the daemon's 120 s budget, so it timed out before
+        # writing any outcome and the table froze on 2026-07-02. Suffixed per
+        # service because order ids are account-scoped (D4.1).
+        from service_suffix import suffixed_path
+        self._status_cache = OrderStatusCache(
+            suffixed_path(Path('logs') / f'order_status_cache_{self._bot_name}.json')
+        )
 
     # ------------------------------------------------------------------
     # Data loading
@@ -130,9 +238,18 @@ class OutcomeTracker:
     # ------------------------------------------------------------------
 
     def get_order_status(self, order_id) -> dict:
-        """Return status, filled_qty, and avg_price for an order."""
+        """Return status, filled_qty, and avg_price for an order.
+
+        Served from the persistent cache when the order has reached a terminal
+        state (its fill price can never change again). Non-terminal orders and
+        failed lookups are always re-fetched — see order_status_cache.py.
+        """
         if not order_id:
             return {'status': 'unknown', 'filled_qty': 0, 'avg_price': None}
+        return self._status_cache.get_or_fetch(order_id, lambda: self._fetch_order_status(order_id))
+
+    def _fetch_order_status(self, order_id) -> dict:
+        """Uncached single lookup against Alpaca."""
         try:
             order = self.trading_client.get_order_by_id(order_id)
             return {
@@ -247,8 +364,8 @@ class OutcomeTracker:
 
                     open_buys.pop(0)  # normal successful match — pop now
                     shares = min(
-                        entry.get('shares', 0),
-                        trade.get('shares', 0)
+                        _row_qty(entry),
+                        _row_qty(trade)
                     )
                     realized_pnl = (exit_price - entry_price) * shares
                     pnl_pct = (exit_price - entry_price) / entry_price
@@ -293,7 +410,14 @@ class OutcomeTracker:
             return
 
         already_tracked = self.load_already_tracked_ids()
-        all_outcomes = self.match_and_calculate_pnl(trades)
+        try:
+            all_outcomes = self.match_and_calculate_pnl(trades)
+        finally:
+            # Persist whatever was resolved even if matching raised — a partial
+            # cache makes the next run cheaper, which is how a cold cache warms
+            # up across runs when one pass cannot finish inside the timeout.
+            self._status_cache.flush()
+            logging.info("%s", self._status_cache.summary())
 
         new_outcomes = [
             o for o in all_outcomes

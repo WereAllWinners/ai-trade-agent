@@ -26,6 +26,13 @@ from preflight_check import run_preflight
 # so the live bot never triggers GPU-intensive background jobs or modifies the model.
 _LIVE_ONLY = os.getenv('TRADING_LIVE_ONLY', '0') == '1'
 
+# Outcome-tracker subprocess budget. It was a hardcoded 120 s, which the tracker
+# outgrew: it issues one Alpaca lookup per trade-log row, so at 3,390 rows a cold
+# run needs ~4 min and timed out every night from ~2026-07-02 onward, writing no
+# outcomes at all. A warm order-status cache brings steady-state back to seconds;
+# this budget only has to cover the cold/first run after the cache is cleared.
+_OUTCOME_TRACKER_TIMEOUT = int(os.getenv('OUTCOME_TRACKER_TIMEOUT', '900'))
+
 
 def _write_heartbeat(status: str, market_open: bool) -> None:
     """Update heartbeat file so health_server.py can report daemon liveness."""
@@ -201,7 +208,7 @@ class TradingDaemon:
             logging.info("📥 [live] Fetching live trade fill prices and computing P&L...")
             result = subprocess.run(
                 [sys.executable, str(_SCRIPTS_DIR / 'analysis' / 'outcome_tracker.py')],
-                timeout=120,
+                timeout=_OUTCOME_TRACKER_TIMEOUT,
             )
             if result.returncode == 0:
                 logging.info("✅ [live] Outcome tracking complete — live trades will feed tonight's fine-tune")
@@ -231,7 +238,7 @@ class TradingDaemon:
             logging.info("📥 Fetching trade fill prices and computing P&L...")
             result = subprocess.run(
                 [sys.executable, str(_SCRIPTS_DIR / 'analysis' / 'outcome_tracker.py')],
-                timeout=120
+                timeout=_OUTCOME_TRACKER_TIMEOUT
             )
             if result.returncode != 0:
                 logging.warning(f"⚠️ Outcome tracker exited with code: {result.returncode}")

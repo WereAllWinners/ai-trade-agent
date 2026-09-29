@@ -24,6 +24,7 @@ import _pathfix  # noqa: F401
 
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
+from analysis.order_status_cache import OrderStatusCache
 import db as _db
 
 # Reuse the SPY benchmark helper from outcome_tracker to avoid duplication
@@ -63,6 +64,13 @@ class OptionsOutcomeTracker:
         self.trade_log_path = Path('logs/options_trade_log.jsonl')
         self.outcomes_path = Path('logs/options_trade_outcomes.jsonl')
         Path('logs').mkdir(exist_ok=True)
+        # Same uncached-lookup stall as outcome_tracker.py — one Alpaca call per
+        # trade-log row on every run. Shared cache implementation so the two
+        # trackers cannot drift apart.
+        from service_suffix import suffixed_path
+        self._status_cache = OrderStatusCache(
+            suffixed_path(Path('logs') / f'order_status_cache_{self._bot_name}.json')
+        )
 
     # ------------------------------------------------------------------
     # Data loading
@@ -114,9 +122,16 @@ class OptionsOutcomeTracker:
     # ------------------------------------------------------------------
 
     def get_order_status(self, order_id) -> dict:
-        """Return status, filled_qty, and avg_price for an order."""
+        """Return status, filled_qty, and avg_price for an order.
+
+        Cached for terminal orders — see analysis/order_status_cache.py.
+        """
         if not order_id:
             return {'status': 'unknown', 'filled_qty': 0, 'avg_price': None}
+        return self._status_cache.get_or_fetch(order_id, lambda: self._fetch_order_status(order_id))
+
+    def _fetch_order_status(self, order_id) -> dict:
+        """Uncached single lookup against Alpaca."""
         try:
             order = self.trading_client.get_order_by_id(order_id)
             return {
@@ -270,7 +285,13 @@ class OptionsOutcomeTracker:
             return
 
         already_tracked = self.load_already_tracked_ids()
-        all_outcomes = self.match_and_calculate_pnl(trades)
+        try:
+            all_outcomes = self.match_and_calculate_pnl(trades)
+        finally:
+            # Persist resolved lookups even on failure so a cold cache warms up
+            # across runs rather than restarting from scratch each time.
+            self._status_cache.flush()
+            logging.info("%s", self._status_cache.summary())
 
         new_outcomes = [
             o for o in all_outcomes

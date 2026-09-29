@@ -15,6 +15,9 @@ import pytz
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 _HEARTBEAT_FILE = _SCRIPTS_DIR.parent / 'logs' / 'heartbeat_options.json'
+
+# See trading_daemon.py — same uncached-lookup stall, same budget.
+_OUTCOME_TRACKER_TIMEOUT = int(os.getenv('OUTCOME_TRACKER_TIMEOUT', '900'))
 sys.path.append(str(_SCRIPTS_DIR))
 
 import inference_client
@@ -183,7 +186,7 @@ class OptionsDaemon:
             logging.info("📥 Fetching options fill prices and computing P&L...")
             result = subprocess.run(
                 [sys.executable, str(_SCRIPTS_DIR / 'analysis' / 'options_outcome_tracker.py')],
-                timeout=120
+                timeout=_OUTCOME_TRACKER_TIMEOUT
             )
             if result.returncode != 0:
                 logging.warning(f"⚠️ Options outcome tracker exited with code: {result.returncode}")
