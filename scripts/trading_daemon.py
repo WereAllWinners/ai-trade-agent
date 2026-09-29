@@ -175,6 +175,20 @@ class TradingDaemon:
         same outcome_tracker subprocess as the paper bot, but inherits PAPER_TRADING=false
         from the live daemon's environment so it queries the live Alpaca account.
         """
+        # Step 0: sync broker-side bracket/OCO exits that bypassed execute_trade
+        # (sprint01 C2) — must run before outcome_tracker so it can pair them.
+        try:
+            logging.info("🔄 [live] Syncing broker-side bracket/OCO exits...")
+            result = subprocess.run(
+                [sys.executable, str(_SCRIPTS_DIR / 'sync_broker_exits.py'),
+                 '--lookback', '3', '--execute-daemon'],
+                timeout=120,
+            )
+            if result.returncode != 0:
+                logging.warning(f"⚠️ [live] sync_broker_exits exited with code: {result.returncode}")
+        except Exception as e:
+            logging.warning(f"⚠️ [live] sync_broker_exits failed: {e}")
+
         try:
             logging.info("📥 [live] Fetching live trade fill prices and computing P&L...")
             result = subprocess.run(
@@ -190,6 +204,20 @@ class TradingDaemon:
 
     def run_performance_analysis(self):
         """Run outcome tracking then performance analysis."""
+        # Step 0: sync broker-side bracket/OCO exits that bypassed execute_trade
+        # (sprint01 C2) — must run before outcome_tracker so it can pair them.
+        try:
+            logging.info("🔄 Syncing broker-side bracket/OCO exits...")
+            result = subprocess.run(
+                [sys.executable, str(_SCRIPTS_DIR / 'sync_broker_exits.py'),
+                 '--lookback', '3', '--execute-daemon'],
+                timeout=120,
+            )
+            if result.returncode != 0:
+                logging.warning(f"⚠️ sync_broker_exits exited with code: {result.returncode}")
+        except Exception as e:
+            logging.warning(f"⚠️ sync_broker_exits failed: {e}")
+
         # Step 1: Enrich trade log with fill prices and compute P&L
         try:
             logging.info("📥 Fetching trade fill prices and computing P&L...")
@@ -296,6 +324,9 @@ class TradingDaemon:
 
     def run_strategy_evolver(self):
         """Evolve trading strategies and generate synthetic training examples (Saturday only)."""
+        if os.getenv('STRATEGY_EVOLVER_ENABLED', 'true').lower() == 'false':
+            logging.info("⏭️  STRATEGY_EVOLVER_ENABLED=false — skipping strategy evolver")
+            return
         try:
             logging.info("=" * 70)
             logging.info("🧬 RUNNING STRATEGY EVOLVER")
@@ -359,6 +390,10 @@ class TradingDaemon:
 
     def run_finetuning(self):
         """Run market research, build training data, then full fine-tune."""
+        if os.getenv('FINETUNE_ENABLED', 'true').lower() == 'false':
+            logging.info("⏭️  FINETUNE_ENABLED=false — skipping fine-tune cycle "
+                          "(market research / training-data build also skipped)")
+            return
         self.run_market_research()
         self.run_training_data_builder()
         self.run_dpo_builder()

@@ -298,6 +298,10 @@ class OptionsDaemon:
 
     def run_finetuning(self):
         """Run market research, build training data, then fine-tune options model."""
+        if os.getenv('FINETUNE_ENABLED', 'true').lower() == 'false':
+            logging.info("⏭️  FINETUNE_ENABLED=false — skipping fine-tune cycle "
+                          "(market research / training-data build also skipped)")
+            return
         self.run_market_research()
         self.run_training_data_builder()
         # Free GPU VRAM before training job loads the 32B base model.
