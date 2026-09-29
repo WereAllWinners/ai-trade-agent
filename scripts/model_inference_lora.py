@@ -2,7 +2,6 @@
 """
 Model Inference with LoRA - OPTIMIZED with model caching
 """
-import json
 import os
 import logging
 import time
@@ -14,8 +13,10 @@ warnings.filterwarnings("ignore", message=".*cuda capability.*", category=UserWa
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel
 from filelock import FileLock, Timeout as FileLockTimeout
-import re
 from pathlib import Path
+
+import decision_parser
+from decision_parser import parse_decision
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 
@@ -33,16 +34,21 @@ _MODEL_CACHE = {
     'loaded': False
 }
 
-# E1: parse failure tracking — incremented when neither JSON nor regex can extract
-# a valid decision from the model response.  Written to logs/parse_failures.json
-# every 50 failures for Prometheus scraping.
-_parse_failures_count: int = 0
-
 # E2: base-model env vars — when set, debate_trade uses a different model tag
 # (un-fine-tuned base) to provide diverse perspective.  Falls back to OLLAMA_MODEL /
 # VLLM_MODEL when not configured so the change is a safe no-op by default.
 _OLLAMA_BASE_MODEL = os.getenv('OLLAMA_BASE_MODEL', '')
 _VLLM_BASE_MODEL   = os.getenv('VLLM_BASE_MODEL', '')
+
+
+def __getattr__(name):
+    """PEP 562 module proxy: _parse_failures_count now lives in decision_parser
+    (sprint01 C1.1 consolidation). A plain re-export would go stale since ints
+    rebind on increment; this keeps `model_inference_lora._parse_failures_count`
+    reflecting the live value for existing callers/tests."""
+    if name == '_parse_failures_count':
+        return decision_parser._parse_failures_count
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def load_model_once():
@@ -161,119 +167,11 @@ def get_trading_decision(prompt, max_new_tokens=200, temperature=0.7):
 
     return response
 
-def parse_decision(response: str) -> dict:
-    """Parse the model's response into a structured decision.
 
-    Attempt 1 — JSON block: look for ``{...}`` anywhere in the response.
-      Accepts keys: decision, confidence, reasoning (case-insensitive).
-    Attempt 2 — structured-line regex: existing Decision:/Confidence: pattern.
-    On total failure: return hold with confidence=None and increment
-      _parse_failures_count (caller can gate on ``confidence is None``).
-    """
-    global _parse_failures_count
-
-    # ── Attempt 1: JSON block ─────────────────────────────────────────────────
-    json_start = response.find('{')
-    json_end   = response.rfind('}')
-    if json_start != -1 and json_end != -1 and json_end > json_start:
-        try:
-            blob = json.loads(response[json_start:json_end + 1])
-            # Normalise keys to lower-case for robustness
-            blob = {k.lower(): v for k, v in blob.items()}
-            j_decision = str(blob.get('decision', '')).lower().strip()
-            if j_decision in ('buy', 'buy_call', 'sell', 'hold'):
-                j_conf = blob.get('confidence')
-                if j_conf is not None:
-                    try:
-                        j_conf = float(j_conf)
-                        if j_conf > 1:
-                            j_conf = j_conf / 100
-                        j_conf = max(0.0, min(1.0, j_conf))
-                    except (ValueError, TypeError):
-                        j_conf = None
-                j_reasoning = str(blob.get('reasoning', response[:200])).replace('\n', ' ').strip()
-                return {
-                    'decision':     j_decision,
-                    'confidence':   j_conf if j_conf is not None else 0.0,
-                    'reasoning':    j_reasoning[:200],
-                    'raw_response': response,
-                    'parse_method': 'json',
-                    'parse_failed': False,
-                }
-        except (json.JSONDecodeError, Exception):
-            pass
-
-    # ── Attempt 2: structured-line regex ─────────────────────────────────────
-    response_lower = response.lower()
-
-    decision = 'hold'
-    found_decision = False
-    if 'buy' in response_lower and "don't buy" not in response_lower and 'not buy' not in response_lower:
-        decision = 'buy'
-        found_decision = True
-    elif 'sell' in response_lower and "don't sell" not in response_lower and 'not sell' not in response_lower:
-        decision = 'sell'
-        found_decision = True
-    else:
-        # 'hold' — only explicit
-        for line in response_lower.splitlines():
-            if 'decision:' in line and 'hold' in line:
-                found_decision = True
-                break
-
-    confidence = None
-    confidence_match = re.search(r'confidence[:\s]+(\d*\.?\d+)', response_lower)
-    if confidence_match:
-        try:
-            conf_val = float(confidence_match.group(1))
-            if conf_val > 1:
-                conf_val = conf_val / 100
-            confidence = max(0.0, min(1.0, conf_val))
-        except (ValueError, TypeError) as _e:
-            logging.warning(
-                "Could not parse confidence value '%s': %s",
-                confidence_match.group(1), _e,
-            )
-
-    reasoning = response[:200].replace('\n', ' ').strip()
-
-    parse_failed = False
-    if not found_decision and confidence is None:
-        _parse_failures_count += 1
-        parse_failed = True
-        logging.debug(
-            "parse_decision: ambiguous response (failure #%d), returning hold/0.0",
-            _parse_failures_count,
-        )
-        _maybe_write_parse_failures()
-
-    if confidence is None:
-        confidence = 0.0
-
-    return {
-        'decision':     decision,
-        'confidence':   confidence,
-        'reasoning':    reasoning,
-        'raw_response': response,
-        'parse_method': 'regex',
-        'parse_failed': parse_failed,
-    }
-
-
-def _maybe_write_parse_failures() -> None:
-    """Persist _parse_failures_count to logs/ every 50 failures for Prometheus."""
-    if _parse_failures_count % 50 != 0:
-        return
-    try:
-        path = _SCRIPTS_DIR.parent / 'logs' / 'parse_failures.json'
-        path.parent.mkdir(parents=True, exist_ok=True)
-        from datetime import datetime as _dt
-        path.write_text(json.dumps({
-            'parse_failures_total': _parse_failures_count,
-            'updated_at': _dt.now().isoformat(),
-        }))
-    except Exception as _e:
-        logging.debug("Could not write parse_failures.json: %s", _e)
+# parse_decision is imported from decision_parser (sprint01 C1.1 consolidation) —
+# see the module import at the top of this file. Kept as a distinct name here
+# (rather than only in __all__) so `from model_inference_lora import parse_decision`
+# continues to work for all existing importers unchanged.
 
 
 def _generate_base_model(prompt: str, max_new_tokens: int = 200, temperature: float = 0.7) -> str:

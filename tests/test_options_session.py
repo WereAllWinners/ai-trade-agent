@@ -200,9 +200,13 @@ class TestHappyPath(unittest.TestCase):
                 history=MagicMock(return_value=make_price_df())
             )),
             patch('options_agent.get_trading_decision',
-                  return_value='BUY_CALL. Confidence: 0.85.'),
+                  return_value='Decision: BUY_CALL\nConfidence: 0.85\nReasoning: bullish'),
+            # sprint01 C1.2: get_ai_options_decision no longer scans the raw response
+            # for 'call'/'put' substrings, so the mocked parse result must reflect a
+            # real structured buy_call decision (as the prompt asks the model to
+            # produce) rather than a bare 'buy' relying on momentum-sign fallback.
             patch('options_agent.parse_decision',
-                  return_value={'decision': 'buy', 'confidence': 0.85, 'reasoning': 'bullish'}),
+                  return_value={'decision': 'buy_call', 'confidence': 0.85, 'reasoning': 'bullish'}),
             patch('options_agent.economic_calendar.get_todays_high_impact_events',
                   return_value=[]),
             patch('options_agent.economic_calendar.should_halt_trading',

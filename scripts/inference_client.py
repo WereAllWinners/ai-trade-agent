@@ -41,6 +41,24 @@ VLLM_MODEL:        str = os.getenv('VLLM_MODEL', 'Qwen/Qwen2.5-32B-Instruct')
 VLLM_API_KEY:      str = os.getenv('VLLM_API_KEY', 'token')
 INFERENCE_TIMEOUT: int = int(os.getenv('INFERENCE_TIMEOUT', '120'))
 
+# Sprint01 C1.5 (optional, non-blocking parser hardening): constrain vLLM's
+# output to the expected Decision:/Confidence:/Reasoning: shape via structured
+# outputs, cutting off the free-text-parsing surface area at the source.
+# Default OFF — flipping this requires a separate paper-verification pass, not
+# just a version check (see docs/sprint01-v0-findings.md).
+# Confirmed against the deployed server (vLLM 0.20.2 at $VLLM_BASE_URL) that
+# the field is a NESTED `structured_outputs: {"regex": ...}` object, NOT the
+# older top-level `guided_regex` key some vLLM docs/versions describe — verify
+# again via `curl $VLLM_BASE_URL/../openapi.json` if the server is upgraded.
+INFERENCE_GUIDED_DECODING: bool = (
+    os.getenv('INFERENCE_GUIDED_DECODING', 'false').lower() == 'true'
+)
+_GUIDED_DECISION_REGEX = (
+    r'Decision: (BUY_CALL|BUY_PUT|BUY|SELL|HOLD)\n'
+    r'Confidence: 0\.\d{2}\n'
+    r'Reasoning: .{10,200}'
+)
+
 _ALLOW_INTRADAY_VLLM_RESTART: bool = (
     os.getenv('ALLOW_INTRADAY_VLLM_RESTART', 'false').lower() == 'true'
 )
@@ -414,6 +432,8 @@ def _generate_vllm(prompt: str, max_tokens: int, temperature: float) -> str:
         "temperature": temperature,
         "top_p": 0.9,
     }
+    if INFERENCE_GUIDED_DECODING:
+        payload["structured_outputs"] = {"regex": _GUIDED_DECISION_REGEX}
     headers = {"Authorization": f"Bearer {VLLM_API_KEY}"}
     # Retry up to 3 times with 10 s gaps to ride out transient vLLM restart windows
     # (e.g., the ~2-3 min reload after a nightly fine-tune promotes a new merged model).

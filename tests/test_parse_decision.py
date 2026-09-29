@@ -156,6 +156,55 @@ class TestParseDecision:
         after = _mli._parse_failures_count
         assert after > before
 
+    # ------------------------------------------------------------------
+    # Sprint01 C1 — decision-inversion hardening
+    # ------------------------------------------------------------------
+
+    def test_both_buy_and_sell_present_is_ambiguous_hold(self):
+        """Free text containing both 'buy' and 'sell' with no Decision: line
+        must not guess a direction — resolves to hold, parse_failed=True."""
+        result = parse_decision(
+            "The analyst said buy signals are weak but some might sell. Confidence: 0.60."
+        )
+        assert result['decision'] == 'hold'
+        assert result['parse_failed'] is True
+
+    def test_decision_line_wins_over_conflicting_reasoning_substrings(self):
+        """A structured Decision: line is authoritative even if the reasoning
+        text elsewhere contains the opposite action word."""
+        result = parse_decision(
+            "Decision: BUY\nConfidence: 0.80\n"
+            "Reasoning: the technicals call for a sell-off eventually but not yet"
+        )
+        assert result['decision'] == 'buy'
+        assert result['parse_method'] == 'structured_line'
+
+    def test_word_boundary_excludes_buyers_false_match(self):
+        """'Buyers' must not be treated as a 'buy' signal — \\bbuy\\b requires a
+        real word boundary, and 'buy' immediately followed by 'ers' has none."""
+        result = parse_decision("Buyers are exhausted, no clear signal. Confidence: 0.5.")
+        assert result['decision'] != 'buy'
+
+    def test_json_buy_put_accepted(self):
+        """JSON path must accept buy_put directly (sprint01 A1 fix) rather than
+        falling through to the regex fallback, which would silently drop it."""
+        response = '{"decision": "buy_put", "confidence": 0.72, "reasoning": "bearish momentum"}'
+        result = parse_decision(response)
+        assert result['decision'] == 'buy_put'
+        assert result['parse_method'] == 'json'
+
+    def test_structured_line_buy_call(self):
+        result = parse_decision("Decision: BUY_CALL\nConfidence: 0.80\nReasoning: r")
+        assert result['decision'] == 'buy_call'
+        assert result['parse_method'] == 'structured_line'
+
+    def test_missing_confidence_is_always_zero_not_stale_default(self):
+        """Sprint01 A2: the consolidated implementation must coerce missing
+        confidence to 0.0, not the older 0.5 default some revisions used."""
+        result = parse_decision("Decision: HOLD\nReasoning: no clear edge")
+        assert result['confidence'] == 0.0
+        assert isinstance(result['confidence'], float)
+
 
 class TestParseDecisionSafety:
     """confidence is never None; parse_failed distinguishes total failure from partial parse."""
