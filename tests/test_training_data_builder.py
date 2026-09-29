@@ -14,6 +14,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts' / 'training'))
 
 
+# The SFT export retains rows *probabilistically*, weighted by recency decay, so
+# any test that asserts on an exact ratio (e.g. the HOLD-share tripwire
+# denominator) needs its examples inside the high-retention window. A hardcoded
+# calendar date silently shrinks the effective sample as it ages: entry_date
+# '2026-06-15' gave full retention when these tests were written in July 2026,
+# but by late September it had crossed the >90d decay bucket, dropping ~81% of
+# rows and pushing 22/32 = 68.8% down to 5/8 = 62.5% — under the 65% ceiling, so
+# the tripwire stopped firing and the test failed while the production code was
+# still correct. Dating examples relative to now keeps retention at ~100% and
+# the ratios exact, whenever the suite happens to run.
+_RECENT_ENTRY_DATE   = (datetime.now() - timedelta(days=1)).date().isoformat()
+_RECENT_GENERATED_AT = (datetime.now() - timedelta(days=1)).isoformat(timespec='seconds')
+
+
 @pytest.fixture()
 def db_path(tmp_path):
     import db as _db
@@ -498,7 +512,7 @@ class TestConstraintBlockCap:
             'prompt': f'Analyze {symbol}', 'ideal_output': ideal_output,
             'label': label, 'confidence': 0.80, 'pnl_pct': None,
             'entry_date': entry_date, 'session_id': '', 'prompt_hash': f'hash_{ideal_output[:10]}',
-            'generated_at': '2026-06-15T00:00:00', 'reward': None,
+            'generated_at': _RECENT_GENERATED_AT, 'reward': None,
         }
 
     def _make_clean_winner(self):
@@ -942,9 +956,9 @@ class TestCounterfactualSFTCap:
             'bot': 'stock', 'source': 'paper', 'symbol': symbol,
             'prompt': p, 'ideal_output': ideal_output,
             'label': label, 'confidence': 0.80, 'pnl_pct': None,
-            'entry_date': '2026-06-15', 'session_id': '',
+            'entry_date': _RECENT_ENTRY_DATE, 'session_id': '',
             'prompt_hash': f'hash_{label}_{symbol}',
-            'generated_at': '2026-06-15T00:00:00', 'reward': None,
+            'generated_at': _RECENT_GENERATED_AT, 'reward': None,
         }
 
     def _make_winner(self):
@@ -1073,9 +1087,9 @@ class TestHoldShareTripwire:
             'prompt': f'Analyze {sym} for a potential trade.',
             'ideal_output': ideal_output,
             'label': label, 'confidence': 0.80, 'pnl_pct': None,
-            'entry_date': '2026-06-15', 'session_id': '',
+            'entry_date': _RECENT_ENTRY_DATE, 'session_id': '',
             'prompt_hash': f'hash_{label}_{i}',
-            'generated_at': '2026-06-15T00:00:00', 'reward': None,
+            'generated_at': _RECENT_GENERATED_AT, 'reward': None,
         }
 
     def _make_correct_hold(self, i=0):
@@ -1179,9 +1193,9 @@ class TestTripwireDenominatorWithLosers:
             'prompt': f'Analyze {sym} for a potential trade.',
             'ideal_output': ideal_output,
             'label': label, 'confidence': 0.80, 'pnl_pct': None,
-            'entry_date': '2026-06-15', 'session_id': '',
+            'entry_date': _RECENT_ENTRY_DATE, 'session_id': '',
             'prompt_hash': f'hash_{label}_{i}',
-            'generated_at': '2026-06-15T00:00:00', 'reward': None,
+            'generated_at': _RECENT_GENERATED_AT, 'reward': None,
         }
 
     def _make_hold(self, i=0):
@@ -1283,9 +1297,9 @@ class TestSFTFileSplit:
             'prompt': f'Analyze {sym} for a potential trade.',
             'ideal_output': ideal_output,
             'label': label, 'confidence': 0.80, 'pnl_pct': None,
-            'entry_date': '2026-06-15', 'session_id': '',
+            'entry_date': _RECENT_ENTRY_DATE, 'session_id': '',
             'prompt_hash': f'hash_{label}_{i}',
-            'generated_at': '2026-06-15T00:00:00', 'reward': None,
+            'generated_at': _RECENT_GENERATED_AT, 'reward': None,
         }
 
     def _run_build(self, tmp_path, name, examples):
