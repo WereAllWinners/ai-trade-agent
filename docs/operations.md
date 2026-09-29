@@ -106,6 +106,50 @@ in use. `health_server.py`'s `/health` endpoint only surfaces
 `WARNING`/`CRITICAL`-level alerts from `alerts.jsonl` — `INFO`-level
 entries (e.g. WI-8's correction rows) never appear there.
 
+## Verifying daemon liveness after a change
+
+Run `scripts/tools/verify_daemon_liveness.sh` after any change to the
+heartbeat, the daemon main loop, or the health-server thresholds. Run it
+**during market hours** — it exits 3 (inconclusive) if no trading session
+ran in the window, because an idle daemon passes the check trivially.
+
+```bash
+scripts/tools/verify_daemon_liveness.sh          # 13-minute watch
+scripts/tools/verify_daemon_liveness.sh 1800     # longer window
+```
+
+**A green test suite is not sufficient evidence here**, and this is worth
+stating plainly because it has already cost two incidents:
+
+- `datetime.now(datetime.UTC)` raised inside a bare `except`, freezing
+  every heartbeat from 2026-03-22 to 2026-09-28 while both bots traded
+  normally and `/health` reported `down`. Nothing tested the write.
+- The first fix for the staleness threshold chunked the daemons' idle
+  sleeps. Its unit tests passed — they mocked `time.sleep` and so
+  asserted the *mechanism*. In production it still failed: `/health` read
+  `down` at 443s, because the daemon was not sleeping, it was **working**.
+  A session holds the main loop for many minutes (one symbol's LLM
+  inference is ~2 minutes; a session walks dozens of symbols). Liveness is
+  now reported by a background thread, independent of the loop.
+
+More generally, this repo's test suite is not isolated from production —
+see the entry under *Accepted gaps* — so for anything daemon-, timing- or
+network-shaped, verify against a running system rather than the suite.
+
+### Paper/live heartbeat files
+
+Each service writes its own heartbeat via `service_suffix` (sprint02 D4.1):
+`heartbeat_stock.json` / `heartbeat_options.json` for paper,
+`*_live.json` for live. Before this, paper and live shared one file
+last-writer-wins, so a healthy paper bot could mask a dead live one.
+
+`health_server` tracks all four but judges only daemons that are either
+listed in `HEALTH_REQUIRED_DAEMONS` (default `stock,options`) or have
+actually written a heartbeat. A live daemon that was never started shows
+as `missing` and does **not** make `/health` degraded; one that ran and
+then went stale does. If you retire a service for good, delete its
+heartbeat file so it stops being judged.
+
 ## Expiry sentinel tiers (R1 WI-3)
 
 `scripts/tools/expiry_sentinel.py`, run daily at 8am via
@@ -185,3 +229,17 @@ every fill-confirmation path in the codebase:
    pipeline to be healthy first (per the Addendum A finding that it's
    currently frozen), so it's grouped with that repair in R2 rather than
    bolted on here.
+
+### Test-suite isolation (found 2026-09-29, outside R1)
+
+**The test suite is not isolated from production.** Unit tests write
+real records into `logs/alerts.jsonl` (a 12-minute window of test runs
+produced 15, including `trade_executed` and `circuit_breaker`), wrote
+79 synthetic files into `logs/eval/` (every `replay_eval_*.json` on
+disk is a test artifact — no real replay eval has ever run), and make
+live Alpaca calls that get rate-limited, which roughly doubles suite
+runtime when the market is open. The alert leak is fixed by an autouse
+fixture in `tests/conftest.py`; the network calls are not. Until they
+are, treat a green suite as weak evidence for anything timing- or
+daemon-shaped, and verify against a running system (see *Verifying
+daemon liveness after a change*).
