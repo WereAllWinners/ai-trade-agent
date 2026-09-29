@@ -25,6 +25,11 @@ import _pathfix  # noqa: F401
 import yfinance as yf
 import db as _db
 from training_constants import _SFT_MAX_HOLD_SHARE, _HOLD_TEACHING_LABELS
+# Shared with the live parser so write-time prevention and after-the-fact
+# cleanup cannot diverge. decision_parser is stdlib-only, so importing it here
+# adds no weight; the dependency must never run the other way (there is a test
+# guarding decision_parser's light import cost).
+from decision_parser import unwrap_reasoning
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -355,15 +360,15 @@ def _extract_reasoning_clean(ideal_output: str) -> str:
     if not reasoning_line:
         return 'Analysis based on available market indicators.'
 
-    # Unwrap all levels of "Decision: ... Reasoning: <actual>" embedding
-    parts = re.split(r'(?i)reasoning:\s*', reasoning_line)
-    # Take the last non-empty segment (rightmost = real reasoning after all embedding)
-    actual = next((p.strip() for p in reversed(parts) if p.strip()), reasoning_line)
-
-    # Strip trailing Outcome / Reward-signal line appended to the Reasoning field
-    m = re.search(r'\s*\n?(?:outcome|reward\s+signal|result)\s*:', actual, re.IGNORECASE)
-    if m:
-        actual = actual[:m.start()].strip()
+    # The unwrap itself now lives in decision_parser.unwrap_reasoning, which is
+    # the same algorithm this function used to own. Sharing it keeps the parser
+    # (which prevents new contamination at write time) and this cleanup path
+    # (which repairs rows already stored) from drifting apart — two copies of
+    # one label set is precisely how the tripwire-denominator bug was
+    # introduced. The placeholder fallback stays here: a training row needs
+    # *some* reasoning text, whereas the parser must never invent one for the
+    # decisions.reasoning audit column.
+    actual = unwrap_reasoning(reasoning_line)
 
     return actual if actual else 'Analysis based on available market indicators.'
 

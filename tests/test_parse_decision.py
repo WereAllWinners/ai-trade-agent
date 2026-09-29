@@ -263,3 +263,33 @@ class TestParseDecisionSafety:
         # autonomous_agent.py:983 — f"{new_decision['confidence']:.2f}"
         _ = f"{result['confidence']:.2f}"                  # was TypeError
         assert new_ev == 0.0  # 0.0 * anything = 0.0 → rotation will be rejected (correct)
+
+
+class TestReasoningContaminationViaReexport:
+    """Same contamination guard as tests/test_decision_parser.py, exercised through
+    the model_inference_lora re-export path that the agents actually import.
+
+    Kept in both files deliberately — see this file's docstring: the two import
+    paths are covered separately so a regression in either is caught.
+    """
+
+    def test_nested_block_is_unwrapped(self):
+        response = ('Decision: BUY\nConfidence: 0.85\n'
+                    'Reasoning: Decision: BUY Confidence: 0.85 Reasoning: Momentum confirmed.')
+        assert parse_decision(response)['reasoning'] == 'Momentum confirmed.'
+
+    def test_outcome_leakage_is_stripped(self):
+        """The model must not be trained to state outcomes it cannot know."""
+        response = ('Decision: BUY\nConfidence: 0.85\n'
+                    'Reasoning: Good setup. Outcome: Small win (+4.2%). Reward signal: +0.0003')
+        reasoning = parse_decision(response)['reasoning']
+        assert reasoning == 'Good setup.'
+        assert 'Outcome' not in reasoning and 'Reward signal' not in reasoning
+
+    def test_reasoning_still_capped_at_200(self):
+        response = 'Decision: BUY\nConfidence: 0.8\nReasoning: ' + 'y' * 400
+        assert len(parse_decision(response)['reasoning']) <= 200
+
+    def test_reasoning_is_single_line(self):
+        response = 'Decision: HOLD\nConfidence: 0.5\nReasoning: first\nsecond'
+        assert '\n' not in parse_decision(response)['reasoning']

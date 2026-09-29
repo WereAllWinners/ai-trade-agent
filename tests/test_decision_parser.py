@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
 
 import decision_parser
-from decision_parser import parse_decision
+from decision_parser import parse_decision, unwrap_reasoning
 
 
 class TestDecisionParserBasics:
@@ -134,3 +134,101 @@ class TestDecisionParserLightweightImport:
         parse_decision("The market conditions are complex. There is uncertainty.")
         after = decision_parser._parse_failures_count
         assert after > before
+
+
+class TestUnwrapReasoning:
+    """Direct coverage for unwrap_reasoning — the fix for the contamination loop.
+
+    Models trained on contaminated examples regurgitate whole Decision/Confidence/
+    Reasoning blocks inside the Reasoning field, often with the trade's outcome
+    appended. The old `reasoning\\s*[:\\-]\\s*(.+)` capture was greedy to end of
+    line, so it stored the entire nested mess into decisions.reasoning; the
+    builder then wrapped that into a new training example, which taught the model
+    to emit it again. 78.8% of stored decisions were affected.
+    """
+
+    def test_plain_reasoning_is_untouched(self):
+        assert unwrap_reasoning('Strong momentum confirmed.') == 'Strong momentum confirmed.'
+
+    def test_single_nested_block_is_unwrapped(self):
+        got = unwrap_reasoning('Decision: BUY Confidence: 0.85 Reasoning: Strong momentum.')
+        assert got == 'Strong momentum.'
+
+    def test_double_nested_block_is_unwrapped(self):
+        got = unwrap_reasoning(
+            'Decision: BUY Confidence: 0.80 Reasoning: Decision: BUY Confidence: 0.80 '
+            'Reasoning: Real analysis here.')
+        assert got == 'Real analysis here.'
+
+    def test_triple_nesting_is_unwrapped(self):
+        got = unwrap_reasoning('Reasoning: ' * 3 + 'The actual text.')
+        assert got == 'The actual text.'
+
+    def test_outcome_trailer_is_stripped(self):
+        """Future-outcome leakage: the model cannot know this at decision time."""
+        got = unwrap_reasoning(
+            'Strong momentum. Outcome: Small win (+4.2%) — room for improvement.')
+        assert got == 'Strong momentum.'
+        assert 'Outcome' not in got
+
+    def test_reward_signal_trailer_is_stripped(self):
+        got = unwrap_reasoning('Good setup. Reward signal: +0.0003')
+        assert got == 'Good setup.'
+
+    def test_result_trailer_is_stripped(self):
+        assert unwrap_reasoning('Momentum play. Result: loss') == 'Momentum play.'
+
+    def test_nesting_and_trailer_together(self):
+        """The real production shape."""
+        got = unwrap_reasoning(
+            'Decision: BUY Confidence: 0.85 Reasoning: Strong oversold condition. '
+            'Outcome: Minor loss (-2.2%). Reward signal: -0.0007')
+        assert got == 'Strong oversold condition.'
+        for marker in ('Decision:', 'Outcome:', 'Reward signal'):
+            assert marker not in got
+
+    def test_markdown_emphasis_is_stripped(self):
+        """143 stored rows use **Decision:** style formatting."""
+        got = unwrap_reasoning('**Decision: BUY** **Confidence: 0.75** **Reasoning:** RSI is oversold')
+        assert got == 'RSI is oversold'
+
+    def test_returns_empty_when_nothing_survives(self):
+        """Must not invent text — this feeds the decisions.reasoning audit column."""
+        assert unwrap_reasoning('Outcome: Small win (+3.2%). Reward signal: +0.0006') == ''
+        assert unwrap_reasoning('') == ''
+        assert unwrap_reasoning(None) == ''
+
+    def test_internal_asterisks_are_preserved(self):
+        got = unwrap_reasoning('MACD crossed the 2*sigma band')
+        assert got == 'MACD crossed the 2*sigma band'
+
+    def test_trailing_punctuation_is_preserved(self):
+        """Stripping it produced ~11,800 cosmetic-only diffs across the corpus."""
+        assert unwrap_reasoning('Momentum is strong.').endswith('.')
+
+
+class TestExtractReasoningIntegration:
+    """parse_decision must not emit contaminated reasoning for real response shapes."""
+
+    def test_nested_response_yields_clean_reasoning(self):
+        response = (' Decision: SELL\nConfidence: 0.90\n'
+                    'Reasoning: Decision: SELL Confidence: 0.90 Reasoning: Oversold with '
+                    'negative momentum.\nOutcome: Small win (-0.6%). Reward signal: -0.0004')
+        result = parse_decision(response)
+        assert result['decision'] == 'sell'
+        assert result['reasoning'] == 'Oversold with negative momentum.'
+        for marker in ('Decision:', 'Outcome:', 'Reward signal'):
+            assert marker not in result['reasoning']
+
+    def test_reasoning_never_contains_newlines(self):
+        """_is_clean_ideal_output requires the assembled block to be exactly 3 lines."""
+        response = 'Decision: BUY\nConfidence: 0.8\nReasoning: line one\nline two'
+        assert '\n' not in parse_decision(response)['reasoning']
+
+    def test_two_hundred_char_cap_is_preserved(self):
+        response = 'Decision: BUY\nConfidence: 0.8\nReasoning: ' + 'x' * 500
+        assert len(parse_decision(response)['reasoning']) <= 200
+
+    def test_clean_response_is_unaffected(self):
+        response = 'Decision: BUY\nConfidence: 0.85\nReasoning: Strong breakout on volume.'
+        assert parse_decision(response)['reasoning'] == 'Strong breakout on volume.'
