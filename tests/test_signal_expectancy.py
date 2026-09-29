@@ -128,14 +128,16 @@ class TestEVRanking:
     def _setup_discovery(self, ev_map: dict):
         """Return a StockDiscovery whose _load_signal_ev returns ev_map."""
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts' / 'data'))
-        with patch('stock_discovery._load_delisted_cache', return_value=set()):
+        with patch('stock_discovery._load_delisted_cache', return_value=set()), \
+             patch('stock_discovery._load_fail_counts', return_value={}):
             import stock_discovery
             d = stock_discovery.StockDiscovery()
         return d, stock_discovery
 
     def test_high_ev_signal_ranks_above_low_ev_signal(self):
         """Symbol with positive-EV signals outranks symbol with negative-EV signals."""
-        with patch('stock_discovery._load_delisted_cache', return_value=set()):
+        with patch('stock_discovery._load_delisted_cache', return_value=set()), \
+             patch('stock_discovery._load_fail_counts', return_value={}):
             import stock_discovery
             d = stock_discovery.StockDiscovery()
 
@@ -150,7 +152,8 @@ class TestEVRanking:
 
     def test_fallback_to_count_when_ev_map_empty(self):
         """When ev_map is {}, ranking falls back to signal count."""
-        with patch('stock_discovery._load_delisted_cache', return_value=set()):
+        with patch('stock_discovery._load_delisted_cache', return_value=set()), \
+             patch('stock_discovery._load_fail_counts', return_value={}):
             import stock_discovery
             d = stock_discovery.StockDiscovery()
 
@@ -164,7 +167,8 @@ class TestEVRanking:
 
     def test_unknown_signal_gets_count_bonus_not_error(self):
         """A signal absent from ev_map gets len(signals)*0.001 — not a KeyError."""
-        with patch('stock_discovery._load_delisted_cache', return_value=set()):
+        with patch('stock_discovery._load_delisted_cache', return_value=set()), \
+             patch('stock_discovery._load_fail_counts', return_value={}):
             import stock_discovery
             d = stock_discovery.StockDiscovery()
 
