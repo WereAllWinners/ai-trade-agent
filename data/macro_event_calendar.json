@@ -1,0 +1,405 @@
+{
+  "generated_at": "2026-07-08T11:53:13.487781-05:00",
+  "source_urls": [
+    "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+    "https://www.bls.gov/schedule/news_release/cpi.htm",
+    "https://www.bls.gov/schedule/news_release/empsit.htm"
+  ],
+  "events": [
+    {
+      "date": "2021-01-27",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2021-03-17",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2021-04-28",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2021-06-16",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2021-07-28",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2021-09-22",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2021-11-03",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2021-12-15",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2022-01-26",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2022-03-16",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2022-05-04",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2022-06-15",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2022-07-27",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2022-09-21",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2022-11-02",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2022-12-14",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2023-03-22",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2023-05-03",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2023-06-14",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2023-07-26",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2023-09-20",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2023-12-13",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2024-01-31",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2024-03-20",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2024-06-12",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2024-07-31",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2024-09-18",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2024-11-07",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2024-12-18",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2025-01-29",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2025-03-19",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2025-05-07",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2025-06-18",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2025-07-30",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2025-09-17",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2025-10-29",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2025-12-10",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2025-12-16",
+      "time_et": "08:30",
+      "event": "Employment Situation (NFP)"
+    },
+    {
+      "date": "2025-12-18",
+      "time_et": "08:30",
+      "event": "CPI"
+    },
+    {
+      "date": "2026-01-09",
+      "time_et": "08:30",
+      "event": "Employment Situation (NFP)"
+    },
+    {
+      "date": "2026-01-13",
+      "time_et": "08:30",
+      "event": "CPI"
+    },
+    {
+      "date": "2026-01-28",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2026-02-11",
+      "time_et": "08:30",
+      "event": "Employment Situation (NFP)"
+    },
+    {
+      "date": "2026-02-13",
+      "time_et": "08:30",
+      "event": "CPI"
+    },
+    {
+      "date": "2026-03-06",
+      "time_et": "08:30",
+      "event": "Employment Situation (NFP)"
+    },
+    {
+      "date": "2026-03-11",
+      "time_et": "08:30",
+      "event": "CPI"
+    },
+    {
+      "date": "2026-03-18",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2026-04-03",
+      "time_et": "08:30",
+      "event": "Employment Situation (NFP)"
+    },
+    {
+      "date": "2026-04-10",
+      "time_et": "08:30",
+      "event": "CPI"
+    },
+    {
+      "date": "2026-04-29",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2026-05-08",
+      "time_et": "08:30",
+      "event": "Employment Situation (NFP)"
+    },
+    {
+      "date": "2026-05-12",
+      "time_et": "08:30",
+      "event": "CPI"
+    },
+    {
+      "date": "2026-06-05",
+      "time_et": "08:30",
+      "event": "Employment Situation (NFP)"
+    },
+    {
+      "date": "2026-06-10",
+      "time_et": "08:30",
+      "event": "CPI"
+    },
+    {
+      "date": "2026-06-17",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2026-07-02",
+      "time_et": "08:30",
+      "event": "Employment Situation (NFP)"
+    },
+    {
+      "date": "2026-07-14",
+      "time_et": "08:30",
+      "event": "CPI"
+    },
+    {
+      "date": "2026-07-29",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2026-08-07",
+      "time_et": "08:30",
+      "event": "Employment Situation (NFP)"
+    },
+    {
+      "date": "2026-08-12",
+      "time_et": "08:30",
+      "event": "CPI"
+    },
+    {
+      "date": "2026-09-04",
+      "time_et": "08:30",
+      "event": "Employment Situation (NFP)"
+    },
+    {
+      "date": "2026-09-11",
+      "time_et": "08:30",
+      "event": "CPI"
+    },
+    {
+      "date": "2026-09-16",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2026-10-02",
+      "time_et": "08:30",
+      "event": "Employment Situation (NFP)"
+    },
+    {
+      "date": "2026-10-14",
+      "time_et": "08:30",
+      "event": "CPI"
+    },
+    {
+      "date": "2026-10-28",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2026-11-06",
+      "time_et": "08:30",
+      "event": "Employment Situation (NFP)"
+    },
+    {
+      "date": "2026-11-10",
+      "time_et": "08:30",
+      "event": "CPI"
+    },
+    {
+      "date": "2026-12-04",
+      "time_et": "08:30",
+      "event": "Employment Situation (NFP)"
+    },
+    {
+      "date": "2026-12-09",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2026-12-10",
+      "time_et": "08:30",
+      "event": "CPI"
+    },
+    {
+      "date": "2027-01-27",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2027-03-17",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2027-04-28",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2027-06-09",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2027-07-28",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2027-09-15",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2027-10-27",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    },
+    {
+      "date": "2027-12-08",
+      "time_et": "14:00",
+      "event": "FOMC Statement"
+    }
+  ]
+}

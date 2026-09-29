@@ -212,3 +212,88 @@ class TestAlertSourceTagging:
             assert written[0].get('source') == 'live'
         finally:
             alerts.set_alert_source('unknown')
+
+
+# ── alert_once_per_day (sprint02 D5b/D6a) ──────────────────────────────────────
+
+class TestAlertOncePerDay:
+    def test_first_call_today_sends(self, tmp_path):
+        from alerts import alert_once_per_day
+        fake_path = tmp_path / 'alert_dedup.json'
+        send_fn = MagicMock()
+        with patch('alerts._ALERT_DEDUP_PATH', fake_path):
+            result = alert_once_per_day('cond_a', send_fn)
+        assert result is True
+        send_fn.assert_called_once()
+
+    def test_second_call_same_day_suppressed(self, tmp_path):
+        from alerts import alert_once_per_day
+        fake_path = tmp_path / 'alert_dedup.json'
+        send_fn = MagicMock()
+        with patch('alerts._ALERT_DEDUP_PATH', fake_path):
+            alert_once_per_day('cond_a', send_fn)
+            result = alert_once_per_day('cond_a', send_fn)
+        assert result is False
+        send_fn.assert_called_once()
+
+    def test_different_condition_keys_independent(self, tmp_path):
+        """Two distinct conditions on the same day each get their own alert —
+        dedup is keyed per-condition, not a single day-wide gate."""
+        from alerts import alert_once_per_day
+        fake_path = tmp_path / 'alert_dedup.json'
+        send_fn_a = MagicMock()
+        send_fn_b = MagicMock()
+        with patch('alerts._ALERT_DEDUP_PATH', fake_path):
+            alert_once_per_day('cond_a', send_fn_a)
+            alert_once_per_day('cond_b', send_fn_b)
+        send_fn_a.assert_called_once()
+        send_fn_b.assert_called_once()
+
+    def test_next_day_alerts_again(self, tmp_path):
+        """A condition triggering again on a later calendar day sends again —
+        the dedup is per-day, not a permanent one-time-ever suppression."""
+        from alerts import alert_once_per_day
+        fake_path = tmp_path / 'alert_dedup.json'
+        send_fn = MagicMock()
+        with patch('alerts._ALERT_DEDUP_PATH', fake_path):
+            fake_path.write_text(json.dumps({'cond_a': '2020-01-01'}))
+            result = alert_once_per_day('cond_a', send_fn)
+        assert result is True
+        send_fn.assert_called_once()
+
+    def test_dedup_state_isolated_per_service_suffix(self, tmp_path):
+        """Paper and live must not share dedup state — each service-suffixed
+        path gets its own day-tracking file."""
+        from alerts import alert_once_per_day
+        fake_path = tmp_path / 'alert_dedup.json'
+        with patch('alerts._ALERT_DEDUP_PATH', fake_path):
+            with patch.dict('os.environ', {'PAPER_TRADING': 'true'}):
+                paper_send = MagicMock()
+                alert_once_per_day('cond_a', paper_send)
+            with patch.dict('os.environ', {'PAPER_TRADING': 'false'}):
+                live_send = MagicMock()
+                result = alert_once_per_day('cond_a', live_send)
+        assert result is True
+        live_send.assert_called_once()
+
+
+# ── alert_macro_calendar_stale (sprint04 F1.3) ─────────────────────────────────
+
+class TestAlertMacroCalendarStale:
+    def test_fires_send_alert_with_reason(self, tmp_path):
+        fake_path = tmp_path / 'alert_dedup.json'
+        with patch('alerts._ALERT_DEDUP_PATH', fake_path), \
+             patch('alerts.send_alert') as mock_send_alert:
+            alerts.alert_macro_calendar_stale('no future-dated events')
+        mock_send_alert.assert_called_once()
+        args, kwargs = mock_send_alert.call_args
+        assert 'no future-dated events' in args[2]
+        assert kwargs['data'] == {'reason': 'no future-dated events'}
+
+    def test_deduped_to_once_per_calendar_day(self, tmp_path):
+        fake_path = tmp_path / 'alert_dedup.json'
+        with patch('alerts._ALERT_DEDUP_PATH', fake_path), \
+             patch('alerts.send_alert') as mock_send_alert:
+            alerts.alert_macro_calendar_stale('reason one')
+            alerts.alert_macro_calendar_stale('reason two')
+        mock_send_alert.assert_called_once()
